@@ -1218,6 +1218,25 @@ static int apply_chatml(
     return (int)total;
 }
 
+/*
+ * Apply chat template with fallback. The C-API llama_chat_apply_template only
+ * matches a hardcoded list of templates (no Jinja parser). Modern HF GGUFs ship
+ * custom Jinja templates that it rejects with -1. When that happens, fall back
+ * to plain ChatML, which is the de-facto format for Qwen/Phi/etc.
+ */
+static int apply_template(
+    const char *tmpl,
+    const struct llama_chat_message *msgs, size_t n_msgs,
+    bool add_gen_prompt,
+    char *buf, size_t buf_size)
+{
+    if (tmpl) {
+        int r = llama_chat_apply_template(tmpl, msgs, n_msgs, add_gen_prompt, buf, buf_size);
+        if (r >= 0) return r;
+    }
+    return apply_chatml(msgs, n_msgs, add_gen_prompt, buf, buf_size);
+}
+
 /* ── Model picker ──────────────────────────────────────────────────── */
 
 #define MODEL_DIRS_MAX 4
@@ -1315,6 +1334,41 @@ typedef struct {
     float temperature;
 } LaunchConfig;
 
+/* Recursively collect .gguf files under `root` (skips mmproj weights). */
+static void scan_gguf_recursive(const char *root, char ***list, int *count, int *cap) {
+    DIR *dir = opendir(root);
+    if (!dir) return;
+    struct dirent *ent;
+    while ((ent = readdir(dir)) != NULL) {
+        if (ent->d_name[0] == '.') continue;  /* skip ., .., hidden */
+        char fullpath[1024];
+        snprintf(fullpath, sizeof(fullpath), "%s/%s", root, ent->d_name);
+
+        struct stat st;
+        if (lstat(fullpath, &st) != 0) continue;
+
+        if (S_ISDIR(st.st_mode)) {
+            scan_gguf_recursive(fullpath, list, count, cap);
+            continue;
+        }
+        /* Resolve symlinks for regular-file checks (HF stores blobs via symlinks). */
+        if (S_ISLNK(st.st_mode) && stat(fullpath, &st) != 0) continue;
+        if (!S_ISREG(st.st_mode) && !S_ISLNK(st.st_mode)) continue;
+
+        size_t nlen = strlen(ent->d_name);
+        if (nlen < 5) continue;
+        if (strcmp(ent->d_name + nlen - 5, ".gguf") != 0) continue;
+        if (strstr(ent->d_name, "mmproj") != NULL) continue;
+
+        if (*count >= *cap) {
+            *cap = *cap ? *cap * 2 : 16;
+            *list = realloc(*list, *cap * sizeof(char *));
+        }
+        (*list)[(*count)++] = strdup(fullpath);
+    }
+    closedir(dir);
+}
+
 /* Settings values for ←/→ adjustment */
 static const int gpu_layer_opts[]  = { 0, 10, 20, 30, 40, 50, 60, 80, 99 };
 static const float temp_opts[]     = { 0.0f, 0.1f, 0.2f, 0.3f, 0.4f, 0.5f, 0.6f, 0.7f, 0.8f, 0.9f, 1.0f };
@@ -1335,33 +1389,16 @@ static LaunchConfig pick_model(void) {
     static char cache_dir[512];
     const char *home = getenv("HOME");
     if (home) {
-        snprintf(cache_dir, sizeof(cache_dir), "%s/.cache/llama.cpp", home);
+        snprintf(cache_dir, sizeof(cache_dir), "%s/.cache/huggingface/hub", home);
         model_search_dirs[0] = cache_dir;
     }
 
-    /* Collect .gguf files */
+    /* Collect .gguf files (recursive: HF hub nests files under models--ORG--NAME/snapshots/HASH/) */
     char **models = NULL;
     int count = 0, cap = 0;
 
     for (int d = 0; d < MODEL_DIRS_MAX && model_search_dirs[d]; d++) {
-        DIR *dir = opendir(model_search_dirs[d]);
-        if (!dir) continue;
-        struct dirent *ent;
-        while ((ent = readdir(dir)) != NULL) {
-            size_t nlen = strlen(ent->d_name);
-            if (nlen < 5) continue;
-            if (strcmp(ent->d_name + nlen - 5, ".gguf") != 0) continue;
-            if (strstr(ent->d_name, "mmproj") != NULL) continue;
-            if (count >= cap) {
-                cap = cap ? cap * 2 : 16;
-                models = realloc(models, cap * sizeof(char *));
-            }
-            char fullpath[1024];
-            snprintf(fullpath, sizeof(fullpath), "%s/%s",
-                     model_search_dirs[d], ent->d_name);
-            models[count++] = strdup(fullpath);
-        }
-        closedir(dir);
+        scan_gguf_recursive(model_search_dirs[d], &models, &count, &cap);
     }
 
     if (count == 0) {
@@ -2085,9 +2122,9 @@ int main(int argc, char **argv) {
         ADD_MESSAGE("user", user_input);
         free(user_input);
 
-        /* Apply chat template */
+        /* Apply chat template (falls back to ChatML if model template is Jinja) */
         const char *tmpl = llama_model_chat_template(model, NULL);
-        int new_len = llama_chat_apply_template(
+        int new_len = apply_template(
             tmpl, messages, msg_count, true,
             formatted_buf, sizeof(formatted_buf));
 
@@ -2170,7 +2207,7 @@ int main(int argc, char **argv) {
                 free(tool_result);
 
                 /* Update template for next iteration */
-                int next_len = llama_chat_apply_template(
+                int next_len = apply_template(
                     tmpl, messages, msg_count, true,
                     formatted_buf, sizeof(formatted_buf));
                 if (next_len < 0) {
@@ -2178,7 +2215,7 @@ int main(int argc, char **argv) {
                     fflush(stdout);
                     break;
                 }
-                int prev = llama_chat_apply_template(
+                int prev = apply_template(
                     tmpl, messages, msg_count - 1, false, NULL, 0);
                 prompt = formatted_buf + prev;
                 prompt_len = (size_t)next_len - (size_t)prev;
@@ -2215,7 +2252,7 @@ int main(int argc, char **argv) {
         fflush(stdout);
 
         /* Update prev_len for next turn */
-        int len = llama_chat_apply_template(
+        int len = apply_template(
             tmpl, messages, msg_count, false, NULL, 0);
         if (len >= 0) prev_len = (size_t)len;
     }
