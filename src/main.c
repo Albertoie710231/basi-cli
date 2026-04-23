@@ -467,23 +467,19 @@ static char *run_command(const char *cmd, size_t max_output) {
 static bool debug_mode = false;
 
 /*
- * Fetch a URL, strip HTML, then use awk to extract paragraphs around matches.
+ * Fetch a URL, strip HTML, then use awk to extract whole paragraphs around matches.
  *
- * The awk script:
- * - Skips short lines (<MIN_LINE_LEN chars) to filter nav/button junk
- * - Stores lines in a ring buffer of 2 (prev context)
- * - When a match is found, prints prev + match + next line (paragraph)
- * - Deduplicates: won't print the same line twice
- * - Stops after MAX_CHARS total output
- * - Separates match groups with "---"
+ * A paragraph is a run of consecutive lines each of length >= minlen; any
+ * shorter/blank line ends the current paragraph. The awk script:
+ * - Builds the paragraph array from the stream
+ * - For small pages (<=5000 usable chars), prints every paragraph
+ * - For large pages, prints every paragraph whose text matches the pattern
+ * - Each paragraph is emitted at most once — multiple hits inside the same
+ *   paragraph do not duplicate it
+ * - Separates distinct paragraphs with "---"
+ * - Stops after MAX_CHARS total output (hard cap via head -c)
  */
 static char *fetch_and_extract(const char *url, const char *pattern) {
-    /* Single pipeline: fetch → strip HTML → filter junk → awk extract.
-       Awk handles both small and large pages:
-       - Counts total usable chars in first pass through lines
-       - If page is small (<=5000 usable chars), outputs everything
-       - If large, extracts paragraphs around pattern matches
-       - Hard cap via head -c at the end */
     char cmd[16384];
     snprintf(cmd, sizeof(cmd),
         "curl -sL -m 10 -A 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36' "
@@ -492,33 +488,32 @@ static char *fetch_and_extract(const char *url, const char *pattern) {
         "| awk -v pat='%s' -v maxchars=%d -v minlen=%d -v dbg=%d '"
         "{"
         "  gsub(/^[[:space:]]+|[[:space:]]+$/, \"\");"
-        "  if (length($0) < minlen) next;"
-        "  lines[++n] = $0; sz += length($0) + 1"
+        "  if (length($0) < minlen) {"
+        "    if (cur_len > 0) { paragraphs[++pn] = cur; cur = \"\"; cur_len = 0 }"
+        "    next"
+        "  }"
+        "  if (cur_len == 0) cur = $0; else cur = cur \"\\n\" $0;"
+        "  cur_len++;"
+        "  sz += length($0) + 1"
         "}"
         "END {"
+        "  if (cur_len > 0) paragraphs[++pn] = cur;"
         "  IGNORECASE=1;"
         "  if (sz <= 5000) {"
-        "    for (i=1; i<=n; i++) print lines[i];"
-        "    if (dbg) printf \"[DEBUG] %%d bytes (small page, full output)\\n\", sz > \"/dev/stderr\";"
+        "    for (i=1; i<=pn; i++) print paragraphs[i];"
+        "    if (dbg) printf \"[DEBUG] %%d bytes, %%d paragraphs (small page, full output)\\n\", sz, pn > \"/dev/stderr\";"
         "  } else {"
-        "    total=0; lastprinted=-10; matches=0;"
-        "    for (i=1; i<=n; i++) {"
+        "    total=0; matches=0;"
+        "    for (i=1; i<=pn; i++) {"
         "      if (total >= maxchars) break;"
-        "      if (lines[i] ~ pat) {"
+        "      if (paragraphs[i] ~ pat) {"
         "        matches++;"
-        "        if (i - lastprinted > 3 && total > 0) { print \"---\"; total+=4 }"
+        "        if (matches > 1) { print \"---\"; total+=4 }"
         "        if (total >= maxchars) break;"
-        "        if (i - lastprinted > 2 && i>=3) { print lines[i-2]; total+=length(lines[i-2])+1 }"
-        "        if (total >= maxchars) break;"
-        "        if (i - lastprinted > 1 && i>=2) { print lines[i-1]; total+=length(lines[i-1])+1 }"
-        "        if (total >= maxchars) break;"
-        "        print lines[i]; total+=length(lines[i])+1;"
-        "        lastprinted=i;"
-        "        if (i+1<=n && total<maxchars) { print lines[i+1]; total+=length(lines[i+1])+1; lastprinted=i+1 }"
-        "        if (i+2<=n && total<maxchars) { print lines[i+2]; total+=length(lines[i+2])+1; lastprinted=i+2 }"
+        "        print paragraphs[i]; total+=length(paragraphs[i])+1;"
         "      }"
         "    }"
-        "    if (dbg) printf \"[DEBUG] %%d bytes page, %%d matches, %%d bytes output\\n\", sz, matches, total > \"/dev/stderr\";"
+        "    if (dbg) printf \"[DEBUG] %%d bytes page, %%d paragraphs, %%d matched, %%d bytes output\\n\", sz, pn, matches, total > \"/dev/stderr\";"
         "  }"
         "}' | head -c %d",
         url, pattern, WEBFETCH_MAX_CHARS, WEBFETCH_MIN_LINE_LEN, debug_mode ? 1 : 0,
