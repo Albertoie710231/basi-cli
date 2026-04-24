@@ -40,20 +40,24 @@ static const char *SYSTEM_PROMPT_FMT =
     "- wc <file> : Count lines, words, characters\n"
     "\n"
     "WEB TOOL:\n"
-    "- webfetch \"search query\" \"grep regex\" : Takes exactly 2 quoted arguments. First is a web search query. Second is a regex pattern (use | for OR). Fetches top 5 results in parallel and extracts lines matching the regex.\n"
+    "- webfetch \"search query\" \"grep regex\" : Takes exactly 2 quoted arguments. First is a web search query. Second is a regex pattern (use | for OR). Fetches the top 5 results in parallel and extracts paragraphs matching the regex. Handles PDFs transparently: if a result URL ends in .pdf it is parsed as PDF, and if an HTML landing page links to a PDF, the PDF is followed and its text is inlined.\n"
+    "\n"
+    "LOCAL DOCUMENT TOOL:\n"
+    "- readfile <path> [\"regex\"] : Read any local document (pdf, docx, odt, epub, or plain text like txt/md/source code). Optional regex narrows output to matching paragraphs; without it, dumps the first ~5000 chars. ONLY call this when the user explicitly gave you a path on their machine — NEVER invent or guess a path. If they asked about something on the web, use webfetch instead.\n"
     "\n"
     "Examples:\n"
-    "<tool>head -n 50 /path/to/file.txt</tool>\n"
+    "<tool>head -n 50 src/main.c</tool>\n"
     "<tool>grep -n \"function main\" src/main.c</tool>\n"
     "<tool>webfetch \"latest google pixel phone specs\" \"pixel|specs|price|release|camera\"</tool>\n"
-    "<tool>webfetch \"rust async tutorial\" \"async|await|Future|tokio\"</tool>\n"
+    "<tool>webfetch \"attention is all you need paper\" \"attention|transformer|self-attention|benchmark\"</tool>\n"
     "\n"
     "Tool results will appear in <tool_result> tags.\n"
     "For large files, first use 'wc' to check size, then 'head' or 'grep' to read relevant parts.\n"
     "CRITICAL RULES:\n"
     "1. After receiving tool results, you MUST answer the user immediately. Do not call another tool unless the results were completely empty.\n"
     "2. Base your answers on the actual content returned by tools. Never assume details.\n"
-    "3. One webfetch call is almost always enough. Answer with what you have.\n"
+    "3. One webfetch call is almost always enough — PDFs linked from landing pages are auto-followed. Answer with what you have.\n"
+    "4. NEVER call readfile unless the user wrote a concrete path in their own message. Do not fabricate paths like /home/user/... — that file does not exist on this machine.\n"
     "\n"
     "Always be helpful, concise, and accurate.";
 
@@ -463,8 +467,93 @@ static char *run_command(const char *cmd, size_t max_output) {
 #define WEBFETCH_MAX_RESULTS   5
 #define WEBFETCH_MAX_CHARS  2500  /* max chars of extracted content per page */
 #define WEBFETCH_MIN_LINE_LEN 30  /* skip short lines (nav, buttons, junk) */
+#define READFILE_MAX_CHARS   5000  /* cap on extracted document text per call */
+#define WEBFETCH_PDF_CHARS   2000  /* budget for an inlined PDF attached to an HTML result */
+
+#define MINI_BROWSER "/home/alberto/Documentos/MINI_BROWSER/build/mini_browser"
 
 static bool debug_mode = false;
+
+/* Awk paragraph extractor. Placeholders consumed (in order):
+     %s  regex pattern
+     %d  maxchars
+     %d  minlen
+     %d  dbg flag (0/1)
+   Literal %d inside the script is written as %%d so snprintf leaves it alone. */
+#define AWK_EXTRACT_PARAGRAPHS \
+    "awk -v pat='%s' -v maxchars=%d -v minlen=%d -v dbg=%d '" \
+    "{" \
+    "  gsub(/^[[:space:]]+|[[:space:]]+$/, \"\");" \
+    "  if (length($0) < minlen) {" \
+    "    if (cur_len > 0) { paragraphs[++pn] = cur; cur = \"\"; cur_len = 0 }" \
+    "    next" \
+    "  }" \
+    "  if (cur_len == 0) cur = $0; else cur = cur \"\\n\" $0;" \
+    "  cur_len++;" \
+    "  sz += length($0) + 1" \
+    "}" \
+    "END {" \
+    "  if (cur_len > 0) paragraphs[++pn] = cur;" \
+    "  IGNORECASE=1;" \
+    "  if (sz <= 5000) {" \
+    "    for (i=1; i<=pn; i++) print paragraphs[i];" \
+    "    if (dbg) printf \"[DEBUG] %%d bytes, %%d paragraphs (small page, full output)\\n\", sz, pn > \"/dev/stderr\";" \
+    "  } else {" \
+    "    total=0; matches=0;" \
+    "    for (i=1; i<=pn; i++) {" \
+    "      if (total >= maxchars) break;" \
+    "      if (paragraphs[i] ~ pat) {" \
+    "        matches++;" \
+    "        if (matches > 1) { print \"---\"; total+=4 }" \
+    "        if (total >= maxchars) break;" \
+    "        print paragraphs[i]; total+=length(paragraphs[i])+1;" \
+    "      }" \
+    "    }" \
+    "    if (dbg) printf \"[DEBUG] %%d bytes page, %%d paragraphs, %%d matched, %%d bytes output\\n\", sz, pn, matches, total > \"/dev/stderr\";" \
+    "  }" \
+    "}'"
+
+static bool url_has_pdf_suffix(const char *url) {
+    size_t len = strlen(url);
+    size_t end = len;
+    for (size_t i = 0; i < len; i++) {
+        if (url[i] == '?' || url[i] == '#') { end = i; break; }
+    }
+    if (end < 4) return false;
+    return strncasecmp(url + end - 4, ".pdf", 4) == 0;
+}
+
+/* Split a URL into its scheme+host (e.g. "https://arxiv.org") and its base
+   directory (URL truncated to the last '/', e.g. "https://arxiv.org/abs/").
+   Relative hrefs on that page get resolved against these two prefixes. */
+static void url_split_base(const char *url,
+                           char *scheme_host, size_t shsz,
+                           char *base_dir, size_t bdsz) {
+    scheme_host[0] = '\0';
+    base_dir[0]    = '\0';
+
+    const char *sep = strstr(url, "://");
+    if (!sep) return;
+    const char *host_start = sep + 3;
+    const char *path_start = strchr(host_start, '/');
+
+    size_t shlen = path_start ? (size_t)(path_start - url) : strlen(url);
+    if (shlen >= shsz) shlen = shsz - 1;
+    memcpy(scheme_host, url, shlen);
+    scheme_host[shlen] = '\0';
+
+    if (path_start) {
+        const char *last_slash = strrchr(path_start, '/');
+        if (last_slash && last_slash >= path_start) {
+            size_t bdlen = (size_t)(last_slash - url) + 1;
+            if (bdlen >= bdsz) bdlen = bdsz - 1;
+            memcpy(base_dir, url, bdlen);
+            base_dir[bdlen] = '\0';
+            return;
+        }
+    }
+    snprintf(base_dir, bdsz, "%s/", scheme_host);
+}
 
 /*
  * Fetch a URL, strip HTML, then use awk to extract whole paragraphs around matches.
@@ -479,50 +568,165 @@ static bool debug_mode = false;
  * - Separates distinct paragraphs with "---"
  * - Stops after MAX_CHARS total output (hard cap via head -c)
  */
-static char *fetch_and_extract(const char *url, const char *pattern) {
+/* fetch_and_extract: if `claim_dir` is non-NULL and non-empty, parallel
+   workers coordinate PDF-fetch dedupe by atomically mkdir'ing a subdirectory
+   named after the md5 of the resolved PDF URL. The first worker wins; losers
+   skip the fetch. Pass NULL/empty to disable dedupe. */
+static char *fetch_and_extract(const char *url, const char *pattern,
+                                const char *claim_dir) {
     char cmd[16384];
-    snprintf(cmd, sizeof(cmd),
-        "curl -sL -m 10 -A 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36' "
-        "'%s' 2>/dev/null "
-        "| w3m -dump -T text/html -cols 120 2>/dev/null "
-        "| awk -v pat='%s' -v maxchars=%d -v minlen=%d -v dbg=%d '"
-        "{"
-        "  gsub(/^[[:space:]]+|[[:space:]]+$/, \"\");"
-        "  if (length($0) < minlen) {"
-        "    if (cur_len > 0) { paragraphs[++pn] = cur; cur = \"\"; cur_len = 0 }"
-        "    next"
-        "  }"
-        "  if (cur_len == 0) cur = $0; else cur = cur \"\\n\" $0;"
-        "  cur_len++;"
-        "  sz += length($0) + 1"
-        "}"
-        "END {"
-        "  if (cur_len > 0) paragraphs[++pn] = cur;"
-        "  IGNORECASE=1;"
-        "  if (sz <= 5000) {"
-        "    for (i=1; i<=pn; i++) print paragraphs[i];"
-        "    if (dbg) printf \"[DEBUG] %%d bytes, %%d paragraphs (small page, full output)\\n\", sz, pn > \"/dev/stderr\";"
-        "  } else {"
-        "    total=0; matches=0;"
-        "    for (i=1; i<=pn; i++) {"
-        "      if (total >= maxchars) break;"
-        "      if (paragraphs[i] ~ pat) {"
-        "        matches++;"
-        "        if (matches > 1) { print \"---\"; total+=4 }"
-        "        if (total >= maxchars) break;"
-        "        print paragraphs[i]; total+=length(paragraphs[i])+1;"
-        "      }"
-        "    }"
-        "    if (dbg) printf \"[DEBUG] %%d bytes page, %%d paragraphs, %%d matched, %%d bytes output\\n\", sz, pn, matches, total > \"/dev/stderr\";"
-        "  }"
-        "}' | head -c %d",
-        url, pattern, WEBFETCH_MAX_CHARS, WEBFETCH_MIN_LINE_LEN, debug_mode ? 1 : 0,
-        WEBFETCH_MAX_CHARS);
 
-    char *result = run_command(cmd, WEBFETCH_MAX_CHARS + 256);
+    /* Debug trace lines emitted to stderr (popen only captures stdout, so
+       stderr reaches the user's terminal alongside the [Fetching...] banner).
+       Single quotes in URLs are already rejected at webfetch entry, so
+       inlining `url` between single quotes here is safe. */
+    char dbg_start[1024]  = "";
+    char dbg_nopdf[256]   = "";
+    if (debug_mode) {
+        snprintf(dbg_start, sizeof(dbg_start),
+            "echo '[wf/%s] %s' >&2; ",
+            url_has_pdf_suffix(url) ? "pdf " : "html", url);
+        snprintf(dbg_nopdf, sizeof(dbg_nopdf),
+            "echo '[wf/html]   (no pdf link on page)' >&2; ");
+    }
+
+    /* Claim guard: either a real `if mkdir` race-gate, or a no-op `if true`.
+       Hash is computed from a normalized URL so that equivalent links
+       (trailing '.pdf', '/', or '?query') collapse to the same key —
+       arxiv.org/pdf/ID and arxiv.org/pdf/ID.pdf resolve to the same
+       document and shouldn't both be fetched. */
+    char claim_begin[1024];
+    char claim_end[1024];
+    if (claim_dir && claim_dir[0]) {
+        snprintf(claim_begin, sizeof(claim_begin),
+            "pdfhash=$(printf '%%s' \"$pdfurl\" "
+            " | sed -E 's|[?#].*||; s|\\.pdf$||i; s|/$||' "
+            " | md5sum | cut -c1-32); "
+            "if mkdir \"%s/$pdfhash\" 2>/dev/null; then %s",
+            claim_dir,
+            debug_mode
+              ? "echo \"[wf/html]   -> pdf-follow: $pdfurl\" >&2; "
+              : "");
+        snprintf(claim_end, sizeof(claim_end),
+            "else %s:; fi",
+            debug_mode
+              ? "echo \"[wf/html]   (pdf already claimed by another worker: $pdfurl)\" >&2; "
+              : "");
+    } else {
+        snprintf(claim_begin, sizeof(claim_begin),
+            "if true; then %s",
+            debug_mode
+              ? "echo \"[wf/html]   -> pdf-follow: $pdfurl\" >&2; "
+              : "");
+        snprintf(claim_end, sizeof(claim_end), "fi");
+    }
+
+    if (url_has_pdf_suffix(url)) {
+        /* PDF branch: raw bytes via curl → pdftotext → paragraph extract. */
+        snprintf(cmd, sizeof(cmd),
+            "%s"
+            "curl -sL -m 20 --max-filesize 20000000 "
+            "-A 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36' "
+            "'%s' 2>/dev/null "
+            "| pdftotext -enc UTF-8 - - 2>/dev/null "
+            "| " AWK_EXTRACT_PARAGRAPHS
+            " | head -c %d",
+            dbg_start,
+            url, pattern, WEBFETCH_MAX_CHARS, WEBFETCH_MIN_LINE_LEN,
+            debug_mode ? 1 : 0, WEBFETCH_MAX_CHARS);
+
+        char *result = run_command(cmd, WEBFETCH_MAX_CHARS + 256);
+        if (result && strlen(result) > (size_t)WEBFETCH_MAX_CHARS) {
+            result[WEBFETCH_MAX_CHARS] = '\0';
+        }
+        return result;
+    }
+
+    /* HTML branch: mini_browser (bypasses CAPTCHAs that hit plain curl) →
+       save raw HTML to a tempfile so we can both flatten it with w3m AND
+       scan the hrefs for a PDF link. If one is found we follow it (one PDF
+       max per landing page) and append its extracted text to the result.
+
+       PDF-picking priority:
+         1. link host matches the landing page's host (e.g. arxiv→arxiv)
+         2. anchor text/href contains 'download', 'full', or 'paper'
+         3. first PDF link on the page
+       Relative hrefs are resolved against the landing page's scheme+host and
+       base directory. */
+    char scheme_host[512];
+    char base_dir[1024];
+    url_split_base(url, scheme_host, sizeof(scheme_host),
+                       base_dir,    sizeof(base_dir));
+
+    snprintf(cmd, sizeof(cmd),
+        "%s"  /* dbg_start */
+        "tmp=$(mktemp 2>/dev/null) && "
+        MINI_BROWSER " --headless --timeout 15000 '%s' 2>/dev/null > \"$tmp\"; "
+
+        /* 1) Paragraph-extract the landing page's visible text. */
+        "w3m -dump -T text/html -cols 120 < \"$tmp\" 2>/dev/null "
+        "| " AWK_EXTRACT_PARAGRAPHS
+        " | head -c %d; "
+
+        /* 2) Pick the best PDF link from the raw HTML. The grep catches both
+              '.pdf' endings and '/pdf/' path segments (arxiv-style links
+              like arxiv.org/pdf/2301.00001 have no extension). Awk then ranks
+              by host match, then by 'download|full|paper' href hint, then
+              first-seen. */
+        "pdf=$(grep -oiE 'href=\"[^\"]*(\\.pdf|/pdf/)[^\"]*\"' \"$tmp\" 2>/dev/null "
+        " | sed -E 's/^href=\"//; s/\"$//' "
+        " | awk -v host='%s' '"
+        "     BEGIN { IGNORECASE=1 }"
+        "     {"
+        "       h = $0;"
+        "       if (same==\"\" && index(h, host)==1) same=h;"
+        "       else if (prio==\"\" && h ~ /download|full|paper/) prio=h;"
+        "       else if (first==\"\") first=h;"
+        "     }"
+        "     END { print (same != \"\" ? same : (prio != \"\" ? prio : first)) }'"
+        "); "
+
+        /* 3) Resolve relative URLs against scheme+host / base_dir, then fetch
+              the PDF, extract, and append. Skip on empty. */
+        "if [ -n \"$pdf\" ]; then "
+        "  case \"$pdf\" in "
+        "    http://*|https://*) pdfurl=\"$pdf\" ;; "
+        "    //*)                pdfurl=\"https:$pdf\" ;; "
+        "    /*)                 pdfurl='%s'\"$pdf\" ;; "
+        "    *)                  pdfurl='%s'\"$pdf\" ;; "
+        "  esac; "
+        "  %s"  /* claim_begin — opens dedupe race-gate (or `if true`);
+                   debug line for "pdf-follow" lives inside the winner side */
+        "    printf '\\n--- PDF: %%s ---\\n' \"$pdfurl\"; "
+        "    curl -sL -m 20 --max-filesize 20000000 "
+        "      -A 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36' "
+        "      \"$pdfurl\" 2>/dev/null "
+        "    | pdftotext -enc UTF-8 - - 2>/dev/null "
+        "    | " AWK_EXTRACT_PARAGRAPHS
+        "    | head -c %d; "
+        "  %s; "  /* claim_end — closes race-gate */
+        "else "
+        "  %s"  /* dbg_nopdf */
+        "  :; "
+        "fi; "
+        "rm -f \"$tmp\"",
+        dbg_start,
+        url,
+        /* 1st awk */ pattern, WEBFETCH_MAX_CHARS, WEBFETCH_MIN_LINE_LEN,
+                     debug_mode ? 1 : 0, WEBFETCH_MAX_CHARS,
+        /* pdf picker */ scheme_host,
+        /* case resolution */ scheme_host, base_dir,
+        claim_begin,
+        /* 2nd awk */ pattern, WEBFETCH_PDF_CHARS, WEBFETCH_MIN_LINE_LEN,
+                     debug_mode ? 1 : 0, WEBFETCH_PDF_CHARS,
+        claim_end,
+        dbg_nopdf);
+
+    char *result = run_command(cmd, WEBFETCH_MAX_CHARS + WEBFETCH_PDF_CHARS + 512);
     /* Hard truncate if still too long */
-    if (result && strlen(result) > (size_t)WEBFETCH_MAX_CHARS) {
-        result[WEBFETCH_MAX_CHARS] = '\0';
+    size_t hard_cap = (size_t)(WEBFETCH_MAX_CHARS + WEBFETCH_PDF_CHARS);
+    if (result && strlen(result) > hard_cap) {
+        result[hard_cap] = '\0';
     }
     return result;
 }
@@ -536,7 +740,7 @@ static char *execute_webfetch(const char *search_query, const char *grep_query) 
     char *encoded = url_encode(search_query);
     char cmd[4096];
     snprintf(cmd, sizeof(cmd),
-        "/home/alberto/Documentos/MINI_BROWSER/build/mini_browser --headless --timeout 30000 "
+        MINI_BROWSER " --headless --timeout 30000 "
         "'https://lite.duckduckgo.com/lite/?q=%s' 2>/dev/null "
         "| grep -oP '(?<=class=\"result-link\" href=\")[^\"]+' "
         "| grep -v 'ad_domain' | grep -v 'ad_provider' "
@@ -580,6 +784,13 @@ static char *execute_webfetch(const char *search_query, const char *grep_query) 
            url_count, grep_query);
     fflush(stdout);
 
+    /* Shared claim directory so parallel workers can dedupe PDF fetches.
+       If mkdtemp fails we fall back to the no-dedupe path (empty string). */
+    char claim_dir[] = "/tmp/basi-wf.XXXXXX";
+    if (mkdtemp(claim_dir) == NULL) {
+        claim_dir[0] = '\0';
+    }
+
     /* Fork parallel fetchers */
     int pipes[WEBFETCH_MAX_RESULTS][2];
     pid_t pids[WEBFETCH_MAX_RESULTS];
@@ -589,7 +800,7 @@ static char *execute_webfetch(const char *search_query, const char *grep_query) 
         pids[i] = fork();
         if (pids[i] == 0) {
             close(pipes[i][0]);
-            char *content = fetch_and_extract(urls[i], grep_query);
+            char *content = fetch_and_extract(urls[i], grep_query, claim_dir);
             if (content && content[0]) {
                 write(pipes[i][1], content, strlen(content));
             }
@@ -633,12 +844,95 @@ static char *execute_webfetch(const char *search_query, const char *grep_query) 
     /* Cleanup */
     for (int i = 0; i < url_count; i++)
         free(urls[i]);
+    if (claim_dir[0]) {
+        char rm_cmd[300];
+        snprintf(rm_cmd, sizeof(rm_cmd), "rm -rf '%s'", claim_dir);
+        int rc = system(rm_cmd);
+        (void)rc;
+    }
 
     if (results.len == 0) {
         sb_free(&results);
         return strdup("No search results found.");
     }
     return sb_to_str(&results);
+}
+
+/* readfile <path> [regex]
+   Reads a local document and returns its plain text. Dispatches by extension:
+     .pdf        → pdftotext
+     .docx       → unzip + XML strip (Word OOXML)
+     .odt        → unzip + XML strip (OpenDocument)
+     .epub       → unzip + XML strip across all xhtml/html files
+     everything  → cat (treat as text: source code, markdown, txt, json, ...)
+   Without regex, emits the first READFILE_MAX_CHARS bytes of extracted text.
+   With regex, paragraph-extracts matching paragraphs (same logic as webfetch). */
+static char *execute_readfile(const char *path, const char *pattern) {
+    if (strncmp(path, "http://", 7) == 0 ||
+        strncmp(path, "https://", 8) == 0) {
+        return strdup("Error: readfile is for local paths. URLs are fetched by webfetch.");
+    }
+    if (strchr(path, '\'')) {
+        return strdup("Error: readfile path must not contain single quotes.");
+    }
+    if (pattern && strchr(pattern, '\'')) {
+        return strdup("Error: readfile regex must not contain single quotes.");
+    }
+    if (access(path, R_OK) != 0) {
+        char *msg = malloc(512);
+        snprintf(msg, 512, "Error: Cannot read file '%s'", path);
+        return msg;
+    }
+
+    const char *ext = strrchr(path, '.');
+    char extractor[2048];
+    if (ext && strcasecmp(ext, ".pdf") == 0) {
+        snprintf(extractor, sizeof(extractor),
+            "pdftotext -enc UTF-8 '%s' - 2>/dev/null", path);
+    } else if (ext && strcasecmp(ext, ".docx") == 0) {
+        /* Turn paragraph closers into blank lines so the paragraph-extract
+           awk still sees paragraph boundaries, then strip all remaining XML
+           tags and a few common entities. */
+        snprintf(extractor, sizeof(extractor),
+            "unzip -p '%s' word/document.xml 2>/dev/null "
+            "| sed -E 's|</w:p>|\\n\\n|g; s|<[^>]+>||g; "
+            "s/&amp;/\\&/g; s/&lt;/</g; s/&gt;/>/g; s/&quot;/\"/g; s/&apos;/'\\''/g'",
+            path);
+    } else if (ext && strcasecmp(ext, ".odt") == 0) {
+        snprintf(extractor, sizeof(extractor),
+            "unzip -p '%s' content.xml 2>/dev/null "
+            "| sed -E 's|</text:p>|\\n\\n|g; s|<[^>]+>||g; "
+            "s/&amp;/\\&/g; s/&lt;/</g; s/&gt;/>/g; s/&quot;/\"/g; s/&apos;/'\\''/g'",
+            path);
+    } else if (ext && strcasecmp(ext, ".epub") == 0) {
+        snprintf(extractor, sizeof(extractor),
+            "unzip -p '%s' '*.xhtml' '*.html' 2>/dev/null "
+            "| sed -E 's|</p>|\\n\\n|g; s|<[^>]+>||g; "
+            "s/&amp;/\\&/g; s/&lt;/</g; s/&gt;/>/g; s/&quot;/\"/g; s/&apos;/'\\''/g'",
+            path);
+    } else {
+        snprintf(extractor, sizeof(extractor), "cat '%s' 2>/dev/null", path);
+    }
+
+    char cmd[16384];
+    if (pattern && pattern[0]) {
+        snprintf(cmd, sizeof(cmd),
+            "%s | " AWK_EXTRACT_PARAGRAPHS " | head -c %d",
+            extractor, pattern, READFILE_MAX_CHARS, WEBFETCH_MIN_LINE_LEN,
+            debug_mode ? 1 : 0, READFILE_MAX_CHARS);
+    } else {
+        snprintf(cmd, sizeof(cmd), "%s | head -c %d", extractor, READFILE_MAX_CHARS);
+    }
+
+    char *result = run_command(cmd, READFILE_MAX_CHARS + 256);
+    if (result && strlen(result) > (size_t)READFILE_MAX_CHARS) {
+        result[READFILE_MAX_CHARS] = '\0';
+    }
+    if (!result || !result[0]) {
+        free(result);
+        return strdup("No text extracted from file (unsupported format, scanned, or empty).");
+    }
+    return result;
 }
 
 /* ── Tokenize command string (respecting quotes) ───────────────────── */
@@ -712,7 +1006,7 @@ static char *execute_tool(const char *command) {
 
     /* Whitelist check */
     static const char *allowed[] = {
-        "read", "head", "tail", "grep", "wc", "cat", "webfetch", NULL
+        "read", "head", "tail", "grep", "wc", "cat", "webfetch", "readfile", NULL
     };
     bool is_allowed = false;
     for (const char **a = allowed; *a; a++) {
@@ -721,7 +1015,7 @@ static char *execute_tool(const char *command) {
     if (!is_allowed) {
         char *msg = malloc(256);
         snprintf(msg, 256,
-            "Error: Command '%s' not allowed. Use: read, head, tail, grep, wc, webfetch", cmd);
+            "Error: Command '%s' not allowed. Use: read, head, tail, grep, wc, webfetch, readfile", cmd);
         arglist_free(&al);
         return msg;
     }
@@ -771,6 +1065,20 @@ static char *execute_tool(const char *command) {
                           "Example: webfetch \"google pixel 10 specs\" \"pixel 10|price|specs|release\"");
         }
         char *result = execute_webfetch(al.args[1], al.args[2]);
+        arglist_free(&al);
+        return result;
+    }
+
+    /* Handle 'readfile' — local multi-format document reader */
+    if (strcmp(cmd, "readfile") == 0) {
+        if (al.count < 2) {
+            arglist_free(&al);
+            return strdup("Error: readfile requires a path:\n"
+                          "  readfile <path> [\"regex\"]\n"
+                          "Example: readfile /home/user/paper.pdf \"attention|transformer|benchmark\"");
+        }
+        const char *regex = (al.count >= 3) ? al.args[2] : NULL;
+        char *result = execute_readfile(al.args[1], regex);
         arglist_free(&al);
         return result;
     }
@@ -1139,6 +1447,20 @@ static GenerateResult generate(
                 memcpy(utf8_buf, combined + output_end, combined_len - output_end);
                 utf8_len = combined_len - output_end;
             }
+        }
+
+        /* Stop as soon as a complete <tool>...</tool> has been emitted, so the
+           model can't chain dozens of speculative tool calls in one response.
+           Only normal-state text is appended to `response`, so this tail match
+           won't trigger inside <think> blocks. */
+        if (response.len >= 7 &&
+            memcmp(response.data + response.len - 7, "</tool>", 7) == 0) {
+            res.gen_time_s = time_now() - timer_start;
+            if (thinking_box_shown) {
+                if (show_thinking) { printf("\033[0m\n"); } else { clear_thinking_box(); }
+                thinking_box_shown = false;
+            }
+            break;
         }
 
         /* Next token */
