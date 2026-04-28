@@ -12,6 +12,8 @@
 #include <dirent.h>
 #include <libgen.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <stdarg.h>
 
 #include "llama.h"
 
@@ -39,6 +41,42 @@ static const char *SYSTEM_PROMPT_FMT =
     "- grep -C <N> <pattern> <file> : Search with N lines of context\n"
     "- wc <file> : Count lines, words, characters\n"
     "\n"
+    "CODE TOOL (C only, requires clangd):\n"
+    "- code_context <file> <symbol> : Returns ONLY clangd's structural info (signature, type, doc) for a symbol. EXACTLY two whitespace-separated arguments — no colons, no line numbers. The symbol must be a top-level identifier (function, typedef, global). Output is fenced between '=== begin clangd ===' and '=== end clangd ===' — quote that block verbatim if asked, do NOT paraphrase surrounding code as 'clangd output'. Use grep -C separately if you also want to see the code.\n"
+    "  Format: <tool>code_context src/main.c execute_apply_patch</tool>\n"
+    "  Use this when the user asks 'what is X', 'signature of X', or 'show me the definition of X'.\n"
+    "\n"
+    "SHELL TOOL:\n"
+    "- bash <command> : Run an arbitrary shell command via 'bash -c'. ALWAYS requires user approval before execution; the user may deny. Use for builds (make, cargo, npm), tests, git operations, or anything not covered by the other tools. Prefer specific commands; avoid destructive operations (rm -rf, package installs) without explaining first. Output combines stdout and stderr.\n"
+    "  Examples: <tool>bash make</tool>  <tool>bash git status</tool>  <tool>bash ls -la src/</tool>\n"
+    "\n"
+    "EDIT TOOL:\n"
+    "- apply_patch : Create, modify, or delete files using a structured patch. Requires user approval. After applying, do NOT re-read the file — the result tells you success or failure. Format:\n"
+    "  <tool>apply_patch\n"
+    "  *** Begin Patch\n"
+    "  *** Update File: <path>          (or 'Add File:' / 'Delete File:')\n"
+    "  @@                                (separates hunks; only needed for >1 hunk per file)\n"
+    "   context line                     (1-3 unchanged lines, prefix with single space)\n"
+    "  -line to remove                   (prefix with '-')\n"
+    "  +line to add                      (prefix with '+')\n"
+    "  *** End Patch</tool>\n"
+    "  'Add File' body is all '+'-prefixed lines (full file content). 'Delete File' has no body. Include enough surrounding ' ' context that the location is unique; if context matches multiple places the patch fails. Paths must be relative.\n"
+    "  Example:\n"
+    "  <tool>apply_patch\n"
+    "  *** Begin Patch\n"
+    "  *** Update File: src/foo.c\n"
+    "  @@\n"
+    "   int main(void) {\n"
+    "  -    return 0;\n"
+    "  +    printf(\"hello\\n\");\n"
+    "  +    return 0;\n"
+    "   }\n"
+    "  *** End Patch</tool>\n"
+    "\n"
+    "SCAFFOLD TOOL:\n"
+    "- scaffold <name> [<dest_dir>] : Materialize a code template into <dest_dir> (default: .). Requires user approval. Use this BEFORE apply_patch when the user asks for boilerplate (e.g. 'add a new C tool', 'create a server') — the template gives you correct structure (includes, error handling, build snippets), and you only need to apply_patch the parts that need customization. The list of available templates is in 'AVAILABLE TEMPLATES' at the end of this prompt; if you don't see one that fits, skip scaffold and write the file with apply_patch directly.\n"
+    "  Examples: <tool>scaffold c-tool src/server.c</tool>  <tool>scaffold list</tool>\n"
+    "\n"
     "WEB TOOL:\n"
     "- webfetch \"search query\" \"grep regex\" : Takes exactly 2 quoted arguments. First is a web search query. Second is a regex pattern (use | for OR). Fetches the top 5 results in parallel and extracts paragraphs matching the regex. Handles PDFs transparently: if a result URL ends in .pdf it is parsed as PDF, and if an HTML landing page links to a PDF, the PDF is followed and its text is inlined.\n"
     "\n"
@@ -58,6 +96,7 @@ static const char *SYSTEM_PROMPT_FMT =
     "2. Base your answers on the actual content returned by tools. Never assume details.\n"
     "3. One webfetch call is almost always enough — PDFs linked from landing pages are auto-followed. Answer with what you have.\n"
     "4. NEVER call readfile unless the user wrote a concrete path in their own message. Do not fabricate paths like /home/user/... — that file does not exist on this machine.\n"
+    "5. If a tool returns 'User denied execution.', do NOT retry. Explain in plain language why you need it and ask the user.\n"
     "\n"
     "Always be helpful, concise, and accurate.";
 
@@ -473,6 +512,28 @@ static char *run_command(const char *cmd, size_t max_output) {
 #define MINI_BROWSER "/home/alberto/Documentos/MINI_BROWSER/build/mini_browser"
 
 static bool debug_mode = false;
+static bool bash_always_allowed = false;  /* set when user picks "always" in approval prompt */
+static bool apply_patch_always_allowed = false;
+static bool scaffold_always_allowed = false;
+
+typedef enum {
+    PERM_DEFAULT,       /* prompt for bash, apply_patch, scaffold */
+    PERM_ACCEPT_EDITS,  /* auto-approve apply_patch + scaffold; bash still prompts */
+    PERM_BYPASS,        /* auto-approve everything */
+} PermissionMode;
+static PermissionMode permission_mode = PERM_DEFAULT;
+
+static bool plan_mode_active = false;  /* read-only: bash/apply_patch/scaffold blocked */
+
+static const char *perm_mode_name(PermissionMode m) {
+    return m == PERM_DEFAULT      ? "default"
+         : m == PERM_ACCEPT_EDITS ? "accept-edits"
+         :                          "bypass";
+}
+
+/* forward decls: definitions live further down in this file. */
+static int mkdir_p(const char *path);
+static int request_approval(const char *tool_label, const char *cmd);
 
 /* Awk paragraph extractor. Placeholders consumed (in order):
      %s  regex pattern
@@ -989,12 +1050,1628 @@ static void arglist_free(ArgList *al) {
     al->count = 0;
 }
 
+/* ── LSP client (clangd) backing the code_context tool ─────────────── */
+/* Deterministic-first: a structured tool that hands the LLM precise
+ * type/signature info via clangd, instead of asking it to extract
+ * structure from raw text. Hand-rolled minimal JSON path-extractor
+ * keeps the codebase single-file (no vendored JSON library). */
+
+#define LSP_MAX_OPENED 64
+
+typedef struct {
+    pid_t pid;
+    int   in_fd;            /* write to clangd stdin  */
+    int   out_fd;           /* read  from clangd stdout */
+    int   next_id;
+    bool  initialized;
+    char *opened[LSP_MAX_OPENED];   /* URIs we've sent didOpen for */
+    int   n_opened;
+} LspClient;
+
+static LspClient lsp = { -1, -1, -1, 1, false, { NULL }, 0 };
+
+/* ── DEBUG: opt-in via BASI_LSP_DEBUG=1 — writes RPC traffic to /tmp/basi-lsp.log ── */
+static FILE *lsp_dbg_fp = NULL;
+static bool  lsp_dbg_inited = false;
+static void lsp_dbg_init(void) {
+    if (lsp_dbg_inited) return;
+    lsp_dbg_inited = true;
+    if (getenv("BASI_LSP_DEBUG")) {
+        lsp_dbg_fp = fopen("/tmp/basi-lsp.log", "w");
+        if (lsp_dbg_fp) {
+            fprintf(lsp_dbg_fp, "=== BASI LSP debug log (pid %d) ===\n", (int)getpid());
+            fflush(lsp_dbg_fp);
+        }
+    }
+}
+static void lsp_dbg(const char *fmt, ...) {
+    if (!lsp_dbg_fp) return;
+    va_list ap; va_start(ap, fmt);
+    vfprintf(lsp_dbg_fp, fmt, ap);
+    va_end(ap);
+    fflush(lsp_dbg_fp);
+}
+
+/* ── Minimal JSON path extractor ──────────────────────────────────── */
+/* Supports paths like "result.contents.value" or "result.0.uri".
+ * Assumes input is well-formed JSON (LSP responses always are). */
+
+static const char *jx_skip_ws(const char *p) {
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+    return p;
+}
+
+static const char *jx_skip_value(const char *p);
+
+static const char *jx_skip_string(const char *p) {
+    if (*p != '"') return NULL;
+    p++;
+    while (*p && *p != '"') {
+        if (*p == '\\' && p[1]) p += 2;
+        else p++;
+    }
+    return *p == '"' ? p + 1 : NULL;
+}
+
+static const char *jx_skip_object(const char *p) {
+    if (*p != '{') return NULL;
+    p++;
+    p = jx_skip_ws(p);
+    if (*p == '}') return p + 1;
+    while (*p) {
+        p = jx_skip_ws(p);
+        p = jx_skip_string(p);
+        if (!p) return NULL;
+        p = jx_skip_ws(p);
+        if (*p != ':') return NULL;
+        p++;
+        p = jx_skip_ws(p);
+        p = jx_skip_value(p);
+        if (!p) return NULL;
+        p = jx_skip_ws(p);
+        if (*p == ',') { p++; continue; }
+        if (*p == '}') return p + 1;
+        return NULL;
+    }
+    return NULL;
+}
+
+static const char *jx_skip_array(const char *p) {
+    if (*p != '[') return NULL;
+    p++;
+    p = jx_skip_ws(p);
+    if (*p == ']') return p + 1;
+    while (*p) {
+        p = jx_skip_ws(p);
+        p = jx_skip_value(p);
+        if (!p) return NULL;
+        p = jx_skip_ws(p);
+        if (*p == ',') { p++; continue; }
+        if (*p == ']') return p + 1;
+        return NULL;
+    }
+    return NULL;
+}
+
+static const char *jx_skip_value(const char *p) {
+    p = jx_skip_ws(p);
+    if (*p == '"') return jx_skip_string(p);
+    if (*p == '{') return jx_skip_object(p);
+    if (*p == '[') return jx_skip_array(p);
+    while (*p && *p != ',' && *p != '}' && *p != ']' &&
+           *p != ' ' && *p != '\t' && *p != '\n' && *p != '\r') p++;
+    return p;
+}
+
+/* In an object, find the value start of a given key. Returns NULL if missing. */
+static const char *jx_find_key(const char *p, const char *key, size_t klen) {
+    p = jx_skip_ws(p);
+    if (*p != '{') return NULL;
+    p++;
+    while (*p) {
+        p = jx_skip_ws(p);
+        if (*p == '}') return NULL;
+        if (*p != '"') return NULL;
+        p++;
+        const char *k_start = p;
+        while (*p && *p != '"') {
+            if (*p == '\\' && p[1]) p += 2;
+            else p++;
+        }
+        size_t k_len = (size_t)(p - k_start);
+        if (*p == '"') p++;
+        p = jx_skip_ws(p);
+        if (*p != ':') return NULL;
+        p++;
+        p = jx_skip_ws(p);
+        if (k_len == klen && memcmp(k_start, key, klen) == 0) return p;
+        p = jx_skip_value(p);
+        if (!p) return NULL;
+        p = jx_skip_ws(p);
+        if (*p == ',') { p++; continue; }
+        return NULL;
+    }
+    return NULL;
+}
+
+/* In an array, return value start of element at index, or NULL. */
+static const char *jx_array_index(const char *p, int idx) {
+    p = jx_skip_ws(p);
+    if (*p != '[') return NULL;
+    p++;
+    int i = 0;
+    while (*p) {
+        p = jx_skip_ws(p);
+        if (*p == ']') return NULL;
+        if (i == idx) return p;
+        p = jx_skip_value(p);
+        if (!p) return NULL;
+        p = jx_skip_ws(p);
+        if (*p == ',') { p++; i++; continue; }
+        if (*p == ']') return NULL;
+        return NULL;
+    }
+    return NULL;
+}
+
+/* Walk a dotted path. Numeric segments are treated as array indices. */
+static const char *jx_walk(const char *json, const char *path) {
+    const char *p = json;
+    while (*path) {
+        const char *dot = strchr(path, '.');
+        size_t plen = dot ? (size_t)(dot - path) : strlen(path);
+
+        bool is_num = true;
+        for (size_t i = 0; i < plen; i++)
+            if (path[i] < '0' || path[i] > '9') { is_num = false; break; }
+
+        if (is_num) {
+            int idx = 0;
+            for (size_t i = 0; i < plen; i++) idx = idx * 10 + (path[i] - '0');
+            p = jx_array_index(p, idx);
+        } else {
+            p = jx_find_key(p, path, plen);
+        }
+        if (!p) return NULL;
+        path += plen;
+        if (*path == '.') path++;
+    }
+    return p;
+}
+
+/* If p points at a JSON string value, decode it to a heap C string. */
+static char *jx_decode_string(const char *p) {
+    p = jx_skip_ws(p);
+    if (*p != '"') return NULL;
+    p++;
+    StringBuf out;
+    sb_init(&out);
+    while (*p && *p != '"') {
+        if (*p == '\\' && p[1]) {
+            switch (p[1]) {
+                case 'n':  sb_append_char(&out, '\n'); p += 2; break;
+                case 't':  sb_append_char(&out, '\t'); p += 2; break;
+                case 'r':  sb_append_char(&out, '\r'); p += 2; break;
+                case '\\': sb_append_char(&out, '\\'); p += 2; break;
+                case '"':  sb_append_char(&out, '"');  p += 2; break;
+                case '/':  sb_append_char(&out, '/');  p += 2; break;
+                case 'u':  sb_append_char(&out, '?');  p += 6; break;  /* skip unicode v1 */
+                default:   sb_append_char(&out, p[1]); p += 2; break;
+            }
+        } else {
+            sb_append_char(&out, *p);
+            p++;
+        }
+    }
+    return sb_to_str(&out);
+}
+
+static char *jx_get_string(const char *json, const char *path) {
+    const char *p = jx_walk(json, path);
+    return p ? jx_decode_string(p) : NULL;
+}
+
+static long jx_get_int(const char *json, const char *path) {
+    const char *p = jx_walk(json, path);
+    if (!p) return -1;
+    p = jx_skip_ws(p);
+    int sign = 1;
+    if (*p == '-') { sign = -1; p++; }
+    long n = 0;
+    while (*p >= '0' && *p <= '9') { n = n * 10 + (*p - '0'); p++; }
+    return n * sign;
+}
+
+static bool jx_has_key(const char *json, const char *key) {
+    return jx_walk(json, key) != NULL;
+}
+
+/* ── JSON-RPC framing over the clangd pipes ───────────────────────── */
+
+static bool rpc_write(int fd, const char *body, size_t blen) {
+    char hdr[64];
+    int hlen = snprintf(hdr, sizeof(hdr), "Content-Length: %zu\r\n\r\n", blen);
+    if (hlen <= 0) return false;
+    lsp_dbg("[OUT fd=%d] header(%d): Content-Length: %zu\n[OUT body %zu bytes]: %.500s%s\n",
+            fd, hlen, blen, blen, body, blen > 500 ? "...(truncated)" : "");
+    size_t off = 0;
+    while (off < (size_t)hlen) {
+        ssize_t w = write(fd, hdr + off, hlen - off);
+        if (w < 0) { if (errno == EINTR) continue; lsp_dbg("[OUT] write hdr failed: %s\n", strerror(errno)); return false; }
+        off += w;
+    }
+    off = 0;
+    while (off < blen) {
+        ssize_t w = write(fd, body + off, blen - off);
+        if (w < 0) { if (errno == EINTR) continue; lsp_dbg("[OUT] write body failed: %s\n", strerror(errno)); return false; }
+        off += w;
+    }
+    return true;
+}
+
+/* Wait up to timeout_ms for fd to become readable. Returns 1=ready, 0=timeout, -1=error. */
+static int wait_readable(int fd, int timeout_ms) {
+    struct pollfd pfd = { .fd = fd, .events = POLLIN, .revents = 0 };
+    int rv;
+    do { rv = poll(&pfd, 1, timeout_ms); } while (rv < 0 && errno == EINTR);
+    return rv;
+}
+
+static char *rpc_read(int fd, int timeout_ms) {
+    /* Read header until \r\n\r\n */
+    char hdr[1024];
+    size_t n = 0;
+    while (n + 1 < sizeof(hdr)) {
+        int rv = wait_readable(fd, timeout_ms);
+        if (rv == 0) { lsp_dbg("[IN  fd=%d] timeout reading header at byte %zu (timeout=%dms)\n", fd, n, timeout_ms); return NULL; }
+        if (rv < 0)  { lsp_dbg("[IN  fd=%d] poll error: %s\n", fd, strerror(errno)); return NULL; }
+        char c;
+        ssize_t r = read(fd, &c, 1);
+        if (r < 0) { if (errno == EINTR) continue; lsp_dbg("[IN  fd=%d] read error: %s\n", fd, strerror(errno)); return NULL; }
+        if (r == 0) { lsp_dbg("[IN  fd=%d] EOF reading header at byte %zu (header so far: %.*s)\n", fd, n, (int)n, hdr); return NULL; }
+        hdr[n++] = c;
+        if (n >= 4 && hdr[n-4] == '\r' && hdr[n-3] == '\n' &&
+            hdr[n-2] == '\r' && hdr[n-1] == '\n') break;
+    }
+    hdr[n] = '\0';
+    lsp_dbg("[IN  fd=%d] header(%zu): %.*s", fd, n, (int)(n - 4), hdr);
+
+    const char *cl = strstr(hdr, "Content-Length:");
+    if (!cl) { lsp_dbg("[IN ] no Content-Length in header\n"); return NULL; }
+    cl += 15;
+    while (*cl == ' ') cl++;
+    long blen = atol(cl);
+    if (blen <= 0 || blen > 32 * 1024 * 1024) { lsp_dbg("[IN ] invalid Content-Length: %ld\n", blen); return NULL; }
+
+    char *body = malloc(blen + 1);
+    if (!body) return NULL;
+    size_t off = 0;
+    while (off < (size_t)blen) {
+        int rv = wait_readable(fd, timeout_ms);
+        if (rv <= 0) { lsp_dbg("[IN ] timeout/error reading body at offset %zu/%ld\n", off, blen); free(body); return NULL; }
+        ssize_t r = read(fd, body + off, blen - off);
+        if (r < 0) { if (errno == EINTR) continue; free(body); return NULL; }
+        if (r == 0) { lsp_dbg("[IN ] EOF reading body at offset %zu/%ld\n", off, blen); free(body); return NULL; }
+        off += r;
+    }
+    body[blen] = '\0';
+    lsp_dbg("[IN  fd=%d] body(%ld): %.500s%s\n", fd, blen, body, blen > 500 ? "...(truncated)" : "");
+    return body;
+}
+
+/* ── Subprocess: spawn clangd with bidirectional pipes ────────────── */
+
+static bool lsp_spawn(LspClient *c) {
+    int in_pipe[2], out_pipe[2];
+    if (pipe(in_pipe) < 0) return false;
+    if (pipe(out_pipe) < 0) {
+        close(in_pipe[0]); close(in_pipe[1]);
+        return false;
+    }
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(in_pipe[0]); close(in_pipe[1]);
+        close(out_pipe[0]); close(out_pipe[1]);
+        return false;
+    }
+    if (pid == 0) {
+        /* child: clangd. Redirect stderr to /dev/null normally; to a debug
+         * log file when BASI_LSP_DEBUG=1 so we can see clangd's own
+         * diagnostics when something goes wrong. */
+        dup2(in_pipe[0],  STDIN_FILENO);
+        dup2(out_pipe[1], STDOUT_FILENO);
+        const char *stderr_path = getenv("BASI_LSP_DEBUG")
+            ? "/tmp/basi-clangd-stderr.log" : "/dev/null";
+        int errfd = open(stderr_path,
+            getenv("BASI_LSP_DEBUG") ? (O_WRONLY | O_CREAT | O_TRUNC) : O_WRONLY,
+            0644);
+        if (errfd >= 0) {
+            dup2(errfd, STDERR_FILENO);
+            close(errfd);
+        }
+        close(in_pipe[0]); close(in_pipe[1]);
+        close(out_pipe[0]); close(out_pipe[1]);
+        /* Also use --log=verbose under debug so clangd reports more */
+        const char *log_arg = getenv("BASI_LSP_DEBUG") ? "--log=verbose" : "--log=error";
+        execlp("clangd", "clangd", log_arg, "--background-index=false", NULL);
+        _exit(127);
+    }
+    /* parent */
+    close(in_pipe[0]);
+    close(out_pipe[1]);
+    c->pid = pid;
+    c->in_fd = in_pipe[1];
+    c->out_fd = out_pipe[0];
+    c->next_id = 1;
+    c->initialized = false;
+    c->n_opened = 0;
+    return true;
+}
+
+static void lsp_kill(LspClient *c) {
+    if (c->pid <= 0) return;
+    if (c->in_fd >= 0) close(c->in_fd);
+    if (c->out_fd >= 0) close(c->out_fd);
+    kill(c->pid, SIGTERM);
+    int status;
+    waitpid(c->pid, &status, 0);
+    c->pid = -1; c->in_fd = -1; c->out_fd = -1;
+    c->initialized = false;
+    for (int i = 0; i < c->n_opened; i++) free(c->opened[i]);
+    c->n_opened = 0;
+}
+
+/* Send request and wait for matching response (skipping notifications,
+ * auto-replying empty results to server-to-client requests so clangd
+ * doesn't block waiting on us). 60s ceiling per response.
+ *
+ * params + params_len = explicit length, NEVER strlen. Past bug: relying on
+ * strlen of a StringBuf buffer let trailing garbage from realloc'd memory
+ * leak past the null terminator and into the wire, breaking clangd. */
+#define LSP_TIMEOUT_MS 60000
+
+static char *lsp_request(LspClient *c, const char *method,
+                         const char *params, size_t params_len) {
+    int id = c->next_id++;
+    StringBuf body;
+    sb_init(&body);
+    char prefix[256];
+    int plen = snprintf(prefix, sizeof(prefix),
+        "{\"jsonrpc\":\"2.0\",\"id\":%d,\"method\":\"%s\",\"params\":", id, method);
+    sb_append(&body, prefix, (size_t)plen);
+    sb_append(&body, params, params_len);
+    sb_append_char(&body, '}');
+
+    if (!rpc_write(c->in_fd, body.data, body.len)) {
+        sb_free(&body);
+        return NULL;
+    }
+    sb_free(&body);
+
+    char idneedle[32];
+    snprintf(idneedle, sizeof(idneedle), "\"id\":%d", id);
+    while (1) {
+        char *resp = rpc_read(c->out_fd, LSP_TIMEOUT_MS);
+        if (!resp) return NULL;  /* timeout or pipe death — caller treats as failure */
+
+        if (strstr(resp, idneedle)) return resp;
+
+        /* Server-to-client request? (has "method" AND "id"). Reply empty so
+         * clangd unblocks. Otherwise it's a notification — just drop. */
+        if (jx_has_key(resp, "method") && jx_has_key(resp, "id")) {
+            long srv_id = jx_get_int(resp, "id");
+            if (srv_id >= 0) {
+                char reply[128];
+                int rlen = snprintf(reply, sizeof(reply),
+                    "{\"jsonrpc\":\"2.0\",\"id\":%ld,\"result\":null}", srv_id);
+                rpc_write(c->in_fd, reply, (size_t)rlen);
+            }
+        }
+        free(resp);
+    }
+}
+
+static bool lsp_notify(LspClient *c, const char *method,
+                       const char *params, size_t params_len) {
+    StringBuf body;
+    sb_init(&body);
+    char prefix[256];
+    int plen = snprintf(prefix, sizeof(prefix),
+        "{\"jsonrpc\":\"2.0\",\"method\":\"%s\",\"params\":", method);
+    sb_append(&body, prefix, (size_t)plen);
+    sb_append(&body, params, params_len);
+    sb_append_char(&body, '}');
+    /* Diagnostic: dump first 80 + last 30 bytes of body so we can verify
+     * what actually gets written, not just trust strlen / null terminator. */
+    if (lsp_dbg_fp) {
+        lsp_dbg("[notify] params_len=%zu body.len=%zu\n", params_len, body.len);
+        lsp_dbg("[notify] body[0..80]: ");
+        size_t first = body.len < 80 ? body.len : 80;
+        for (size_t i = 0; i < first; i++) lsp_dbg("%c", body.data[i] >= 0x20 && body.data[i] < 0x7f ? body.data[i] : '.');
+        lsp_dbg("\n[notify] body[last 30] hex: ");
+        size_t start = body.len > 30 ? body.len - 30 : 0;
+        for (size_t i = start; i < body.len; i++) lsp_dbg("%02x ", (unsigned char)body.data[i]);
+        lsp_dbg("\n");
+    }
+    bool ok = rpc_write(c->in_fd, body.data, body.len);
+    sb_free(&body);
+    return ok;
+}
+
+/* ── LSP handshake + textDocument lifecycle ───────────────────────── */
+
+static bool lsp_initialize(LspClient *c) {
+    char cwd[1024];
+    if (!getcwd(cwd, sizeof(cwd))) return false;
+
+    char buf[2048];
+    int n = snprintf(buf, sizeof(buf),
+        "{\"processId\":%d,\"rootUri\":\"file://%s\",\"capabilities\":"
+        "{\"textDocument\":{\"hover\":{\"contentFormat\":[\"plaintext\"]},\"definition\":{}}}}",
+        (int)getpid(), cwd);
+
+    char *resp = lsp_request(c, "initialize", buf, (size_t)n);
+    if (!resp) return false;
+    bool ok = !strstr(resp, "\"error\"");
+    free(resp);
+    if (!ok) return false;
+
+    static const char empty_obj[] = "{}";
+    if (!lsp_notify(c, "initialized", empty_obj, sizeof(empty_obj) - 1)) return false;
+    c->initialized = true;
+    return true;
+}
+
+/* JSON-escape a string into a StringBuf (NO surrounding quotes — caller adds them). */
+static void lsp_json_escape(StringBuf *out, const char *s) {
+    for (const char *p = s; *p; p++) {
+        unsigned char b = (unsigned char)*p;
+        if      (*p == '"')  sb_append_str(out, "\\\"");
+        else if (*p == '\\') sb_append_str(out, "\\\\");
+        else if (*p == '\n') sb_append_str(out, "\\n");
+        else if (*p == '\r') sb_append_str(out, "\\r");
+        else if (*p == '\t') sb_append_str(out, "\\t");
+        else if (b < 0x20)   { char hx[8]; snprintf(hx, sizeof(hx), "\\u%04x", b); sb_append_str(out, hx); }
+        else                 sb_append_char(out, *p);
+    }
+}
+
+static char *abs_uri(const char *path) {
+    char abspath[2048];
+    if (path[0] == '/') {
+        snprintf(abspath, sizeof(abspath), "%.2000s", path);
+    } else {
+        char cwd[1024];
+        if (!getcwd(cwd, sizeof(cwd))) return NULL;
+        snprintf(abspath, sizeof(abspath), "%.1000s/%.1000s", cwd, path);
+    }
+    size_t ulen = strlen(abspath) + 8;
+    char *uri = malloc(ulen);
+    snprintf(uri, ulen, "file://%s", abspath);
+    return uri;
+}
+
+/* didOpen on first sight, didChange on subsequent calls. */
+static bool lsp_sync_file(LspClient *c, const char *path, const char *content) {
+    char *uri = abs_uri(path);
+    if (!uri) return false;
+
+    bool first = true;
+    for (int i = 0; i < c->n_opened; i++)
+        if (strcmp(c->opened[i], uri) == 0) { first = false; break; }
+
+    StringBuf p;
+    sb_init(&p);
+    if (first) {
+        sb_append_str(&p, "{\"textDocument\":{\"uri\":\"");
+        lsp_json_escape(&p, uri);
+        sb_append_str(&p, "\",\"languageId\":\"c\",\"version\":1,\"text\":\"");
+        lsp_json_escape(&p, content);
+        sb_append_str(&p, "\"}}");
+        bool ok = lsp_notify(c, "textDocument/didOpen", p.data, p.len);
+        sb_free(&p);
+        if (ok && c->n_opened < LSP_MAX_OPENED)
+            c->opened[c->n_opened++] = uri;
+        else
+            free(uri);
+        return ok;
+    } else {
+        sb_append_str(&p, "{\"textDocument\":{\"uri\":\"");
+        lsp_json_escape(&p, uri);
+        sb_append_str(&p, "\",\"version\":2},\"contentChanges\":[{\"text\":\"");
+        lsp_json_escape(&p, content);
+        sb_append_str(&p, "\"}]}");
+        bool ok = lsp_notify(c, "textDocument/didChange", p.data, p.len);
+        sb_free(&p);
+        free(uri);
+        return ok;
+    }
+}
+
+/* C keywords to skip when picking a hover column. clangd returns null for
+ * hover on type/storage keywords, so first-non-whitespace lands wrong on
+ * lines like `static char *foo(...)`. We walk past these to find the first
+ * real identifier. */
+static const char *const C_HOVER_SKIP_KEYWORDS[] = {
+    "static", "inline", "extern", "const", "volatile", "register", "restrict",
+    "struct", "union", "enum", "typedef", "auto",
+    "int", "char", "void", "bool", "float", "double", "long", "short",
+    "unsigned", "signed", "size_t", "ssize_t", "uint8_t", "uint16_t",
+    "uint32_t", "uint64_t", "int8_t", "int16_t", "int32_t", "int64_t",
+    "if", "else", "for", "while", "do", "switch", "case", "default",
+    "return", "break", "continue", "goto", "sizeof",
+    NULL
+};
+
+static bool is_c_skip_keyword(const char *s, size_t len) {
+    for (const char *const *kw = C_HOVER_SKIP_KEYWORDS; *kw; kw++) {
+        if (strlen(*kw) == len && memcmp(*kw, s, len) == 0) return true;
+    }
+    return false;
+}
+
+/* Find the column of the first non-keyword identifier on the line.
+ * Falls back to first non-whitespace column if none is found. */
+static int find_hover_column(const char *line) {
+    const char *p = line;
+    int fallback = 0;
+    while (*p == ' ' || *p == '\t') { p++; fallback++; }
+    while (*p && *p != '\n') {
+        if ((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') || *p == '_') {
+            const char *id = p;
+            while ((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
+                   (*p >= '0' && *p <= '9') || *p == '_') p++;
+            size_t len = (size_t)(p - id);
+            if (!is_c_skip_keyword(id, len)) return (int)(id - line);
+            while (*p == ' ' || *p == '\t' || *p == '*') p++;
+            continue;
+        }
+        p++;
+    }
+    return fallback;
+}
+
+/* lsp_hover return contract:
+ *   NULL          → transport failure (timeout/pipe death). Caller should kill clangd.
+ *   ""  (empty)   → clangd responded with result:null (no symbol at position). Don't kill.
+ *   "..."         → real hover text (signature, type, docstring). */
+static char *lsp_hover(LspClient *c, const char *path, int line, int col) {
+    char *uri = abs_uri(path);
+    if (!uri) return NULL;
+    char buf[4096];
+    int n = snprintf(buf, sizeof(buf),
+        "{\"textDocument\":{\"uri\":\"%s\"},\"position\":{\"line\":%d,\"character\":%d}}",
+        uri, line, col);
+    free(uri);
+    char *resp = lsp_request(c, "textDocument/hover", buf, (size_t)n);
+    if (!resp) return NULL;  /* transport failure */
+    /* hover result shape: result.contents.value (markup) OR result.contents (string in older spec) */
+    char *value = jx_get_string(resp, "result.contents.value");
+    if (!value) value = jx_get_string(resp, "result.contents");
+    free(resp);
+    return value ? value : strdup("");  /* empty = response ok, no info at position */
+}
+
+/* ── code_context orchestrator ────────────────────────────────────── */
+/* Semantic-only tool: returns ONLY clangd's structural info for a symbol,
+ * fenced so the model can't conflate it with surrounding text. Accepts
+ * either <file>:<line> or <file> <symbol> (the latter is robust to file
+ * edits — internally grep for the symbol's definition line). */
+
+static bool is_id_char(char c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+           (c >= '0' && c <= '9') || c == '_';
+}
+
+/* Find the line number (1-based) where <symbol> appears as a top-level
+ * definition. Heuristic: line starts at column 0, <symbol> appears with
+ * word boundaries, followed by '(' / '=' / ';' / ',' / EOL after optional
+ * whitespace. Returns -1 if not found. */
+static int find_symbol_definition_line(const char *file_path, const char *symbol) {
+    FILE *f = fopen(file_path, "r");
+    if (!f) return -1;
+    char line[4096];
+    int line_num = 0;
+    size_t slen = strlen(symbol);
+
+    while (fgets(line, sizeof(line), f)) {
+        line_num++;
+        if (line[0] == ' ' || line[0] == '\t') continue;  /* indented = function body */
+
+        for (char *p = line; (p = strstr(p, symbol)) != NULL; p++) {
+            bool prev_ok = (p == line) || !is_id_char(*(p - 1));
+            bool next_ok = !is_id_char(p[slen]);
+            if (!prev_ok || !next_ok) continue;
+            const char *q = p + slen;
+            while (*q == ' ' || *q == '\t') q++;
+            if (*q == '(' || *q == '=' || *q == ';' || *q == ',' ||
+                *q == '\n' || *q == '\0') {
+                fclose(f);
+                return line_num;
+            }
+        }
+    }
+    fclose(f);
+    return -1;
+}
+
+static char *execute_code_context(const char *args) {
+    while (*args == ' ' || *args == '\t' || *args == '\n') args++;
+    if (!*args) {
+        return strdup("Error: code_context requires <file>:<line> or <file> <symbol>. "
+                      "Examples: <tool>code_context src/main.c execute_apply_patch</tool> "
+                      "(by symbol — preferred), or <tool>code_context src/main.c:2102</tool>");
+    }
+
+    /* Parse: STRICTLY <file> <symbol> separated by whitespace. One form, no
+     * fallbacks, no colon syntax. Loud, specific errors when the model deviates. */
+    char *file = NULL;
+    char *symbol = NULL;
+    {
+        const char *sep = strpbrk(args, " \t");
+        if (!sep) {
+            return strdup("Error: code_context expects exactly two whitespace-separated arguments: <file> <symbol>. "
+                          "Example: <tool>code_context src/main.c execute_apply_patch</tool>");
+        }
+        size_t flen = (size_t)(sep - args);
+        if (flen == 0) {
+            return strdup("Error: code_context: empty file path before whitespace.");
+        }
+        file = malloc(flen + 1);
+        memcpy(file, args, flen);
+        file[flen] = '\0';
+
+        const char *s = sep;
+        while (*s == ' ' || *s == '\t') s++;
+        const char *e = s;
+        while (*e && *e != ' ' && *e != '\t' && *e != '\n') e++;
+        size_t slen = (size_t)(e - s);
+        if (slen == 0) {
+            free(file);
+            return strdup("Error: code_context: missing symbol name after the file path.");
+        }
+        /* Symbol must be a C identifier — reject digits-first (line numbers) and any
+         * non-identifier characters (parens, colons, etc.). */
+        bool bad_start = (s[0] >= '0' && s[0] <= '9');
+        bool bad_char  = false;
+        if (!bad_start) {
+            for (size_t i = 0; i < slen; i++) {
+                if (!is_id_char(s[i])) { bad_char = true; break; }
+            }
+        }
+        if (bad_start || bad_char) {
+            char *err = malloc(512);
+            snprintf(err, 512,
+                "Error: code_context: '%.100s' is not a valid C identifier. "
+                "Pass only the symbol's name (no line numbers, no colons, no parens). "
+                "Example: <tool>code_context src/main.c execute_apply_patch</tool>",
+                s);
+            free(file);
+            return err;
+        }
+        symbol = malloc(slen + 1);
+        memcpy(symbol, s, slen);
+        symbol[slen] = '\0';
+    }
+
+    /* Find the definition line via grep-style scan. */
+    int line_1based = find_symbol_definition_line(file, symbol);
+    if (line_1based < 0) {
+        char *err = malloc(512);
+        snprintf(err, 512,
+            "code_context: symbol '%.100s' not found as a top-level definition in '%.200s'. "
+            "Check spelling, or grep to confirm it's defined in this file.",
+            symbol, file);
+        free(file); free(symbol);
+        return err;
+    }
+    int line0 = line_1based - 1;
+
+    /* Read file content. */
+    FILE *f = fopen(file, "r");
+    if (!f) {
+        char *e = malloc(512);
+        snprintf(e, 512, "code_context: cannot open '%.300s' (%s)", file, strerror(errno));
+        free(file); free(symbol);
+        return e;
+    }
+    fseek(f, 0, SEEK_END);
+    long fsize = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (fsize <= 0 || fsize > 8 * 1024 * 1024) {
+        fclose(f);
+        free(file); free(symbol);
+        return strdup("code_context: file is empty or larger than 8MB");
+    }
+    char *content = malloc(fsize + 1);
+    size_t nread = fread(content, 1, fsize, f);
+    content[nread] = '\0';
+    fclose(f);
+
+    int total_lines = 0;
+    for (size_t i = 0; i < nread; i++) if (content[i] == '\n') total_lines++;
+    if (content[nread - 1] != '\n') total_lines++;
+    if (line0 >= total_lines) {
+        char *e = malloc(256);
+        snprintf(e, 256, "code_context: line %d out of range (file has %d lines)", line_1based, total_lines);
+        free(file); free(symbol); free(content);
+        return e;
+    }
+
+    /* Pick hover column.
+     *  - For symbol form: hover at the symbol's exact column on its definition line.
+     *  - For file:line form: walk past leading keywords to the first real identifier. */
+    int  hover_col = 0;
+    bool target_is_blank = false;
+    {
+        const char *lp = content;
+        int cur = 0;
+        while (cur < line0 && *lp) { if (*lp == '\n') cur++; lp++; }
+        const char *first_ns = lp;
+        while (*first_ns == ' ' || *first_ns == '\t') first_ns++;
+        target_is_blank = (*first_ns == '\n' || *first_ns == '\0');
+
+        if (!target_is_blank) {
+            const char *line_end = strchr(lp, '\n');
+            const char *p = strstr(lp, symbol);
+            if (p && (!line_end || p < line_end)) {
+                hover_col = (int)(p - lp);
+            } else {
+                hover_col = find_hover_column(lp);
+            }
+        }
+    }
+
+    if (target_is_blank) {
+        /* Should be unreachable since find_symbol_definition_line only returns lines
+         * with non-whitespace content, but handle defensively. */
+        char *err = malloc(512);
+        snprintf(err, 512,
+            "code_context: definition line %d for symbol '%.100s' in '%.200s' resolved to a blank line. "
+            "This usually means find_symbol_definition_line picked the wrong line — file me a bug.",
+            line_1based, symbol, file);
+        free(file); free(symbol); free(content);
+        return err;
+    }
+
+    /* Spawn + initialize clangd lazily on first use. */
+    if (lsp.pid <= 0) {
+        lsp_dbg_init();
+        lsp_dbg("=== code_context request: file=%s line=%d symbol=%s ===\n",
+                file, line_1based, symbol ? symbol : "(none)");
+        printf("\033[90m[Starting clangd... (one-time, can take 10–30s on large codebases)]\033[0m\n");
+        fflush(stdout);
+        if (!lsp_spawn(&lsp)) {
+            free(file); free(symbol); free(content);
+            return strdup("code_context: failed to spawn clangd. Is it installed? Try: pacman -S clang  (or: apt install clangd)");
+        }
+        lsp_dbg("[lsp_spawn] OK pid=%d in_fd=%d out_fd=%d\n", lsp.pid, lsp.in_fd, lsp.out_fd);
+        if (!lsp_initialize(&lsp)) {
+            lsp_dbg("[lsp_initialize] FAILED\n");
+            lsp_kill(&lsp);
+            free(file); free(symbol); free(content);
+            return strdup("code_context: clangd failed to initialize. Check that clangd is in PATH and the project compiles.");
+        }
+        lsp_dbg("[lsp_initialize] OK\n");
+    }
+
+    if (!lsp_sync_file(&lsp, file, content)) {
+        lsp_kill(&lsp);
+        free(file); free(symbol); free(content);
+        return strdup("code_context: failed to sync file with clangd (clangd likely died — will respawn on next call)");
+    }
+
+    char *hover_text = lsp_hover(&lsp, file, line0, hover_col);
+    if (hover_text == NULL) lsp_kill(&lsp);
+
+    /* Build SEMANTIC-ONLY response. No surrounding lines (grep -C handles that).
+     * Hover text is fenced so the model can't claim non-clangd content as clangd output. */
+    StringBuf out;
+    sb_init(&out);
+    char header[512];
+    snprintf(header, sizeof(header), "symbol: %.100s\nfile: %.200s:%d\n", symbol, file, line_1based);
+    sb_append_str(&out, header);
+
+    if (hover_text && *hover_text) {
+        sb_append_str(&out, "\n=== begin clangd ===\n");
+        sb_append_str(&out, hover_text);
+        if (hover_text[strlen(hover_text) - 1] != '\n') sb_append_char(&out, '\n');
+        sb_append_str(&out, "=== end clangd ===\n");
+    } else {
+        sb_append_str(&out,
+            "\n=== begin clangd ===\n(no symbol info — clangd couldn't resolve the symbol)\n=== end clangd ===\n"
+            "Most likely cause: compile_commands.json missing or out of date.\n");
+    }
+    free(hover_text);
+
+    free(file); free(symbol); free(content);
+    return sb_to_str(&out);
+}
+
+/* ── apply_patch: Codex-style freeform diff ───────────────────────── */
+
+typedef enum { OP_ADD, OP_DELETE, OP_UPDATE } PatchOpKind;
+
+typedef struct {
+    char *before;   /* concatenated " "+"-" lines (with newlines); empty for OP_ADD */
+    char *after;    /* concatenated " "+"+" lines */
+} PatchHunk;
+
+typedef struct {
+    PatchOpKind kind;
+    char       *path;
+    PatchHunk  *hunks;
+    int         n_hunks;
+} PatchFileOp;
+
+typedef struct {
+    PatchFileOp *ops;
+    int          n_ops;
+    char        *error;   /* NULL on success */
+} ParsedPatch;
+
+static char *take_line(const char **p) {
+    if (!**p) return NULL;
+    const char *start = *p;
+    const char *nl = strchr(start, '\n');
+    size_t len = nl ? (size_t)(nl - start) : strlen(start);
+    char *line = malloc(len + 1);
+    memcpy(line, start, len);
+    line[len] = '\0';
+    *p = nl ? nl + 1 : start + len;
+    return line;
+}
+
+static void free_parsed_patch(ParsedPatch *p) {
+    if (!p) return;
+    for (int i = 0; i < p->n_ops; i++) {
+        free(p->ops[i].path);
+        for (int j = 0; j < p->ops[i].n_hunks; j++) {
+            free(p->ops[i].hunks[j].before);
+            free(p->ops[i].hunks[j].after);
+        }
+        free(p->ops[i].hunks);
+    }
+    free(p->ops);
+    free(p->error);
+    free(p);
+}
+
+static void flush_hunk(PatchFileOp *op, StringBuf *before, StringBuf *after) {
+    op->hunks = realloc(op->hunks, sizeof(PatchHunk) * (op->n_hunks + 1));
+    op->hunks[op->n_hunks].before = strdup(before->len ? before->data : "");
+    op->hunks[op->n_hunks].after  = strdup(after->len  ? after->data  : "");
+    op->n_hunks++;
+    sb_clear(before);
+    sb_clear(after);
+}
+
+static ParsedPatch *parse_patch(const char *text) {
+    ParsedPatch *p = calloc(1, sizeof(*p));
+    int op_cap = 0;
+    PatchFileOp *cur = NULL;
+    StringBuf before, after;
+    sb_init(&before);
+    sb_init(&after);
+    bool in_hunk = false;
+
+    while (*text == ' ' || *text == '\t' || *text == '\n') text++;
+
+    char *line = take_line(&text);
+    if (!line || strcmp(line, "*** Begin Patch") != 0) {
+        p->error = strdup("apply_patch: missing '*** Begin Patch' marker on first line");
+        free(line);
+        sb_free(&before); sb_free(&after);
+        return p;
+    }
+    free(line);
+
+    while ((line = take_line(&text)) != NULL) {
+        if (strcmp(line, "*** End Patch") == 0) {
+            free(line);
+            if (in_hunk && cur) flush_hunk(cur, &before, &after);
+            sb_free(&before); sb_free(&after);
+            return p;
+        }
+
+        if (strncmp(line, "*** ", 4) == 0) {
+            if (in_hunk && cur) { flush_hunk(cur, &before, &after); in_hunk = false; }
+
+            if (p->n_ops >= op_cap) {
+                op_cap = op_cap ? op_cap * 2 : 4;
+                p->ops = realloc(p->ops, sizeof(PatchFileOp) * op_cap);
+            }
+            cur = &p->ops[p->n_ops++];
+            memset(cur, 0, sizeof(*cur));
+
+            if (strncmp(line, "*** Add File: ", 14) == 0) {
+                cur->kind = OP_ADD;
+                cur->path = strdup(line + 14);
+                in_hunk = true;
+            } else if (strncmp(line, "*** Delete File: ", 17) == 0) {
+                cur->kind = OP_DELETE;
+                cur->path = strdup(line + 17);
+                in_hunk = false;
+            } else if (strncmp(line, "*** Update File: ", 17) == 0) {
+                cur->kind = OP_UPDATE;
+                cur->path = strdup(line + 17);
+                in_hunk = false;
+            } else {
+                p->error = malloc(256);
+                snprintf(p->error, 256, "apply_patch: unknown directive: %.180s", line);
+                free(line);
+                sb_free(&before); sb_free(&after);
+                return p;
+            }
+            free(line);
+            continue;
+        }
+
+        if (!cur) {
+            p->error = strdup("apply_patch: content before any '*** Add/Delete/Update File:' directive");
+            free(line);
+            sb_free(&before); sb_free(&after);
+            return p;
+        }
+
+        if (cur->kind == OP_DELETE) {
+            if (line[0] != '\0') {
+                p->error = strdup("apply_patch: 'Delete File' takes no body lines");
+                free(line);
+                sb_free(&before); sb_free(&after);
+                return p;
+            }
+            free(line);
+            continue;
+        }
+
+        if (strncmp(line, "@@", 2) == 0 && cur->kind == OP_UPDATE) {
+            if (in_hunk) flush_hunk(cur, &before, &after);
+            in_hunk = true;
+            free(line);
+            continue;
+        }
+
+        char prefix = line[0];
+        const char *body = (prefix == '\0') ? "" : line + 1;
+
+        if (cur->kind == OP_ADD) {
+            if (prefix != '+' && prefix != '\0') {
+                p->error = malloc(256);
+                snprintf(p->error, 256,
+                    "apply_patch: 'Add File' line must start with '+': %.180s", line);
+                free(line);
+                sb_free(&before); sb_free(&after);
+                return p;
+            }
+            sb_append_str(&after, prefix == '\0' ? "" : body);
+            sb_append_char(&after, '\n');
+        } else { /* OP_UPDATE */
+            in_hunk = true;
+            if (prefix == ' ' || prefix == '\0') {
+                sb_append_str(&before, prefix == '\0' ? "" : body);
+                sb_append_char(&before, '\n');
+                sb_append_str(&after,  prefix == '\0' ? "" : body);
+                sb_append_char(&after,  '\n');
+            } else if (prefix == '-') {
+                sb_append_str(&before, body);
+                sb_append_char(&before, '\n');
+            } else if (prefix == '+') {
+                sb_append_str(&after, body);
+                sb_append_char(&after, '\n');
+            } else {
+                p->error = malloc(256);
+                snprintf(p->error, 256,
+                    "apply_patch: hunk line must start with ' ', '-', or '+': %.180s", line);
+                free(line);
+                sb_free(&before); sb_free(&after);
+                return p;
+            }
+        }
+        free(line);
+    }
+
+    /* EOF without explicit '*** End Patch' — accept and flush. */
+    if (in_hunk && cur) flush_hunk(cur, &before, &after);
+    sb_free(&before); sb_free(&after);
+    return p;
+}
+
+static char *apply_add_file(const char *path, const char *content) {
+    struct stat st;
+    if (stat(path, &st) == 0) {
+        char *e = malloc(512);
+        snprintf(e, 512,
+            "apply_patch: '%s' already exists. Use 'Update File' instead of 'Add File'.", path);
+        return e;
+    }
+    char *path_copy = strdup(path);
+    char *dir = dirname(path_copy);
+    if (strcmp(dir, ".") != 0 && strcmp(dir, "/") != 0) mkdir_p(dir);
+    free(path_copy);
+
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        char *e = malloc(512);
+        snprintf(e, 512, "apply_patch: cannot create '%s' (%s)", path, strerror(errno));
+        return e;
+    }
+    if (content && *content) fwrite(content, 1, strlen(content), f);
+    fclose(f);
+    return NULL;
+}
+
+static char *apply_delete_file(const char *path) {
+    if (unlink(path) != 0) {
+        char *e = malloc(512);
+        snprintf(e, 512, "apply_patch: cannot delete '%s' (%s)", path, strerror(errno));
+        return e;
+    }
+    return NULL;
+}
+
+static char *apply_update_file(const char *path, PatchFileOp *op) {
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        char *e = malloc(512);
+        snprintf(e, 512, "apply_patch: cannot open '%s' for update (%s)", path, strerror(errno));
+        return e;
+    }
+    fseek(f, 0, SEEK_END);
+    long fsize = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    char *orig = malloc(fsize + 1);
+    size_t nread = fread(orig, 1, fsize, f);
+    orig[nread] = '\0';
+    fclose(f);
+
+    StringBuf cur;
+    sb_init(&cur);
+    sb_append(&cur, orig, nread);
+    free(orig);
+
+    for (int i = 0; i < op->n_hunks; i++) {
+        const char *bef = op->hunks[i].before;
+        const char *aft = op->hunks[i].after;
+
+        if (!bef || !*bef) {
+            char *e = malloc(512);
+            snprintf(e, 512,
+                "apply_patch: hunk %d in '%s' has no context — include at least one ' ' or '-' line.",
+                i + 1, path);
+            sb_free(&cur);
+            return e;
+        }
+
+        char *match = memmem(cur.data, cur.len, bef, strlen(bef));
+        if (!match) {
+            char *e = malloc(1024);
+            snprintf(e, 1024,
+                "apply_patch: hunk %d in '%s' — context not found. Re-read the file and verify the ' ' and '-' lines match exactly (including whitespace).",
+                i + 1, path);
+            sb_free(&cur);
+            return e;
+        }
+        size_t bef_len = strlen(bef);
+        char *next = memmem(match + 1, cur.len - (match - cur.data) - 1, bef, bef_len);
+        if (next) {
+            char *e = malloc(1024);
+            snprintf(e, 1024,
+                "apply_patch: hunk %d in '%s' — context matches multiple locations. Add more surrounding ' ' lines to disambiguate.",
+                i + 1, path);
+            sb_free(&cur);
+            return e;
+        }
+
+        size_t aft_len = strlen(aft);
+        size_t prefix_len = match - cur.data;
+        size_t suffix_len = cur.len - prefix_len - bef_len;
+
+        StringBuf nxt;
+        sb_init(&nxt);
+        sb_append(&nxt, cur.data, prefix_len);
+        sb_append(&nxt, aft, aft_len);
+        sb_append(&nxt, cur.data + prefix_len + bef_len, suffix_len);
+        sb_free(&cur);
+        cur = nxt;
+    }
+
+    f = fopen(path, "w");
+    if (!f) {
+        char *e = malloc(512);
+        snprintf(e, 512, "apply_patch: cannot write '%s' (%s)", path, strerror(errno));
+        sb_free(&cur);
+        return e;
+    }
+    if (cur.len) fwrite(cur.data, 1, cur.len, f);
+    fclose(f);
+    sb_free(&cur);
+    return NULL;
+}
+
+static char *execute_apply_patch(const char *patch_text) {
+    ParsedPatch *p = parse_patch(patch_text);
+    if (p->error) {
+        char *err = strdup(p->error);
+        free_parsed_patch(p);
+        return err;
+    }
+    if (p->n_ops == 0) {
+        free_parsed_patch(p);
+        return strdup("apply_patch: empty patch (no Add/Delete/Update File directives)");
+    }
+
+    StringBuf summary;
+    sb_init(&summary);
+    for (int i = 0; i < p->n_ops; i++) {
+        char line[512];
+        const char *kind = p->ops[i].kind == OP_ADD    ? "add"
+                         : p->ops[i].kind == OP_DELETE ? "delete"
+                         :                               "edit";
+        if (p->ops[i].kind == OP_UPDATE) {
+            snprintf(line, sizeof(line), "%s%s %s (%d hunk%s)",
+                i ? ", " : "", kind, p->ops[i].path, p->ops[i].n_hunks,
+                p->ops[i].n_hunks == 1 ? "" : "s");
+        } else {
+            snprintf(line, sizeof(line), "%s%s %s",
+                i ? ", " : "", kind, p->ops[i].path);
+        }
+        sb_append_str(&summary, line);
+    }
+
+    bool ap_auto = (permission_mode == PERM_BYPASS)
+                || (permission_mode == PERM_ACCEPT_EDITS)
+                || apply_patch_always_allowed;
+    if (!ap_auto) {
+        printf("\n\033[36m%s\033[0m\n", patch_text);
+        char *summary_str = sb_to_str(&summary);
+        int decision = request_approval("apply_patch", summary_str);
+        free(summary_str);
+        if (decision == 0) {
+            free_parsed_patch(p);
+            return strdup("User denied execution.");
+        }
+        if (decision == 2) apply_patch_always_allowed = true;
+    } else {
+        sb_free(&summary);
+    }
+
+    StringBuf result;
+    sb_init(&result);
+    int succeeded = 0;
+    for (int i = 0; i < p->n_ops; i++) {
+        char *err = NULL;
+        if (p->ops[i].kind == OP_ADD) {
+            const char *content = (p->ops[i].n_hunks > 0) ? p->ops[i].hunks[0].after : "";
+            err = apply_add_file(p->ops[i].path, content);
+        } else if (p->ops[i].kind == OP_DELETE) {
+            err = apply_delete_file(p->ops[i].path);
+        } else {
+            err = apply_update_file(p->ops[i].path, &p->ops[i]);
+        }
+
+        if (err) {
+            sb_append_str(&result, err);
+            sb_append_char(&result, '\n');
+            free(err);
+            if (succeeded) sb_append_str(&result, "WARNING: patch was partially applied; earlier files were modified.\n");
+            free_parsed_patch(p);
+            return sb_to_str(&result);
+        }
+        char ok[512];
+        const char *kind = p->ops[i].kind == OP_ADD    ? "Added"
+                         : p->ops[i].kind == OP_DELETE ? "Deleted"
+                         :                               "Updated";
+        snprintf(ok, sizeof(ok), "%s %s\n", kind, p->ops[i].path);
+        sb_append_str(&result, ok);
+        succeeded++;
+    }
+
+    free_parsed_patch(p);
+    return sb_to_str(&result);
+}
+
+/* ── Scaffold templates ──────────────────────────────────────────── */
+
+typedef struct {
+    char       *root;
+    const char *label;
+} TemplateRoot;
+
+static int discover_template_roots(TemplateRoot roots[2]) {
+    int n = 0;
+    struct stat st;
+
+    if (stat("./.basi/templates", &st) == 0 && S_ISDIR(st.st_mode)) {
+        roots[n].root = strdup("./.basi/templates");
+        roots[n].label = "project";
+        n++;
+    }
+    const char *home = getenv("HOME");
+    if (home) {
+        char user[1024];
+        snprintf(user, sizeof(user), "%s/.config/basi-cli/templates", home);
+        if (stat(user, &st) == 0 && S_ISDIR(st.st_mode)) {
+            roots[n].root = strdup(user);
+            roots[n].label = "user";
+            n++;
+        }
+    }
+    return n;
+}
+
+static void free_template_roots(TemplateRoot roots[2], int n) {
+    for (int i = 0; i < n; i++) free(roots[i].root);
+}
+
+/* Read 'description: ...' or 'post_message: ...' from <dir>/_meta. */
+static char *read_meta_field(const char *template_dir, const char *field) {
+    char meta_path[2048];
+    snprintf(meta_path, sizeof(meta_path), "%s/_meta", template_dir);
+    FILE *f = fopen(meta_path, "r");
+    if (!f) return strdup("");
+
+    size_t flen = strlen(field);
+    char line[1024];
+    while (fgets(line, sizeof(line), f)) {
+        if (strncmp(line, field, flen) == 0 && line[flen] == ':') {
+            const char *v = line + flen + 1;
+            while (*v == ' ' || *v == '\t') v++;
+            size_t len = strlen(v);
+            while (len > 0 && (v[len-1] == '\n' || v[len-1] == '\r' || v[len-1] == ' ')) len--;
+            char *r = malloc(len + 1);
+            memcpy(r, v, len);
+            r[len] = '\0';
+            fclose(f);
+            return r;
+        }
+    }
+    fclose(f);
+    return strdup("");
+}
+
+/* Build a string like "  - name1 — desc1\n  - name2 — desc2\n" across all roots.
+ * Returns malloc'd string. Project-scope templates shadow user-scope by name. */
+static char *build_templates_index(void) {
+    TemplateRoot roots[2];
+    int nroots = discover_template_roots(roots);
+
+    StringBuf sb;
+    sb_init(&sb);
+    char **seen = NULL;
+    int n_seen = 0, cap_seen = 0;
+
+    for (int i = 0; i < nroots; i++) {
+        DIR *d = opendir(roots[i].root);
+        if (!d) continue;
+        struct dirent *e;
+        while ((e = readdir(d))) {
+            if (e->d_name[0] == '.') continue;
+
+            bool dup = false;
+            for (int j = 0; j < n_seen; j++)
+                if (strcmp(seen[j], e->d_name) == 0) { dup = true; break; }
+            if (dup) continue;
+
+            char tdir[2048];
+            snprintf(tdir, sizeof(tdir), "%s/%s", roots[i].root, e->d_name);
+            struct stat st;
+            if (stat(tdir, &st) != 0 || !S_ISDIR(st.st_mode)) continue;
+
+            char *desc = read_meta_field(tdir, "description");
+            char line[1024];
+            snprintf(line, sizeof(line), "  - %s — %s\n",
+                     e->d_name, *desc ? desc : "(no description)");
+            sb_append_str(&sb, line);
+            free(desc);
+
+            if (n_seen >= cap_seen) {
+                cap_seen = cap_seen ? cap_seen * 2 : 8;
+                seen = realloc(seen, cap_seen * sizeof(char *));
+            }
+            seen[n_seen++] = strdup(e->d_name);
+        }
+        closedir(d);
+    }
+
+    for (int i = 0; i < n_seen; i++) free(seen[i]);
+    free(seen);
+    free_template_roots(roots, nroots);
+
+    if (sb.len == 0) {
+        sb_free(&sb);
+        return strdup("  (none — to add one: mkdir -p ~/.config/basi-cli/templates/<name>, drop files inside, and add a '_meta' file with 'description: ...')\n");
+    }
+    return sb_to_str(&sb);
+}
+
+/* Find a template by name. Returns malloc'd absolute path or NULL. */
+static char *find_template_dir(const char *name) {
+    if (!name || !*name) return NULL;
+    for (const char *p = name; *p; p++)
+        if (*p == '/' || *p == '\\') return NULL;
+    if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) return NULL;
+
+    TemplateRoot roots[2];
+    int nroots = discover_template_roots(roots);
+    char *result = NULL;
+    for (int i = 0; i < nroots; i++) {
+        char path[2048];
+        snprintf(path, sizeof(path), "%s/%s", roots[i].root, name);
+        struct stat st;
+        if (stat(path, &st) == 0 && S_ISDIR(st.st_mode)) {
+            result = strdup(path);
+            break;
+        }
+    }
+    free_template_roots(roots, nroots);
+    return result;
+}
+
+/* Recursively copy template tree (skipping '_meta'). Returns NULL on success,
+ * heap error string on failure. Appends each created file path to created. */
+static char *copy_template_dir(const char *src, const char *dst, StringBuf *created) {
+    if (mkdir_p(dst) != 0) {
+        char *e = malloc(512);
+        snprintf(e, 512, "scaffold: cannot create '%s' (%s)", dst, strerror(errno));
+        return e;
+    }
+
+    DIR *d = opendir(src);
+    if (!d) {
+        char *e = malloc(512);
+        snprintf(e, 512, "scaffold: cannot open template '%s'", src);
+        return e;
+    }
+
+    struct dirent *ent;
+    while ((ent = readdir(d))) {
+        if (ent->d_name[0] == '.') continue;
+        if (strcmp(ent->d_name, "_meta") == 0) continue;
+
+        char src_path[2048], dst_path[2048];
+        snprintf(src_path, sizeof(src_path), "%s/%s", src, ent->d_name);
+        snprintf(dst_path, sizeof(dst_path), "%s/%s", dst, ent->d_name);
+
+        struct stat st;
+        if (stat(src_path, &st) != 0) continue;
+
+        if (S_ISDIR(st.st_mode)) {
+            char *e = copy_template_dir(src_path, dst_path, created);
+            if (e) { closedir(d); return e; }
+        } else if (S_ISREG(st.st_mode)) {
+            struct stat dst_st;
+            if (stat(dst_path, &dst_st) == 0) {
+                char *e = malloc(512);
+                snprintf(e, 512, "scaffold: '%.300s' already exists; refusing to overwrite", dst_path);
+                closedir(d);
+                return e;
+            }
+            FILE *fs = fopen(src_path, "rb");
+            FILE *fd = fopen(dst_path, "wb");
+            if (!fs || !fd) {
+                if (fs) fclose(fs);
+                if (fd) fclose(fd);
+                char *e = malloc(512);
+                snprintf(e, 512, "scaffold: cannot copy '%.180s' -> '%.180s'", src_path, dst_path);
+                closedir(d);
+                return e;
+            }
+            char buf[4096];
+            size_t n;
+            while ((n = fread(buf, 1, sizeof(buf), fs)) > 0)
+                fwrite(buf, 1, n, fd);
+            fclose(fs);
+            fclose(fd);
+            sb_append_str(created, dst_path);
+            sb_append_char(created, '\n');
+        }
+    }
+    closedir(d);
+    return NULL;
+}
+
+static char *execute_scaffold(const char *args) {
+    while (*args == ' ' || *args == '\t' || *args == '\n') args++;
+    if (!*args) {
+        return strdup("Error: scaffold requires a template name. Usage: <tool>scaffold <name> [<dest>]</tool> or <tool>scaffold list</tool>");
+    }
+
+    /* scaffold list */
+    if (strncmp(args, "list", 4) == 0 &&
+        (args[4] == '\0' || args[4] == ' ' || args[4] == '\t' || args[4] == '\n')) {
+        char *idx = build_templates_index();
+        size_t need = strlen(idx) + 32;
+        char *result = malloc(need);
+        snprintf(result, need, "Available templates:\n%s", idx);
+        free(idx);
+        return result;
+    }
+
+    /* parse name */
+    const char *name_end = args;
+    while (*name_end && *name_end != ' ' && *name_end != '\t' && *name_end != '\n') name_end++;
+    size_t name_len = name_end - args;
+    char *name = malloc(name_len + 1);
+    memcpy(name, args, name_len);
+    name[name_len] = '\0';
+
+    /* parse dest (default ".") */
+    const char *dest_start = name_end;
+    while (*dest_start == ' ' || *dest_start == '\t' || *dest_start == '\n') dest_start++;
+    char *dest;
+    if (*dest_start) {
+        const char *dest_end = dest_start;
+        while (*dest_end && *dest_end != ' ' && *dest_end != '\t' && *dest_end != '\n') dest_end++;
+        size_t dest_len = dest_end - dest_start;
+        dest = malloc(dest_len + 1);
+        memcpy(dest, dest_start, dest_len);
+        dest[dest_len] = '\0';
+    } else {
+        dest = strdup(".");
+    }
+
+    char *template_dir = find_template_dir(name);
+    if (!template_dir) {
+        char *e = malloc(512 + name_len);
+        snprintf(e, 512 + name_len,
+            "scaffold: template '%s' not found. Use <tool>scaffold list</tool> to see available templates.", name);
+        free(name);
+        free(dest);
+        return e;
+    }
+
+    bool sc_auto = (permission_mode == PERM_BYPASS)
+                || (permission_mode == PERM_ACCEPT_EDITS)
+                || scaffold_always_allowed;
+    if (!sc_auto) {
+        char prompt_line[1024];
+        snprintf(prompt_line, sizeof(prompt_line), "%s -> %s", name, dest);
+        int decision = request_approval("scaffold", prompt_line);
+        if (decision == 0) {
+            free(name); free(dest); free(template_dir);
+            return strdup("User denied execution.");
+        }
+        if (decision == 2) scaffold_always_allowed = true;
+    }
+
+    StringBuf created;
+    sb_init(&created);
+    char *err = copy_template_dir(template_dir, dest, &created);
+    char *post = read_meta_field(template_dir, "post_message");
+
+    StringBuf result;
+    sb_init(&result);
+    if (err) {
+        sb_append_str(&result, err);
+        free(err);
+    } else {
+        sb_append_str(&result, "Created files:\n");
+        sb_append_str(&result, created.len ? created.data : "(none)\n");
+        if (*post) {
+            sb_append_str(&result, "\nNote: ");
+            sb_append_str(&result, post);
+            sb_append_char(&result, '\n');
+        }
+    }
+
+    sb_free(&created);
+    free(post);
+    free(name);
+    free(dest);
+    free(template_dir);
+    return sb_to_str(&result);
+}
+
+/* ── Approval prompt for risky tools ──────────────────────────────── */
+
+static int request_approval(const char *tool_label, const char *cmd) {
+    /* returns: 0 = deny, 1 = allow once, 2 = always allow (caller sets flag) */
+    bool was_raw = raw_mode_enabled;
+    if (was_raw) disable_raw_mode();
+
+    printf("\n\033[33m>> Allow %s to run:\033[0m %s\n", tool_label, cmd);
+    printf("\033[33m   [y]es / [n]o / [a]lways:\033[0m ");
+    fflush(stdout);
+
+    int decision = 0;
+    char buf[16];
+    if (fgets(buf, sizeof(buf), stdin)) {
+        char c = buf[0];
+        if (c == 'y' || c == 'Y') decision = 1;
+        else if (c == 'a' || c == 'A') decision = 2;
+    }
+
+    if (was_raw) enable_raw_mode();
+    return decision;
+}
+
 /* ── Execute tool command ──────────────────────────────────────────── */
 
 static char *execute_tool(const char *command) {
     /* trim whitespace */
     while (*command == ' ' || *command == '\t' || *command == '\n') command++;
     if (!*command) return strdup("Error: Empty command");
+
+    /* Plan mode: block bash, apply_patch, and scaffold (except 'scaffold list'). */
+    if (plan_mode_active) {
+        if (strncmp(command, "bash", 4) == 0 &&
+            (command[4] == ' ' || command[4] == '\t' || command[4] == '\n' || command[4] == '\0')) {
+            return strdup("bash not allowed in plan mode (read-only). Exit with /plan off, or write your final plan inside <plan>...</plan> tags.");
+        }
+        if (strncmp(command, "apply_patch", 11) == 0 &&
+            (command[11] == ' ' || command[11] == '\t' || command[11] == '\n' || command[11] == '\0')) {
+            return strdup("apply_patch not allowed in plan mode (read-only). Exit with /plan off, or write your final plan inside <plan>...</plan> tags.");
+        }
+        if (strncmp(command, "scaffold", 8) == 0 &&
+            (command[8] == ' ' || command[8] == '\t' || command[8] == '\n' || command[8] == '\0')) {
+            const char *a = command + 8;
+            while (*a == ' ' || *a == '\t') a++;
+            if (strncmp(a, "list", 4) != 0) {
+                return strdup("scaffold (except 'list') not allowed in plan mode (read-only). Exit with /plan off, or write your final plan inside <plan>...</plan> tags.");
+            }
+        }
+    }
+
+    /* code_context: structured query via clangd LSP (read-only, no approval). */
+    if (strncmp(command, "code_context", 12) == 0) {
+        char after = command[12];
+        if (after == ' ' || after == '\t' || after == '\n' || after == '\0') {
+            return execute_code_context(command + 12);
+        }
+    }
+
+    /* scaffold: copy a template tree to dest, with approval. */
+    if (strncmp(command, "scaffold", 8) == 0) {
+        char after = command[8];
+        if (after == ' ' || after == '\t' || after == '\n' || after == '\0') {
+            return execute_scaffold(command + 8);
+        }
+    }
+
+    /* apply_patch: pass through entire patch body, parse + apply. */
+    if (strncmp(command, "apply_patch", 11) == 0) {
+        char after = command[11];
+        if (after == ' ' || after == '\t' || after == '\n' || after == '\0') {
+            const char *patch_text = command + 11;
+            while (*patch_text == ' ' || *patch_text == '\t' || *patch_text == '\n') patch_text++;
+            if (!*patch_text) {
+                return strdup("Error: apply_patch requires a patch body. See system prompt for grammar.");
+            }
+            return execute_apply_patch(patch_text);
+        }
+    }
+
+    /* bash: pass through raw command line (no tokenization), gated by approval. */
+    if (strncmp(command, "bash", 4) == 0) {
+        char after = command[4];
+        if (after == ' ' || after == '\t' || after == '\n' || after == '\0') {
+            const char *shell_cmd = command + 4;
+            while (*shell_cmd == ' ' || *shell_cmd == '\t' || *shell_cmd == '\n') shell_cmd++;
+            if (!*shell_cmd) {
+                return strdup("Error: bash requires a command, e.g. <tool>bash ls -la</tool>");
+            }
+
+            bool auto_approve = (permission_mode == PERM_BYPASS) || bash_always_allowed;
+            if (!auto_approve) {
+                int decision = request_approval("bash", shell_cmd);
+                if (decision == 0) return strdup("User denied execution.");
+                if (decision == 2) bash_always_allowed = true;
+            }
+
+            StringBuf wrapped;
+            sb_init(&wrapped);
+            sb_append_str(&wrapped, "bash -c '");
+            for (const char *c = shell_cmd; *c; c++) {
+                if (*c == '\'') sb_append_str(&wrapped, "'\"'\"'");
+                else sb_append_char(&wrapped, *c);
+            }
+            sb_append_str(&wrapped, "' 2>&1");
+            char *result = run_command(sb_to_str(&wrapped), 512 * 1024);
+            sb_free(&wrapped);
+            return result;
+        }
+    }
 
     ArgList al = tokenize_command(command);
     if (al.count == 0) {
@@ -1015,7 +2692,7 @@ static char *execute_tool(const char *command) {
     if (!is_allowed) {
         char *msg = malloc(256);
         snprintf(msg, 256,
-            "Error: Command '%s' not allowed. Use: read, head, tail, grep, wc, webfetch, readfile", cmd);
+            "Error: Command '%s' not allowed. Use: read, head, tail, grep, wc, bash, apply_patch, scaffold, code_context, webfetch, readfile", cmd);
         arglist_free(&al);
         return msg;
     }
@@ -2373,6 +4050,10 @@ int main(int argc, char **argv) {
     size_t msg_count = 0;
     size_t msg_cap   = 0;
 
+    /* Running token totals for /cost */
+    size_t session_prompt_tokens = 0;
+    size_t session_gen_tokens    = 0;
+
     /* Session file (set after picker; system messages are not persisted) */
     FILE *session_fp = NULL;
 
@@ -2396,8 +4077,46 @@ int main(int argc, char **argv) {
         struct tm *t = localtime(&now);
         strftime(date_str, sizeof(date_str), "%Y-%m-%d", t);
     }
-    char system_prompt[4096];
+    char system_prompt[16384];
     snprintf(system_prompt, sizeof(system_prompt), SYSTEM_PROMPT_FMT, date_str);
+    {
+        char *templates_idx = build_templates_index();
+        size_t cur_len = strlen(system_prompt);
+        snprintf(system_prompt + cur_len, sizeof(system_prompt) - cur_len,
+            "\n\nAVAILABLE TEMPLATES (use the scaffold tool):\n%s", templates_idx);
+        free(templates_idx);
+    }
+    /* Project memory: append ./BASI.md if present. Context for the model,
+     * not enforcement — tools and rules above take precedence. */
+    {
+        FILE *bf = fopen("BASI.md", "r");
+        if (bf) {
+            fseek(bf, 0, SEEK_END);
+            long fsize = ftell(bf);
+            fseek(bf, 0, SEEK_SET);
+            if (fsize > 0) {
+                size_t cur_len = strlen(system_prompt);
+                size_t avail = sizeof(system_prompt) - cur_len - 1;
+                const char *header =
+                    "\n\nPROJECT MEMORY (from ./BASI.md — facts and conventions for this codebase; tools and rules above take precedence):\n";
+                size_t hlen = strlen(header);
+                if (avail > hlen + 200) {
+                    memcpy(system_prompt + cur_len, header, hlen);
+                    cur_len += hlen;
+                    avail -= hlen;
+                    size_t cap = 4000;  /* ~1000 tokens; small models tune out beyond this */
+                    size_t to_read = (size_t)fsize < cap ? (size_t)fsize : cap;
+                    if (to_read > avail - 1) to_read = avail - 1;
+                    size_t nread = fread(system_prompt + cur_len, 1, to_read, bf);
+                    system_prompt[cur_len + nread] = '\0';
+                    printf("\033[90m[Loaded ./BASI.md (%zu bytes%s)]\033[0m\n",
+                           nread, (size_t)fsize > nread ? ", truncated" : "");
+                    fflush(stdout);
+                }
+            }
+            fclose(bf);
+        }
+    }
     ADD_MESSAGE("system", system_prompt);
 
     /* Session picker: list previous sessions for this cwd, or start a new one */
@@ -2436,8 +4155,167 @@ int main(int argc, char **argv) {
             continue;
         }
 
-        ADD_MESSAGE("user", user_input);
-        free(user_input);
+        /* Slash commands intercept (no model call) */
+        if (user_input[0] == '/') {
+            if (strcmp(user_input, "/help") == 0) {
+                printf(
+                    "\nSlash commands:\n"
+                    "  /help                 this help\n"
+                    "  /clear                drop conversation history (system prompt + project memory kept)\n"
+                    "  /cost                 show session token usage\n"
+                    "  /save [path]          export transcript as JSONL\n"
+                    "  /memory               open ./BASI.md in $EDITOR\n"
+                    "  /permissions [mode]   show or set permission mode (default | accept-edits | bypass)\n"
+                    "  /plan [on|off]        toggle plan mode (blocks bash/apply_patch/scaffold)\n"
+                    "  /model                switch model (requires restart)\n"
+                    "\n"
+                    "Tools the model can call: read, head, tail, grep, wc, bash,\n"
+                    "  apply_patch, scaffold, webfetch, readfile.\n\n");
+                fflush(stdout);
+                free(user_input);
+                continue;
+            }
+            if (strcmp(user_input, "/clear") == 0) {
+                for (size_t i = 1; i < msg_count; i++) free((void*)messages[i].content);
+                msg_count = 1;
+                llama_memory_clear(llama_get_memory(ctx), true);
+                prev_len = 0;
+                printf("\033[90m[Cleared conversation history (system prompt kept)]\033[0m\n");
+                fflush(stdout);
+                free(user_input);
+                continue;
+            }
+            if (strcmp(user_input, "/cost") == 0) {
+                printf("\033[90m[Session: %zu prompt tokens, %zu generated tokens, %zu total]\033[0m\n",
+                       session_prompt_tokens, session_gen_tokens,
+                       session_prompt_tokens + session_gen_tokens);
+                fflush(stdout);
+                free(user_input);
+                continue;
+            }
+            if (strncmp(user_input, "/save", 5) == 0 &&
+                (user_input[5] == '\0' || user_input[5] == ' ')) {
+                const char *path = user_input + 5;
+                while (*path == ' ') path++;
+                char default_path[256];
+                if (!*path) {
+                    snprintf(default_path, sizeof(default_path),
+                             "basi-transcript-%ld.jsonl", (long)time(NULL));
+                    path = default_path;
+                }
+                FILE *out = fopen(path, "w");
+                if (!out) {
+                    printf("\033[31mError: cannot write '%s' (%s)\033[0m\n",
+                           path, strerror(errno));
+                } else {
+                    for (size_t i = 0; i < msg_count; i++) {
+                        fprintf(out, "{\"role\":\"%s\",\"content\":\"", messages[i].role);
+                        for (const char *c = messages[i].content; *c; c++) {
+                            if (*c == '"')       fputs("\\\"", out);
+                            else if (*c == '\\') fputs("\\\\", out);
+                            else if (*c == '\n') fputs("\\n", out);
+                            else if (*c == '\r') fputs("\\r", out);
+                            else if (*c == '\t') fputs("\\t", out);
+                            else if ((unsigned char)*c < 32) fprintf(out, "\\u%04x", (unsigned char)*c);
+                            else fputc(*c, out);
+                        }
+                        fputs("\"}\n", out);
+                    }
+                    fclose(out);
+                    printf("\033[90m[Saved %zu messages to %s]\033[0m\n", msg_count, path);
+                }
+                fflush(stdout);
+                free(user_input);
+                continue;
+            }
+            if (strcmp(user_input, "/memory") == 0) {
+                const char *editor = getenv("EDITOR");
+                if (!editor || !*editor) editor = "vi";
+                char cmd[256];
+                snprintf(cmd, sizeof(cmd), "%s BASI.md", editor);
+                bool was_raw = raw_mode_enabled;
+                if (was_raw) disable_raw_mode();
+                int rc = system(cmd);
+                if (was_raw) enable_raw_mode();
+                if (rc != 0) printf("\033[31m[Editor exited with status %d]\033[0m\n", rc);
+                printf("\033[90m[BASI.md edited. Changes apply on next BASI restart.]\033[0m\n");
+                fflush(stdout);
+                free(user_input);
+                continue;
+            }
+            if (strcmp(user_input, "/model") == 0) {
+                printf("\033[90m[Model switching is not yet implemented — exit (Ctrl-D) and restart BASI to pick a different model.]\033[0m\n");
+                fflush(stdout);
+                free(user_input);
+                continue;
+            }
+            if (strncmp(user_input, "/plan", 5) == 0 &&
+                (user_input[5] == '\0' || user_input[5] == ' ')) {
+                const char *arg = user_input + 5;
+                while (*arg == ' ') arg++;
+                if (strcmp(arg, "off") == 0) {
+                    plan_mode_active = false;
+                    printf("\033[90m[Plan mode: off]\033[0m\n");
+                } else if (strcmp(arg, "on") == 0 || !*arg) {
+                    plan_mode_active = !plan_mode_active || (*arg != '\0');
+                    if (*arg) plan_mode_active = true;
+                    printf(plan_mode_active
+                        ? "\033[36m[Plan mode: on — bash/apply_patch/scaffold blocked. Toggle off with /plan off.]\033[0m\n"
+                        : "\033[90m[Plan mode: off]\033[0m\n");
+                } else {
+                    printf("\033[31m[Unknown arg '%s'. Use /plan, /plan on, or /plan off]\033[0m\n", arg);
+                }
+                fflush(stdout);
+                free(user_input);
+                continue;
+            }
+            if (strncmp(user_input, "/permissions", 12) == 0 &&
+                (user_input[12] == '\0' || user_input[12] == ' ')) {
+                const char *arg = user_input + 12;
+                while (*arg == ' ') arg++;
+                if (!*arg) {
+                    printf("\033[90m[Permission mode: %s]\033[0m\n", perm_mode_name(permission_mode));
+                    printf("Modes:\n"
+                           "  default       prompt before bash, apply_patch, scaffold\n"
+                           "  accept-edits  auto-approve apply_patch + scaffold; bash still prompts\n"
+                           "  bypass        auto-approve everything\n"
+                           "Use: /permissions <mode>\n");
+                } else if (strcmp(arg, "default") == 0) {
+                    permission_mode = PERM_DEFAULT;
+                    printf("\033[90m[Permission mode: default]\033[0m\n");
+                } else if (strcmp(arg, "accept-edits") == 0) {
+                    permission_mode = PERM_ACCEPT_EDITS;
+                    printf("\033[90m[Permission mode: accept-edits]\033[0m\n");
+                } else if (strcmp(arg, "bypass") == 0) {
+                    permission_mode = PERM_BYPASS;
+                    printf("\033[33m[Permission mode: bypass — all tool calls auto-approved]\033[0m\n");
+                } else {
+                    printf("\033[31m[Unknown mode '%s'. Try: default, accept-edits, bypass]\033[0m\n", arg);
+                }
+                fflush(stdout);
+                free(user_input);
+                continue;
+            }
+            printf("\033[33m[Unknown command '%s'. Type /help for the list.]\033[0m\n", user_input);
+            fflush(stdout);
+            free(user_input);
+            continue;
+        }
+
+        if (plan_mode_active) {
+            size_t blen = strlen(user_input) + 384;
+            char *banner = malloc(blen);
+            snprintf(banner, blen,
+                "[PLAN MODE — only read tools are allowed (read, head, tail, grep, wc, webfetch, readfile). bash, apply_patch, and scaffold are BLOCKED. Reply with your final plan inside <plan>...</plan> tags; if you need clarification, ask me first instead of attempting blocked tools.]\n\n%s",
+                user_input);
+            ADD_MESSAGE("user", banner);
+            free(banner);
+        } else {
+            ADD_MESSAGE("user", user_input);
+        }
+        /* keep user_input alive across tool iterations so the context reminder
+         * can echo the original request back to the model — small models drift
+         * after several tool rounds otherwise. Freed at end of turn. */
 
         /* Apply chat template (falls back to ChatML if model template is Jinja) */
         const char *tmpl = llama_model_chat_template(model, NULL);
@@ -2465,6 +4343,8 @@ int main(int argc, char **argv) {
             setup_sigint_handler();
             GenerateResult result = generate(ctx, vocab, smpl, prompt, prompt_len);
             reset_sigint_handler();
+            session_prompt_tokens += result.prompt_tokens;
+            session_gen_tokens    += result.gen_tokens;
 
             /* Performance metrics */
             double prompt_tps = result.prompt_time_s > 0
@@ -2513,11 +4393,11 @@ int main(int argc, char **argv) {
                 sb_init(&tool_resp);
                 sb_append_str(&tool_resp, "<tool_result>\n");
                 sb_append_str(&tool_resp, tool_result);
-                char budget[128];
+                char budget[512];
                 snprintf(budget, sizeof(budget),
                     "\n</tool_result>\n[Context: %d/%d tokens used, %d remaining. "
-                    "You MUST answer now if remaining < 8000.]",
-                    used, (int)llama_n_ctx(ctx), remaining);
+                    "Original request: \"%.180s\". You MUST answer now if remaining < 8000.]",
+                    used, (int)llama_n_ctx(ctx), remaining, user_input);
                 sb_append_str(&tool_resp, budget);
                 ADD_MESSAGE("user", sb_to_str(&tool_resp));
                 sb_free(&tool_resp);
@@ -2555,6 +4435,8 @@ int main(int argc, char **argv) {
             setup_sigint_handler();
             GenerateResult final_result = generate(ctx, vocab, smpl, prompt, prompt_len);
             reset_sigint_handler();
+            session_prompt_tokens += final_result.prompt_tokens;
+            session_gen_tokens    += final_result.gen_tokens;
 
             double gen_tps = final_result.gen_time_s > 0
                 ? final_result.gen_tokens / final_result.gen_time_s : 0;
@@ -2572,10 +4454,13 @@ int main(int argc, char **argv) {
         int len = apply_template(
             tmpl, messages, msg_count, false, NULL, 0);
         if (len >= 0) prev_len = (size_t)len;
+
+        free(user_input);
     }
 
     /* Cleanup */
     if (session_fp) fclose(session_fp);
+    lsp_kill(&lsp);
     for (size_t i = 0; i < msg_count; i++)
         free((void *)messages[i].content);
     free(messages);
