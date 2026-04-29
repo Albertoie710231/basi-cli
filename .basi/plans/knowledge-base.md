@@ -180,3 +180,301 @@ Bodies of knowledge most directly relevant:
 - The reliability-over-tokens metric applies. Doc DB is justified by goal-completion-rate, not token economics. See `feedback_optimize_for_reliability.md`.
 - The manager/worker idea is documented in `project_manager_worker_idea.md` (Tier 3) and connects here as the natural execution model.
 - The Codex/Claude-Code patterns harvested earlier (Tier 2 references) inform tool-description style for the doc-DB tools. See `reference_codex_patterns.md`, `reference_claude_code_patterns.md`.
+
+---
+
+# Design Decisions (locked 2026-04-28)
+
+Action items #1–#7 from the brainstorm are resolved below. The brainstorm above stays as historical context; this section is what we build against.
+
+Lit-mine summary lives at `reference_planning_literature.md`. The decisions in this section are derived from that mine.
+
+## Decision #1 — Planning literature (item #1, done)
+
+Mined Polya / A3 / WBS / DoD / pre-mortem / spike. Results saved to `reference_planning_literature.md`. Notable specific outputs that drive everything below:
+
+- **A3 confirmed.** Use the Proposal A3 variant (forward-looking) over problem-solving A3.
+- **Leaf-task rule confirmed and tightened:** single named artifact + one shell-checkable `verify:` + one tool-call cycle.
+- **Polya prompts** drop verbatim into the planning system prompt as stage-checklists.
+- **Pre-mortem framing locked:** Klein's past-tense "the project has failed" wording; +30% reason-identification benefit (Mitchell/Russo/Pennington 1989) is the load-bearing claim.
+- **Spike phase rules locked:** read-only tools, 8k token / 12-call budget, exit-artifact triple Question/Findings/Decision.
+
+## Decision #2 — Doc-DB storage layout
+
+Filesystem hierarchy under `./.basi/`:
+
+```
+.basi/
+├── BASI.md                  # CLAUDE.md analogue (milestone #4 of agent mode)
+├── plans/                   # plan artifacts (this section)
+│   ├── <slug>.md            # Proposal A3 plan
+│   └── <slug>.spike.md      # spike artifact (when phase 0 ran)
+└── knowledge/               # the doc DB
+    ├── notes/               # user notes — HIGHEST precedence
+    ├── pinned/              # explicitly added external sources
+    └── docs/                # bulk-imported official docs — LOWEST precedence
+```
+
+Every file under `knowledge/` is markdown with frontmatter:
+
+```yaml
+---
+source: <url|path|user-note>
+shelf: notes|pinned|docs
+title: <human-readable title>
+fetched: 2026-04-28               # ISO date; absent for user-note
+upstream_version: <optional>      # e.g. "godot-4.4.1"
+---
+```
+
+Section addressing: full path + optional anchor. Example: `docs/godot-4.4/classes/Node.md#methods/queue_free`. Anchors are derived deterministically from the heading path — no hand-maintained anchor maps.
+
+Precedence rule (encoded in code): when sources disagree, `notes/` > `pinned/` > `docs/`. The model is told this explicitly in the planning system prompt; the precedence value is also surfaced in `docs_search` output so the model can see which shelf a hit came from without a separate call.
+
+**Why this layout** — it's a structured filesystem of markdown (the brainstorm's framing), navigable by `find`/`ls`/`grep` deterministically, no DB engine required. The shelf hierarchy matches the precedence semantics directly so the code never has to translate. Frontmatter survives `git mv` for refresh semantics later.
+
+**Rejected alternative:** flat directory with shelf-in-frontmatter only. Rejected because precedence-by-directory is cheaper to enforce and humans read trees better than they read frontmatter.
+
+## Decision #3 — Plan artifact format
+
+Proposal A3 in markdown with YAML frontmatter, hard-capped at 200 lines:
+
+```markdown
+---
+slug: add-knowledge-base
+status: drafting | spike | premortem | active | done | abandoned
+created: 2026-04-28
+goal: <one-line theme>
+---
+
+# <human title>
+
+## Theme
+<one sentence — what we're trying to do>
+
+## Background
+<context, importance, why-now>
+
+## Current Condition
+<measures, not anecdote — failing test, reproducer cmd, missing file, etc.>
+
+## Cause Analysis
+<5-Why chain to root cause>
+
+## Target Condition
+<quantified — signature exists / test passes / file at path>
+
+## Implementation Plan
+
+| id  | title              | deliverable           | depends_on | touches              | verify                                         | status  |
+|-----|--------------------|-----------------------|------------|----------------------|------------------------------------------------|---------|
+| 1.1 | parse plan header  | src/plan.c:parse_hdr  | -          | src/plan.c, plan.h   | `cc -c src/plan.c && grep -q parse_hdr plan.h` | pending |
+| 1.2 | ...                | ...                   | 1.1        | ...                  | ...                                            | pending |
+
+## Follow-Up
+<verification plan: how/when we'll check effects after execution>
+
+## Pre-mortem
+<populated by /premortem after draft, before active>
+
+### Failure modes
+<numbered list, distinct, past-tense framing>
+
+### Plan revisions
+<bullet diff — what changed in the plan body in response>
+
+### Unaddressed risks
+<failure modes accepted as residual>
+```
+
+**Hard cap:** 200 lines / ~6 KB. Validation rejects overflow; the model is forced to compress rather than truncate (Shook's "constraints are load-bearing" rule).
+
+**Spike artifact** at `<slug>.spike.md`:
+
+```markdown
+---
+slug: add-knowledge-base
+phase: spike
+created: 2026-04-28
+---
+
+## Question
+<the specific uncertainty that triggered the spike>
+
+## Findings
+- <bullet — each cites a path or URL>
+- ...
+
+## Decision
+PROCEED-TO-PLAN | NEED-ANOTHER-SPIKE | ABANDON
+```
+
+Hard cap: 80 lines.
+
+## Decision #4 — Librarian's toolkit interfaces
+
+Tool prose follows Codex style (3–4 sentences, namespaced names, error mold `<tool> not allowed: <reason>`).
+
+```
+docs_toc                        — no args
+  Returns the table of contents of this project's knowledge base as a flat
+  list of "<shelf>/<path>: <title>" entries with no bodies. Call this FIRST
+  when you don't know what's in the corpus. Then call docs_get on a
+  specific path to read a section. Hits across all three shelves
+  (notes, pinned, docs) in precedence order.
+
+docs_get <path>                 — path: string (required)
+  Returns the body of a single document or section by path
+  (e.g., "docs/godot-4.4/classes/Node.md#methods/queue_free"). Use after
+  docs_toc has shown you the path. Returns plain markdown, capped at
+  4 KB; if the section is larger, the response says so and asks you to
+  request a more specific anchor.
+
+docs_search <keyword>           — keyword: string (required)
+  Full-text grep across the entire knowledge base. Returns up to 50
+  matches as "<shelf>/<path>:<line>: <surrounding-line>". Literal
+  substring match — NOT a semantic search. Use when you know a specific
+  term but not where it lives.
+
+docs_followlink <ref>           — ref: string (required), context: path
+  Resolves a markdown cross-reference link (e.g.,
+  "[queue_free](#methods/queue_free)" or "[Signal](Signal.md)") against
+  the supplied source-doc context, returning the linked section's body.
+  Use to chase references the way you'd click a link.
+
+docs_recent_notes               — no args
+  Returns all user notes added during this project session, in insertion
+  order, with timestamps. Notes win over imported docs by precedence —
+  call this BEFORE answering a question where the user might have
+  corrected a prior assumption.
+
+docs_vector_search <query>      — query: string (required)  [DEFERRED — v2]
+  Last-resort semantic search across the corpus via BGE-M3 embeddings.
+  Use ONLY when docs_toc, docs_search, and docs_recent_notes have all
+  failed. Returns top-3 matches by cosine similarity. Does NOT replace
+  navigation.
+```
+
+All tools are blocked outside plan mode and execute mode (i.e., always available — they're read-only, no approval needed).
+
+**Output discipline** — every tool returns plain markdown or plain `path:line: ...` lines. No JSON wrappers. The model's prompt-template renders these directly into the conversation.
+
+## Decision #5 — Plan-mode evolution
+
+Today's plan mode is a tool-blocker that lets the model emit a free-text `<plan>` sentinel block. Replace with a phase machine driven by deterministic state transitions:
+
+```
+                +-----------+    assumptions >= 3      +----------+
+  /plan <slug>  |           |  --------------------->  |          |
+  ---------->   | drafting  |                          |  spike   |
+                |           |  <---------------------  |          |
+                +-----+-----+    decision = PROCEED    +----------+
+                      |
+                      | draft saved
+                      v
+                +-----------+    /premortem            +-----------+
+                | drafting  |  -------------------->   | premortem |
+                +-----------+                          +-----------+
+                                                            |
+                                                            | revisions saved
+                                                            v
+                                                       +----------+
+                                                       |  active  |  -> exit plan mode
+                                                       +----------+
+```
+
+State stored in the plan file's frontmatter `status:` field. Each transition is a deterministic check in C, not an LLM judgment:
+
+- `drafting` → `spike`: model emits `{unverified: N}` JSON before plan-write; if N ≥ 3, code routes to spike.
+- `spike` → `drafting`: spike artifact written with `Decision: PROCEED-TO-PLAN`.
+- `drafting` → `premortem`: user invokes `/premortem` slash command.
+- `premortem` → `active`: user invokes `/plan accept` (final user-in-the-loop gate).
+- `active` → exits plan mode; executor takes over against the plan.
+
+**Tools available per phase:**
+
+| Phase     | docs_*  | code_context | readfile | webfetch | plan_write | bash | apply_patch | scaffold |
+|-----------|---------|--------------|----------|----------|------------|------|-------------|----------|
+| spike     | ✓       | ✓            | ✓        | ✓ (GET)  | ✗          | ✗    | ✗           | ✗        |
+| drafting  | ✓       | ✓            | ✓        | ✓ (GET)  | ✓          | ✗    | ✗           | ✗        |
+| premortem | ✓ (read) | ✓            | ✓        | ✗        | ✓ (append) | ✗    | ✗           | ✗        |
+| active    | ✓       | ✓            | ✓        | ✓        | ✓ (status) | ✓    | ✓           | ✓        |
+
+`plan_write` is a new tool — writes the plan artifact with validation (A3 sections present, leaf rules satisfied, banned words absent, 200-line cap).
+
+## Decision #6 — Ingestion path
+
+Three tiers, only v1 ships now:
+
+**v1 (this milestone):**
+- `basi-cli docs add <path> [--shelf=pinned|docs]` — copies a local markdown file into `./.basi/knowledge/<shelf>/`. Stamps frontmatter (`source`, `fetched`, `shelf`, `title` from H1).
+- `/note "..."` — slash command appends a single-line entry to `./.basi/knowledge/notes/session-<date>.md` (one file per day).
+- `/edit <doc-path>` — opens the doc in `$EDITOR` (defaults to whatever `EDITOR` is set; if unset, refuse with "<edit> not allowed: $EDITOR not set").
+
+**v2 (deferred):**
+- URL ingestion via libcurl. HTML→markdown via pandoc shell-out (most users have it; refuse cleanly if missing).
+- `docs refresh <path>` — re-fetches by stored `source` URL, diffs, prompts user before replacing.
+
+**v3 (deferred):**
+- Bulk URL crawls (sitemap-driven).
+- `docs_vector_search` backed by BGE-M3 via llama.cpp embedding mode.
+
+Rationale: v1 covers the forcing-function case (Godot user pre-downloads docs locally, runs `basi-cli docs add`). v2 is convenience. v3 is the corporate-scale scenario from footnote #4.
+
+## Decision #7 — Mock session (paper walk-through)
+
+Walking the design through one full session for the Godot forcing-function case to surface rough edges before coding.
+
+**Scenario:** user is working in a Godot 4.4 project. Asks BASI to add a `queue_free()` call to an enemy node when its HP reaches 0.
+
+**Pre-state:** user has previously run:
+- `basi-cli docs add /path/to/godot-docs/ --shelf=docs` (bulk Godot 4.4 docs)
+- `/note "GDScript closures don't capture by reference — confirmed via experiment 2026-04-26"` (project-specific gotcha)
+
+**Session walk:**
+
+1. User: `/plan kill-on-zero-hp` — enters plan mode, status=`drafting`.
+2. Model first emits `{unverified: [...], unverified: 4}` — it doesn't know whether `queue_free()` is on `Node` or `Node2D`, doesn't know GDScript syntax for HP comparison in this codebase, doesn't know if the existing enemy script has a `_process` or signal-driven update, doesn't know the project's lifecycle conventions.
+3. Code routes to `spike` — 4 ≥ 3.
+4. Model uses `docs_toc` → sees `docs/godot-4.4/classes/Node.md`, `docs/godot-4.4/classes/Node2D.md`, etc.
+5. Model uses `docs_get docs/godot-4.4/classes/Node.md#methods/queue_free` → confirms `queue_free()` is on `Node` (parent of all).
+6. Model uses `code_context` to find the existing enemy script's `take_damage` function.
+7. Model uses `docs_recent_notes` → reads the "closures don't capture by reference" note (irrelevant here, but the discipline ran).
+8. Model writes `kill-on-zero-hp.spike.md` — Question: "where to call queue_free in existing damage flow", Findings: "queue_free is on Node, take_damage exists at scripts/Enemy.gd:42, project uses signals not _process for HP updates", Decision: `PROCEED-TO-PLAN`. ~6 tool calls, ~3 KB I/O — well under budget.
+9. Code transitions to `drafting`. Model writes the A3 with one leaf:
+   - `1.1` — title: "queue_free on HP zero", deliverable: `scripts/Enemy.gd:on_hp_changed`, touches: `scripts/Enemy.gd`, verify: `grep -q queue_free scripts/Enemy.gd && godot --check-only scripts/Enemy.gd` (assumes godot CLI available).
+10. User runs `/premortem`. Model emits failure modes: "queue_free called twice if signal fires twice", "free during physics step crashes engine", "no audio cue before despawn so player loses feedback". Plan revisions: add 1.2 (guard against double-fire), add 1.3 (call_deferred wrapper). Unaddressed risk: audio cue (out of scope).
+11. User: `/plan accept`. Status → `active`. Plan mode exits.
+12. Executor takes over: edits `scripts/Enemy.gd`, runs `verify:` after each leaf, marks done.
+
+**Rough edges surfaced by the walk:**
+
+- **Anchor extraction needs care.** `#methods/queue_free` requires that the bulk-imported Godot docs use a consistent anchor convention. If they're flat (one file per class with no method anchors), we either need to split during ingestion or rely on `docs_search` for in-doc lookups. **Action:** add to v1 ingestion: optional `--split-by-heading=H2` flag.
+- **`docs_get` 4 KB cap is tight for whole-class pages.** A full Godot `Node.md` is ~30 KB. Without anchor splitting we choke on first read. **Action:** `--split-by-heading` is now mandatory-default for the `docs` shelf.
+- **`verify:` for non-shell ecosystems.** `godot --check-only` may not exist on all setups. The `verify:` system needs a fallback: if `cmd` exits with `127` (command not found), the executor should report "verify-tool-missing" not "verify-failed" and prompt the user.
+- **`/note` filename collision.** Two notes on the same day go into the same file — fine. But what about a note with backticks or quotes? **Action:** notes are appended as raw markdown; no escaping needed if we always wrap in a fenced block. Decide: append as bullet `- 14:32 <text>` — simpler.
+- **Spike artifact lifecycle on re-spike.** If `Decision: NEED-ANOTHER-SPIKE`, do we overwrite or append? **Action:** append a numbered second `## Question`/`## Findings`/`## Decision` group to the same `.spike.md` file. Cap at 3 cycles; on the 4th, force `ABANDON`.
+
+These five edges are now folded into the relevant decisions above:
+- Storage decision #2 gets `--split-by-heading=H2` ingestion default for `docs/` shelf.
+- Toolkit decision #4: `docs_get` overflow message must include the available anchors at the requested level.
+- Phase decision #5: executor's verify-runner distinguishes exit code 127 (tool missing) from non-zero (failure).
+- Ingestion decision #6: notes use `- HH:MM <text>` bullet format in `notes/session-<date>.md`.
+- Plan-mode decision #5: spike re-entry caps at 3 cycles.
+
+## Implementation order (after design)
+
+Now that #1–#7 are locked, code in this order:
+
+1. **Storage scaffolding** — directory creation, frontmatter parser, slug-name validation. Smallest concrete piece.
+2. **Librarian toolkit (read-only)** — `docs_toc`, `docs_get`, `docs_search`, `docs_recent_notes`. `docs_followlink` last (parses links). Defer `docs_vector_search`.
+3. **Ingestion v1** — `basi-cli docs add`, `--split-by-heading=H2`, `/note`, `/edit`.
+4. **Plan artifact validator** — A3 section presence, leaf-rule check, banned-word lint, 200-line cap.
+5. **`plan_write` tool** — uses the validator.
+6. **Phase machine** — state transitions, tool gates per phase.
+7. **`/premortem` slash command** — runs the protocol, appends section.
+8. **Spike phase** — assumption gate, time-box, `.spike.md` write, re-entry cap.
+9. **Executor verify-runner** — runs `cmd:`, distinguishes 127 vs. non-zero.
+10. **`docs_vector_search`** — last; requires BGE-M3 GGUF + llama.cpp embedding mode wiring.
+
+Each step has a single deliverable, a verify clause, and lands in one cycle — i.e. these are the leaf tasks of the *meta-plan* for building the doc-DB feature, by the same WBS rule we just defined. We dogfood from step 1.
