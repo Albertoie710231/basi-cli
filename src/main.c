@@ -27,6 +27,8 @@
 #include "scaffold.h"
 #include "session.h"
 #include "model.h"
+#include "verify.h"
+#include "embed.h"
 
 /* MAX_TOKENS, CONTEXT_SIZE → globals.h */
 #define MAX_FILE_TOKENS     2000
@@ -87,8 +89,15 @@ static const char *SYSTEM_PROMPT_FMT =
     "- scaffold <name> [<dest_dir>] : Materialize a code template into <dest_dir> (default: .). Requires user approval. Use this BEFORE apply_patch when the user asks for boilerplate (e.g. 'add a new C tool', 'create a server') — the template gives you correct structure (includes, error handling, build snippets), and you only need to apply_patch the parts that need customization. The list of available templates is in 'AVAILABLE TEMPLATES' at the end of this prompt; if you don't see one that fits, skip scaffold and write the file with apply_patch directly.\n"
     "  Examples: <tool>scaffold c-tool src/server.c</tool>  <tool>scaffold list</tool>\n"
     "\n"
-    "PLANNING TOOL (only during drafting or premortem phase):\n"
-    "- plan_write : Save a Proposal-A3 plan artifact to .basi/plans/<slug>.md. Body must have YAML frontmatter (slug/status/created/goal) followed by seven sections in this order — ## Theme, ## Background, ## Current Condition, ## Cause Analysis, ## Target Condition, ## Implementation Plan, ## Follow-Up. Capped at 200 lines. Refuses to overwrite — pick a fresh slug to start a new plan. Status must be one of: drafting | spike | premortem | active | done | abandoned.\n"
+    "PLANNING TOOLS (gated by plan phase):\n"
+    "- assumptions (drafting only) : List unverified things the plan depends on, one '- <item>' per line. If 3 or more, code auto-routes you to a spike phase to investigate before drafting can proceed. Call this BEFORE plan_write.\n"
+    "  Format: <tool>assumptions\n"
+    "  - queue_free is on Node or Node2D\n"
+    "  - existing damage flow uses signals or _process</tool>\n"
+    "- spike_write (spike only) : Persist the spike artifact to .basi/plans/<slug>.spike.md and route the phase. Body has YAML frontmatter (slug/phase=spike/created) plus three sections: ## Question, ## Findings (each bullet citing a path or URL), ## Decision. The Decision line must be exactly one of: PROCEED-TO-PLAN | NEED-ANOTHER-SPIKE | ABANDON. Capped at 80 lines.\n"
+    "- plan_write (drafting/premortem) : Save a Proposal-A3 plan artifact to .basi/plans/<slug>.md. Body must have YAML frontmatter (slug/status/created/goal) followed by seven sections in this order — ## Theme, ## Background, ## Current Condition, ## Cause Analysis, ## Target Condition, ## Implementation Plan, ## Follow-Up. Capped at 200 lines. Refuses to overwrite — pick a fresh slug to start a new plan. The frontmatter status field MUST equal the runtime phase ('drafting' or 'premortem').\n"
+    "- plan_verify [<id>] (active only) : Run the verify clause of every row (or just one row by id) in the Implementation Plan table. Reports OK / FAIL / SETUP (exit 127) / SKIP (empty clause) per row, with last 5 lines of output for failures. Use after the plan has been accepted via /plan accept to confirm the implementation actually meets the verify clauses you wrote.\n"
+    "  Format: <tool>plan_verify</tool>  <tool>plan_verify 1.2</tool>\n"
     "  Format: <tool>plan_write\n"
     "  ---\n"
     "  slug: <kebab-case>\n"
@@ -113,6 +122,8 @@ static const char *SYSTEM_PROMPT_FMT =
     "  Format: <tool>docs_search queue_free</tool>\n"
     "- docs_recent_notes : Show all user notes from this project (newest file first). Notes win over imported docs by precedence — call this BEFORE answering questions where the user might have corrected a prior assumption.\n"
     "  Format: <tool>docs_recent_notes</tool>\n"
+    "- docs_vector_search <query> : Semantic similarity search across the corpus. Last-resort fallback for when docs_search (literal grep) returns nothing — embeds the query and finds chunks with the closest meaning. First call lazily loads the embedding model (one-time slow path); the embeddings sidecar caches results across calls and re-embeds only what changed. Use natural-language phrasing, not keywords. If the model isn't installed, the response tells you how to download it.\n"
+    "  Format: <tool>docs_vector_search how does the planner gate tools by phase</tool>\n"
     "\n"
     "WEB TOOL:\n"
     "- webfetch \"search query\" \"grep regex\" : Takes exactly 2 quoted arguments. First is a web search query. Second is a regex pattern (use | for OR). Fetches the top 5 results in parallel and extracts paragraphs matching the regex. Handles PDFs transparently: if a result URL ends in .pdf it is parsed as PDF, and if an HTML landing page links to a PDF, the PDF is followed and its text is inlined.\n"
@@ -402,6 +413,8 @@ PermissionMode permission_mode = PERM_DEFAULT;
 
 PlanPhase plan_phase = PHASE_NONE;
 char *current_plan_slug = NULL;
+int spike_cycles = 0;
+int spike_calls  = 0;
 
 const char *perm_mode_name(PermissionMode m) {
     return m == PERM_DEFAULT      ? "default"
@@ -420,9 +433,9 @@ const char *plan_phase_name(PlanPhase p) {
 const char *plan_phase_banner(PlanPhase p) {
     switch (p) {
         case PHASE_DRAFTING:
-            return "[DRAFTING phase — research the task using docs_*, code_context, read/grep/wc, webfetch, readfile, then call plan_write to save a Proposal-A3 plan to .basi/plans/<slug>.md. bash/apply_patch/scaffold are BLOCKED (scaffold list is allowed).]";
+            return "[DRAFTING phase — research the task using docs_*, code_context, read/grep/wc, webfetch, readfile. BEFORE you call plan_write, call the assumptions tool with a list (one '- <item>' per line) of every unverified thing the plan depends on; if 3 or more, you'll be auto-routed to a spike phase to investigate first. Then save the Proposal-A3 plan to .basi/plans/<slug>.md via plan_write. bash/apply_patch/scaffold are BLOCKED (scaffold list is allowed).]";
         case PHASE_SPIKE:
-            return "[SPIKE phase — read-only investigation only. Allowed: docs_*, code_context, read/grep/wc, webfetch, readfile. plan_write is blocked until the spike concludes with PROCEED-TO-PLAN.]";
+            return "[SPIKE phase — read-only investigation. Allowed: docs_*, code_context, read/grep/wc, webfetch, readfile. Budget: 12 tool calls / ~8000 tokens; stay tight. When done, call spike_write with this body:\n  ---\n  slug: <same>\n  phase: spike\n  created: YYYY-MM-DD\n  ---\n  ## Question\n  <the specific uncertainty>\n  ## Findings\n  - <bullet, each cites a path or URL>\n  ## Decision\n  PROCEED-TO-PLAN | NEED-ANOTHER-SPIKE | ABANDON\n  PROCEED-TO-PLAN returns to drafting; NEED-ANOTHER-SPIKE starts cycle N+1 (cap 3); ABANDON exits plan mode. plan_write/assumptions are blocked here.]";
         case PHASE_PREMORTEM:
             return "[PREMORTEM phase — Klein protocol. Imagine it is three months from now and this plan FAILED. Looking back, explain why. Then call plan_write to rewrite the plan with a new \"## Pre-mortem\" section containing three subsections: ### Failure modes (numbered, distinct, past-tense — \"X happened because Y\"), ### Plan revisions (bullet diff: what you changed in the plan body in response), ### Unaddressed risks (failure modes accepted as residual). The 200-line cap still holds — compress, don't truncate. webfetch is blocked; review what's in front of you. /plan accept transitions to active.]";
         case PHASE_NONE:
@@ -471,11 +484,43 @@ static char *execute_tool(const char *command) {
         return plan_block_msg(plan_phase, command);
     }
 
+    /* Spike-call accounting: count anything other than spike_write itself
+     * while the spike is active. Done after the phase gate so we don't
+     * charge for tools we already refused. */
+    if (plan_phase == PHASE_SPIKE &&
+        strncmp(command, "spike_write", 11) != 0) {
+        spike_calls++;
+    }
+
     /* plan_write: persist a Proposal-A3 plan artifact. */
     if (strncmp(command, "plan_write", 10) == 0) {
         char after = command[10];
         if (after == ' ' || after == '\t' || after == '\n' || after == '\0') {
             return execute_plan_write(command + 10);
+        }
+    }
+
+    /* assumptions: declare unverified items; auto-routes drafting → spike. */
+    if (strncmp(command, "assumptions", 11) == 0) {
+        char after = command[11];
+        if (after == ' ' || after == '\t' || after == '\n' || after == '\0') {
+            return execute_assumptions(command + 11);
+        }
+    }
+
+    /* spike_write: persist a spike artifact and route the phase. */
+    if (strncmp(command, "spike_write", 11) == 0) {
+        char after = command[11];
+        if (after == ' ' || after == '\t' || after == '\n' || after == '\0') {
+            return execute_spike_write(command + 11);
+        }
+    }
+
+    /* plan_verify: run each row's verify clause, report OK/FAIL/SETUP/SKIP. */
+    if (strncmp(command, "plan_verify", 11) == 0) {
+        char after = command[11];
+        if (after == ' ' || after == '\t' || after == '\n' || after == '\0') {
+            return execute_plan_verify(command + 11);
         }
     }
 
@@ -510,6 +555,12 @@ static char *execute_tool(const char *command) {
         char after = command[17];
         if (after == ' ' || after == '\t' || after == '\n' || after == '\0') {
             return execute_docs_recent_notes(command + 17);
+        }
+    }
+    if (strncmp(command, "docs_vector_search", 18) == 0) {
+        char after = command[18];
+        if (after == ' ' || after == '\t' || after == '\n' || after == '\0') {
+            return execute_docs_vector_search(command + 18);
         }
     }
 
@@ -929,7 +980,9 @@ int main(int argc, char **argv) {
                     "Tools the model can call: read, head, tail, grep, wc, bash,\n"
                     "  apply_patch, scaffold, webfetch, readfile, code_context,\n"
                     "  docs_toc, docs_get, docs_search, docs_recent_notes,\n"
-                    "  plan_write (drafting/premortem phase only).\n\n");
+                    "  docs_vector_search,\n"
+                    "  plan_write (drafting/premortem), assumptions (drafting),\n"
+                    "  spike_write (spike), plan_verify (active).\n\n");
                 fflush(stdout);
                 free(user_input);
                 continue;
@@ -1130,11 +1183,21 @@ int main(int argc, char **argv) {
                         plan_phase = PHASE_NONE;
                         free(current_plan_slug);
                         current_plan_slug = NULL;
+                        spike_cycles = 0;
+                        spike_calls  = 0;
                         printf("\033[90m[Plan phase: off]\033[0m\n");
                     }
                 } else if (strcmp(arg, "accept") == 0) {
                     if (plan_phase == PHASE_DRAFTING || plan_phase == PHASE_PREMORTEM) {
                         plan_phase = PHASE_ACTIVE;
+                        if (current_plan_slug) {
+                            int src = rewrite_plan_status(current_plan_slug, "active");
+                            if (src == -2) {
+                                printf("\033[33m[Plan file has no status: line; runtime phase=active but file untouched.]\033[0m\n");
+                            } else if (src == -1) {
+                                printf("\033[33m[Plan file not yet written; runtime phase=active. Status will be set on the next plan_write.]\033[0m\n");
+                            }
+                        }
                         printf("\033[36m[Plan accepted: '%s' — phase=active. Tools unblocked.]\033[0m\n",
                                current_plan_slug ? current_plan_slug : "(unset)");
                     } else {
@@ -1154,6 +1217,8 @@ int main(int argc, char **argv) {
                         plan_phase = PHASE_DRAFTING;
                         free(current_plan_slug);
                         current_plan_slug = strdup(arg);
+                        spike_cycles = 0;
+                        spike_calls  = 0;
                         printf("\033[36m[Plan phase: drafting — slug '%s'. Research first, then save with plan_write. /plan accept when ready.]\033[0m\n",
                                current_plan_slug);
                     }
@@ -1177,6 +1242,10 @@ int main(int argc, char **argv) {
                                path);
                     } else {
                         plan_phase = PHASE_PREMORTEM;
+                        int src = rewrite_plan_status(current_plan_slug, "premortem");
+                        if (src == -2) {
+                            printf("\033[33m[Plan file has no status: line; runtime phase=premortem but file untouched.]\033[0m\n");
+                        }
                         printf("\033[36m[Pre-mortem phase entered for '%s'. On your next message the model will run Klein's protocol — \"imagine the plan failed; explain why\" — and rewrite %s with a ## Pre-mortem section. Use /plan accept when satisfied, or /plan off to abort.]\033[0m\n",
                                current_plan_slug, path);
                     }
@@ -1376,6 +1445,7 @@ int main(int argc, char **argv) {
     /* Cleanup */
     if (session_fp) fclose(session_fp);
     lsp_shutdown();
+    embed_shutdown();
     for (size_t i = 0; i < msg_count; i++)
         free((void *)messages[i].content);
     free(messages);

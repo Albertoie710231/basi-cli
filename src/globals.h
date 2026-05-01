@@ -39,6 +39,16 @@ extern char *current_plan_slug;     /* malloc'd; NULL when phase == PHASE_NONE *
 const char *plan_phase_name(PlanPhase p);
 const char *plan_phase_banner(PlanPhase p);   /* NULL when no banner needed */
 
+/* Spike-phase budget (Decision #5; mock-session edge #5).
+ * `spike_cycles` is per-plan: capped at SPIKE_MAX_CYCLES; the next would force
+ * ABANDON. `spike_calls` is per-cycle: tool-calls other than spike_write while
+ * phase == SPIKE. Both reset on /plan <slug> entry and /plan off. */
+#define SPIKE_MAX_CYCLES   3
+#define SPIKE_MAX_CALLS   12
+#define SPIKE_TOKEN_HINT 8000     /* advisory only, surfaced in banner */
+extern int spike_cycles;
+extern int spike_calls;
+
 /* Sigint / Ctrl+T globals — set in handlers, read everywhere generate() runs. */
 extern volatile sig_atomic_t generation_interrupted;
 extern volatile sig_atomic_t show_thinking;

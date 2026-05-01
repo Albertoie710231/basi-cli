@@ -1,0 +1,791 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdarg.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <math.h>
+#include <unistd.h>
+#include <sys/stat.h>
+#include <dirent.h>
+#include <errno.h>
+
+#include "llama.h"
+
+#include "util.h"
+#include "globals.h"
+#include "kb.h"
+#include "embed.h"
+
+/* ── Static state ──────────────────────────────────────────────────── */
+
+static struct llama_model   *embed_model = NULL;
+static struct llama_context *embed_ctx   = NULL;
+static const struct llama_vocab *embed_vocab = NULL;
+static int    embed_dim_v   = -1;
+static int    embed_n_ctx   = 8192;
+static char   embed_err[512] = "";
+
+/* ── Helpers ───────────────────────────────────────────────────────── */
+
+static void set_err(const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(embed_err, sizeof(embed_err), fmt, ap);
+    va_end(ap);
+}
+
+const char *embed_last_error(void) { return embed_err[0] ? embed_err : "ok"; }
+
+static enum llama_pooling_type pooling_from_env(void) {
+    const char *p = getenv("BASI_EMBED_POOLING");
+    if (!p || !*p) return LLAMA_POOLING_TYPE_LAST;   /* Jina v5 / Qwen3 default */
+    if (strcmp(p, "mean") == 0) return LLAMA_POOLING_TYPE_MEAN;
+    if (strcmp(p, "cls")  == 0) return LLAMA_POOLING_TYPE_CLS;
+    if (strcmp(p, "last") == 0) return LLAMA_POOLING_TYPE_LAST;
+    return LLAMA_POOLING_TYPE_LAST;
+}
+
+/* Path resolution. Returns malloc'd path or NULL (with err set). */
+static bool fname_looks_like_embed(const char *name) {
+    /* Must be .gguf (allow trailing .etag/.tmp partials to be skipped). */
+    size_t n = strlen(name);
+    if (n < 5 || strcmp(name + n - 5, ".gguf") != 0) return false;
+    /* Lowercase substring scan for "embed" / "embedding" / "jina-embed" /
+     * common patterns. We deliberately do NOT match "qwen3-vl" or similar
+     * pure chat-model names. */
+    char low[1024];
+    size_t cn = (n < sizeof(low) - 1) ? n : sizeof(low) - 1;
+    for (size_t i = 0; i < cn; i++) {
+        char c = name[i];
+        low[i] = (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c;
+    }
+    low[cn] = '\0';
+    return strstr(low, "embed") != NULL;
+}
+
+static char *resolve_embed_model_path(void) {
+    const char *override = getenv("BASI_EMBED_MODEL");
+    if (override && *override) {
+        struct stat st;
+        if (stat(override, &st) != 0 || !S_ISREG(st.st_mode)) {
+            set_err("BASI_EMBED_MODEL=%s is not a readable file", override);
+            return NULL;
+        }
+        return strdup(override);
+    }
+
+    const char *home = getenv("HOME");
+    if (!home || !*home) {
+        set_err("HOME is not set; cannot locate embedding model. "
+                "Set BASI_EMBED_MODEL to a GGUF path.");
+        return NULL;
+    }
+    char dir[1024];
+    if ((size_t)snprintf(dir, sizeof(dir), "%s/.cache/llama.cpp", home) >= sizeof(dir)) {
+        set_err("HOME path too long");
+        return NULL;
+    }
+    DIR *d = opendir(dir);
+    if (!d) {
+        set_err("no embedding model: %s does not exist. "
+                "Download with: llama-embedding -hf jinaai/jina-embeddings-v5-text-small-retrieval-GGUF:Q4_K_M -p test",
+                dir);
+        return NULL;
+    }
+    /* Two-pass: first look for "jina-embed" specifically; then any "embed". */
+    char *best = NULL;
+    int   best_score = -1;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        if (de->d_name[0] == '.') continue;
+        if (!fname_looks_like_embed(de->d_name)) continue;
+        int score = 0;
+        char low[1024];
+        size_t n = strlen(de->d_name);
+        size_t cn = (n < sizeof(low) - 1) ? n : sizeof(low) - 1;
+        for (size_t i = 0; i < cn; i++) {
+            char c = de->d_name[i];
+            low[i] = (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c;
+        }
+        low[cn] = '\0';
+        if (strstr(low, "jina"))      score += 4;
+        if (strstr(low, "retrieval")) score += 2;
+        if (strstr(low, "v5"))        score += 1;
+        if (strstr(low, "qwen3"))     score += 2;
+        if (strstr(low, "gemma"))     score += 1;
+        if (score > best_score) {
+            best_score = score;
+            free(best);
+            char full[1280];
+            snprintf(full, sizeof(full), "%s/%s", dir, de->d_name);
+            best = strdup(full);
+        }
+    }
+    closedir(d);
+    if (!best) {
+        set_err("no embedding model in %s. Download one (recommended: "
+                "jinaai/jina-embeddings-v5-text-small-retrieval-GGUF:Q4_K_M, "
+                "~397 MB) or set BASI_EMBED_MODEL.", dir);
+    }
+    return best;
+}
+
+/* L2-normalize `v` of length `n` in place. */
+static void l2_normalize(float *v, int n) {
+    double sum = 0.0;
+    for (int i = 0; i < n; i++) sum += (double)v[i] * v[i];
+    if (sum <= 0.0) return;
+    float inv = (float)(1.0 / sqrt(sum));
+    for (int i = 0; i < n; i++) v[i] *= inv;
+}
+
+/* ── Public: init / shutdown / dim / embed_text ────────────────────── */
+
+int embed_init(void) {
+    if (embed_model) return 0;
+
+    char *path = resolve_embed_model_path();
+    if (!path) return -1;
+
+    struct llama_model_params mp = llama_model_default_params();
+    mp.n_gpu_layers = 99;     /* embedding models are small; fit on GPU */
+    embed_model = llama_model_load_from_file(path, mp);
+    if (!embed_model) {
+        set_err("failed to load embedding model from %s", path);
+        free(path);
+        return -1;
+    }
+    free(path);
+
+    embed_vocab = llama_model_get_vocab(embed_model);
+    if (!embed_vocab) {
+        set_err("embedding model has no vocab");
+        llama_model_free(embed_model);
+        embed_model = NULL;
+        return -1;
+    }
+    embed_dim_v = llama_model_n_embd(embed_model);
+    if (embed_dim_v <= 0) {
+        set_err("embedding model n_embd is %d (expected > 0)", embed_dim_v);
+        llama_model_free(embed_model);
+        embed_model = NULL;
+        return -1;
+    }
+
+    struct llama_context_params cp = llama_context_default_params();
+    cp.n_ctx        = embed_n_ctx;
+    cp.n_batch      = embed_n_ctx;
+    cp.n_ubatch     = embed_n_ctx;
+    cp.embeddings   = true;
+    cp.pooling_type = pooling_from_env();
+    cp.attention_type = LLAMA_ATTENTION_TYPE_UNSPECIFIED;
+    embed_ctx = llama_init_from_model(embed_model, cp);
+    if (!embed_ctx) {
+        set_err("failed to create embedding context");
+        llama_model_free(embed_model);
+        embed_model = NULL;
+        return -1;
+    }
+    return 0;
+}
+
+int embed_dim(void) { return embed_dim_v; }
+
+void embed_shutdown(void) {
+    if (embed_ctx)   { llama_free(embed_ctx); embed_ctx = NULL; }
+    if (embed_model) { llama_model_free(embed_model); embed_model = NULL; }
+    embed_vocab = NULL;
+    embed_dim_v = -1;
+}
+
+int embed_text(const char *text, float *out) {
+    if (!embed_ctx || !embed_vocab) {
+        set_err("embed_text called before embed_init succeeded");
+        return -1;
+    }
+    if (!text || !out) {
+        set_err("embed_text: NULL argument");
+        return -1;
+    }
+
+    int text_len = (int)strlen(text);
+    if (text_len == 0) {
+        for (int i = 0; i < embed_dim_v; i++) out[i] = 0.0f;
+        return 0;
+    }
+
+    /* Tokenize. First call returns negative count = -needed. */
+    int n_tok = -llama_tokenize(embed_vocab, text, text_len,
+                                NULL, 0, true, true);
+    if (n_tok <= 0) {
+        set_err("tokenize returned %d for text length %d", n_tok, text_len);
+        return -1;
+    }
+    if (n_tok > embed_n_ctx) {
+        /* Truncate by taking only the first n_ctx tokens — re-tokenize with
+         * a buffer that only holds n_ctx slots so llama_tokenize gives us
+         * the prefix. The extra text is discarded; chunks should be sized
+         * so this rarely triggers. */
+        n_tok = embed_n_ctx;
+    }
+    llama_token *tokens = malloc((size_t)n_tok * sizeof(llama_token));
+    int got = llama_tokenize(embed_vocab, text, text_len,
+                             tokens, n_tok, true, true);
+    if (got < 0) got = -got;
+    if (got > n_tok) got = n_tok;
+
+    /* Build batch with logits flag set on every token (so pooling works). */
+    struct llama_batch batch = llama_batch_init(n_tok, 0, 1);
+    for (int i = 0; i < got; i++) {
+        batch.token[batch.n_tokens] = tokens[i];
+        batch.pos[batch.n_tokens]   = i;
+        batch.n_seq_id[batch.n_tokens] = 1;
+        batch.seq_id[batch.n_tokens][0] = 0;
+        batch.logits[batch.n_tokens] = 1;
+        batch.n_tokens++;
+    }
+
+    llama_memory_clear(llama_get_memory(embed_ctx), true);
+    int rc = llama_decode(embed_ctx, batch);
+    if (rc < 0) {
+        set_err("llama_decode failed (rc=%d)", rc);
+        llama_batch_free(batch);
+        free(tokens);
+        return -1;
+    }
+
+    const float *embd = llama_get_embeddings_seq(embed_ctx, 0);
+    if (!embd) {
+        set_err("llama_get_embeddings_seq returned NULL "
+                "(pooling_type may be NONE)");
+        llama_batch_free(batch);
+        free(tokens);
+        return -1;
+    }
+    for (int i = 0; i < embed_dim_v; i++) out[i] = embd[i];
+    l2_normalize(out, embed_dim_v);
+
+    llama_batch_free(batch);
+    free(tokens);
+    return 0;
+}
+
+/* ── Chunker ───────────────────────────────────────────────────────── *
+ *
+ * One chunk per H2 section (with nested H3s included). Content before the
+ * first H2 becomes the "_intro" chunk. Each chunk capped at CHUNK_CAP
+ * bytes (truncated, not split — chunks above the cap are rare given how
+ * we author docs). Anchor uses the heading slug; "_intro" for pre-H2.
+ */
+
+#define CHUNK_CAP 4096
+
+typedef struct {
+    char  *path;     /* full path, malloc'd, e.g. ".basi/knowledge/notes/x.md" */
+    char  *anchor;   /* heading text (utf-8) or "_intro" */
+    char  *text;     /* malloc'd, NUL-terminated chunk body (capped) */
+    long   mtime;    /* source file mtime when chunked */
+} Chunk;
+
+static void chunk_free(Chunk *c) {
+    free(c->path); free(c->anchor); free(c->text);
+    c->path = c->anchor = c->text = NULL;
+}
+
+/* Trim ASCII whitespace at both ends of a slice. */
+static void slice_trim(const char **s, size_t *len) {
+    while (*len && (**s == ' ' || **s == '\t' || **s == '\r' || **s == '\n')) {
+        (*s)++; (*len)--;
+    }
+    while (*len && (((*s)[*len - 1] == ' ') || ((*s)[*len - 1] == '\t') ||
+                    ((*s)[*len - 1] == '\r') || ((*s)[*len - 1] == '\n'))) {
+        (*len)--;
+    }
+}
+
+static char *slice_dup(const char *s, size_t len) {
+    char *out = malloc(len + 1);
+    memcpy(out, s, len);
+    out[len] = '\0';
+    return out;
+}
+
+/* Heading line? Returns level (1..6) if so and writes the heading text
+ * slice via *out_text/*out_len; 0 otherwise. */
+static int heading_line(const char *p, size_t len,
+                        const char **out_text, size_t *out_len) {
+    if (len == 0 || *p != '#') return 0;
+    int level = 0;
+    while (level < 6 && (size_t)level < len && p[level] == '#') level++;
+    if (level == 0 || (size_t)level >= len || p[level] != ' ') return 0;
+    const char *h = p + level + 1;
+    size_t hlen = len - level - 1;
+    while (hlen && (*h == ' ' || *h == '\t')) { h++; hlen--; }
+    while (hlen && (h[hlen - 1] == ' ' || h[hlen - 1] == '\t' ||
+                    h[hlen - 1] == '#' || h[hlen - 1] == '\r')) hlen--;
+    *out_text = h;
+    *out_len = hlen;
+    return level;
+}
+
+/* Append chunk to a dynamic array, growing as needed. */
+static void chunks_push(Chunk **arr, size_t *n, size_t *cap,
+                        const char *path, const char *anchor, size_t alen,
+                        const char *text, size_t tlen, long mtime) {
+    if (*n == *cap) {
+        *cap = *cap ? *cap * 2 : 16;
+        *arr = realloc(*arr, *cap * sizeof(Chunk));
+    }
+    Chunk *c = &(*arr)[*n];
+    c->path   = strdup(path);
+    c->anchor = slice_dup(anchor, alen);
+    if (tlen > CHUNK_CAP) tlen = CHUNK_CAP;
+    c->text   = slice_dup(text, tlen);
+    c->mtime  = mtime;
+    (*n)++;
+}
+
+/* Chunk one markdown file. Caller frees the array via chunks_free. */
+static int chunk_file(const char *path, long mtime,
+                      Chunk **out_arr, size_t *out_n) {
+    *out_arr = NULL; *out_n = 0;
+    size_t fl = 0;
+    char *buf = kb_read_file(path, &fl);
+    if (!buf) return -1;
+    KbFrontmatter fm;
+    kb_parse_frontmatter(buf, fl, &fm);
+    const char *body = buf + fm.body_offset;
+    size_t body_len = fl - fm.body_offset;
+    kb_fm_free(&fm);
+
+    Chunk *arr = NULL;
+    size_t n = 0, cap = 0;
+
+    /* Walk lines. Track current H2 boundaries. */
+    const char *cur_anchor = "_intro";
+    size_t cur_anchor_len = 6;
+    const char *section_start = body;
+    const char *p = body;
+    const char *end = body + body_len;
+    while (p < end) {
+        const char *le = p;
+        while (le < end && *le != '\n') le++;
+        const char *htext;
+        size_t hlen;
+        int level = heading_line(p, le - p, &htext, &hlen);
+        if (level == 2) {
+            /* close previous section */
+            const char *s = section_start;
+            size_t slen = p - section_start;
+            slice_trim(&s, &slen);
+            if (slen > 0) {
+                chunks_push(&arr, &n, &cap, path,
+                    cur_anchor, cur_anchor_len, s, slen, mtime);
+            }
+            cur_anchor     = htext;
+            cur_anchor_len = hlen;
+            section_start  = p;     /* keep heading line in chunk text */
+        }
+        p = (le < end) ? le + 1 : end;
+    }
+    /* Tail section. */
+    const char *s = section_start;
+    size_t slen = end - section_start;
+    slice_trim(&s, &slen);
+    if (slen > 0) {
+        chunks_push(&arr, &n, &cap, path,
+            cur_anchor, cur_anchor_len, s, slen, mtime);
+    }
+
+    free(buf);
+    *out_arr = arr;
+    *out_n = n;
+    return 0;
+}
+
+static void chunks_free(Chunk *arr, size_t n) {
+    for (size_t i = 0; i < n; i++) chunk_free(&arr[i]);
+    free(arr);
+}
+
+/* ── Vector store (.basi/knowledge/.embeddings.bin) ────────────────── *
+ *
+ * On-disk layout (little-endian, host architecture):
+ *   uint32 magic   = 'BASE'  (0x45534142)
+ *   uint32 version = 1
+ *   uint32 dim
+ *   uint32 n_entries
+ *   for each entry:
+ *     uint16 path_len   ; char[path_len]
+ *     uint16 anchor_len ; char[anchor_len]
+ *     uint32 text_len   ; char[text_len]   (NOT NUL-terminated on disk)
+ *     int64  mtime
+ *     float[dim]
+ */
+
+#define EMB_FILE  ".basi/knowledge/.embeddings.bin"
+#define EMB_MAGIC 0x45534142u  /* 'BASE' little-endian */
+#define EMB_VER   1u
+
+typedef struct {
+    char  *path;
+    char  *anchor;
+    char  *text;
+    long   mtime;
+    float *vec;       /* malloc'd, length = store->dim */
+} VecEntry;
+
+typedef struct {
+    int       dim;
+    VecEntry *e;
+    size_t    n;
+    size_t    cap;
+} VecStore;
+
+static void vs_init(VecStore *s, int dim) {
+    s->dim = dim; s->e = NULL; s->n = 0; s->cap = 0;
+}
+
+static void vs_clear(VecStore *s) {
+    for (size_t i = 0; i < s->n; i++) {
+        free(s->e[i].path); free(s->e[i].anchor); free(s->e[i].text);
+        free(s->e[i].vec);
+    }
+    free(s->e);
+    s->e = NULL; s->n = 0; s->cap = 0;
+}
+
+static void vs_push(VecStore *s, const char *path, const char *anchor,
+                    const char *text, long mtime, float *vec /* takes ownership */) {
+    if (s->n == s->cap) {
+        s->cap = s->cap ? s->cap * 2 : 32;
+        s->e = realloc(s->e, s->cap * sizeof(VecEntry));
+    }
+    VecEntry *v = &s->e[s->n++];
+    v->path   = strdup(path);
+    v->anchor = strdup(anchor);
+    v->text   = strdup(text);
+    v->mtime  = mtime;
+    v->vec    = vec;
+}
+
+/* Returns 0 on success (or no file present); -1 on read/format error. */
+static int vs_load(VecStore *s) {
+    FILE *f = fopen(EMB_FILE, "rb");
+    if (!f) {
+        if (errno == ENOENT) return 0;
+        return -1;
+    }
+    uint32_t magic, ver, dim, count;
+    if (fread(&magic, 4, 1, f) != 1 || fread(&ver, 4, 1, f) != 1 ||
+        fread(&dim, 4, 1, f) != 1   || fread(&count, 4, 1, f) != 1) {
+        fclose(f); return -1;
+    }
+    if (magic != EMB_MAGIC || ver != EMB_VER) { fclose(f); return -1; }
+    if ((int)dim != s->dim) {
+        /* Different model dim → invalidate the store. */
+        fclose(f); return -1;
+    }
+    for (uint32_t i = 0; i < count; i++) {
+        uint16_t plen, alen; uint32_t tlen; int64_t mtime;
+        if (fread(&plen, 2, 1, f) != 1) { fclose(f); return -1; }
+        char *path = malloc(plen + 1);
+        if (fread(path, 1, plen, f) != plen) { free(path); fclose(f); return -1; }
+        path[plen] = '\0';
+        if (fread(&alen, 2, 1, f) != 1) { free(path); fclose(f); return -1; }
+        char *anc = malloc(alen + 1);
+        if (fread(anc, 1, alen, f) != alen) { free(path); free(anc); fclose(f); return -1; }
+        anc[alen] = '\0';
+        if (fread(&tlen, 4, 1, f) != 1) { free(path); free(anc); fclose(f); return -1; }
+        char *text = malloc(tlen + 1);
+        if (fread(text, 1, tlen, f) != tlen) { free(path); free(anc); free(text); fclose(f); return -1; }
+        text[tlen] = '\0';
+        if (fread(&mtime, 8, 1, f) != 1) { free(path); free(anc); free(text); fclose(f); return -1; }
+        float *vec = malloc(s->dim * sizeof(float));
+        if (fread(vec, sizeof(float), s->dim, f) != (size_t)s->dim) {
+            free(path); free(anc); free(text); free(vec); fclose(f); return -1;
+        }
+        /* push raw — don't strdup again (transfer ownership) */
+        if (s->n == s->cap) {
+            s->cap = s->cap ? s->cap * 2 : 32;
+            s->e = realloc(s->e, s->cap * sizeof(VecEntry));
+        }
+        s->e[s->n++] = (VecEntry){ path, anc, text, (long)mtime, vec };
+    }
+    fclose(f);
+    return 0;
+}
+
+static int vs_save(const VecStore *s) {
+    if (kb_ensure_dirs() != 0) return -1;
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", EMB_FILE);
+    FILE *f = fopen(tmp, "wb");
+    if (!f) return -1;
+    uint32_t magic = EMB_MAGIC, ver = EMB_VER;
+    uint32_t dim = (uint32_t)s->dim, count = (uint32_t)s->n;
+    if (fwrite(&magic, 4, 1, f) != 1 || fwrite(&ver, 4, 1, f) != 1 ||
+        fwrite(&dim, 4, 1, f) != 1   || fwrite(&count, 4, 1, f) != 1) {
+        fclose(f); unlink(tmp); return -1;
+    }
+    for (size_t i = 0; i < s->n; i++) {
+        const VecEntry *v = &s->e[i];
+        uint16_t plen = (uint16_t)strlen(v->path);
+        uint16_t alen = (uint16_t)strlen(v->anchor);
+        uint32_t tlen = (uint32_t)strlen(v->text);
+        int64_t  mt   = (int64_t)v->mtime;
+        if (fwrite(&plen, 2, 1, f) != 1 || fwrite(v->path, 1, plen, f) != plen ||
+            fwrite(&alen, 2, 1, f) != 1 || fwrite(v->anchor, 1, alen, f) != alen ||
+            fwrite(&tlen, 4, 1, f) != 1 || fwrite(v->text, 1, tlen, f) != tlen ||
+            fwrite(&mt, 8, 1, f) != 1   ||
+            fwrite(v->vec, sizeof(float), s->dim, f) != (size_t)s->dim) {
+            fclose(f); unlink(tmp); return -1;
+        }
+    }
+    if (fclose(f) != 0) { unlink(tmp); return -1; }
+    if (rename(tmp, EMB_FILE) != 0) { unlink(tmp); return -1; }
+    return 0;
+}
+
+/* Drop entries whose source file is gone or whose recorded mtime is stale.
+ * Files staying are returned via `keep_seen` keyed by (path, anchor). */
+typedef struct { const char *path; const char *anchor; } SeenKey;
+
+static int seen_has(const SeenKey *seen, size_t n,
+                    const char *path, const char *anchor) {
+    for (size_t i = 0; i < n; i++) {
+        if (strcmp(seen[i].path, path) == 0 &&
+            strcmp(seen[i].anchor, anchor) == 0) return 1;
+    }
+    return 0;
+}
+
+/* Walk-the-KB ctx for kb_walk_dir. */
+typedef struct {
+    Chunk *all;
+    size_t n, cap;
+} ChunkCollect;
+
+static int collect_visit(const char *path, void *ud) {
+    ChunkCollect *cc = (ChunkCollect *)ud;
+    struct stat st;
+    if (stat(path, &st) != 0) return 0;
+    /* Skip the embeddings sidecar itself defensively. */
+    if (strstr(path, ".embeddings.bin")) return 0;
+    Chunk *cs = NULL; size_t nc = 0;
+    if (chunk_file(path, (long)st.st_mtime, &cs, &nc) != 0) return 0;
+    for (size_t i = 0; i < nc; i++) {
+        if (cc->n == cc->cap) {
+            cc->cap = cc->cap ? cc->cap * 2 : 32;
+            cc->all = realloc(cc->all, cc->cap * sizeof(Chunk));
+        }
+        cc->all[cc->n++] = cs[i];   /* transfer ownership */
+    }
+    free(cs);
+    return 0;
+}
+
+/* Reconcile store with current on-disk KB. Embeds anything new or stale.
+ * Returns number of (re)embedded chunks, or -1 on error. */
+static int vs_sync(VecStore *s, int *out_kept, int *out_dropped) {
+    *out_kept = 0; *out_dropped = 0;
+
+    /* 1. Collect every current chunk. */
+    ChunkCollect cc = { NULL, 0, 0 };
+    kb_walk_dir(KB_NOTES_DIR,  collect_visit, &cc);
+    kb_walk_dir(KB_PINNED_DIR, collect_visit, &cc);
+    kb_walk_dir(KB_DOCS_DIR,   collect_visit, &cc);
+
+    /* 2. Build a (path, anchor) → mtime index of current chunks. */
+    /* 3. Walk store: drop entries whose current chunk is missing or whose
+     *    mtime is stale. */
+    VecStore kept;
+    vs_init(&kept, s->dim);
+    SeenKey *seen = malloc(s->n * sizeof(SeenKey) + sizeof(SeenKey));
+    size_t  n_seen = 0;
+    for (size_t i = 0; i < s->n; i++) {
+        VecEntry *v = &s->e[i];
+        long want_mtime = -1;
+        for (size_t j = 0; j < cc.n; j++) {
+            if (strcmp(cc.all[j].path, v->path) == 0 &&
+                strcmp(cc.all[j].anchor, v->anchor) == 0) {
+                want_mtime = cc.all[j].mtime;
+                break;
+            }
+        }
+        if (want_mtime != -1 && want_mtime == v->mtime) {
+            /* Keep — transfer ownership. */
+            seen[n_seen++] = (SeenKey){ v->path, v->anchor };
+            if (kept.n == kept.cap) {
+                kept.cap = kept.cap ? kept.cap * 2 : 32;
+                kept.e = realloc(kept.e, kept.cap * sizeof(VecEntry));
+            }
+            kept.e[kept.n++] = *v;
+            v->path = v->anchor = v->text = NULL;
+            v->vec = NULL;
+            (*out_kept)++;
+        } else {
+            (*out_dropped)++;
+        }
+    }
+    /* Free anything that wasn't kept. */
+    for (size_t i = 0; i < s->n; i++) {
+        free(s->e[i].path); free(s->e[i].anchor);
+        free(s->e[i].text); free(s->e[i].vec);
+    }
+    free(s->e);
+    *s = kept;
+
+    /* 4. Embed every current chunk that isn't in the kept set. */
+    int n_embedded = 0;
+    for (size_t j = 0; j < cc.n; j++) {
+        if (seen_has(seen, n_seen, cc.all[j].path, cc.all[j].anchor)) continue;
+        float *vec = malloc(s->dim * sizeof(float));
+        if (embed_text(cc.all[j].text, vec) != 0) {
+            free(vec);
+            chunks_free(cc.all + j, 1);   /* free this single chunk */
+            continue;
+        }
+        vs_push(s, cc.all[j].path, cc.all[j].anchor, cc.all[j].text,
+                cc.all[j].mtime, vec);
+        n_embedded++;
+    }
+    free(seen);
+
+    /* Free remaining collected chunks (those we didn't transfer in vs_push,
+     * i.e. all of them — vs_push strdup'd everything). */
+    chunks_free(cc.all, cc.n);
+
+    return n_embedded;
+}
+
+/* ── Top-K search ──────────────────────────────────────────────────── */
+
+typedef struct { int idx; float score; } Hit;
+
+static int hit_cmp_desc(const void *a, const void *b) {
+    float da = ((const Hit *)b)->score - ((const Hit *)a)->score;
+    return (da > 0) - (da < 0);
+}
+
+static void score_topk(const VecStore *s, const float *q,
+                       int k, Hit *out, int *out_n) {
+    Hit *all = malloc(s->n * sizeof(Hit) + sizeof(Hit));
+    for (size_t i = 0; i < s->n; i++) {
+        double dot = 0.0;
+        const float *v = s->e[i].vec;
+        for (int d = 0; d < s->dim; d++) dot += (double)v[d] * q[d];
+        all[i].idx = (int)i;
+        all[i].score = (float)dot;
+    }
+    qsort(all, s->n, sizeof(Hit), hit_cmp_desc);
+    int n = (int)s->n < k ? (int)s->n : k;
+    for (int i = 0; i < n; i++) out[i] = all[i];
+    *out_n = n;
+    free(all);
+}
+
+/* ── Tool entry ────────────────────────────────────────────────────── */
+
+#define VS_TOPK   5
+#define VS_SNIPPET_CAP 320
+
+char *execute_docs_vector_search(const char *args) {
+    while (*args == ' ' || *args == '\t' || *args == '\n') args++;
+    if (!*args) {
+        return strdup(
+            "docs_vector_search not allowed: missing query. "
+            "Example: docs_vector_search how does the planner gate tools");
+    }
+    /* Trim trailing whitespace. */
+    size_t qlen = strlen(args);
+    while (qlen && (args[qlen - 1] == ' ' || args[qlen - 1] == '\t' ||
+                    args[qlen - 1] == '\n' || args[qlen - 1] == '\r')) qlen--;
+    if (qlen == 0) {
+        return strdup("docs_vector_search not allowed: empty query.");
+    }
+    char *query = malloc(qlen + 1);
+    memcpy(query, args, qlen);
+    query[qlen] = '\0';
+
+    if (embed_init() != 0) {
+        char *msg = malloc(1024);
+        snprintf(msg, 1024,
+            "docs_vector_search failed: %s\n"
+            "(use docs_search for literal grep instead, or set BASI_EMBED_MODEL.)",
+            embed_last_error());
+        free(query);
+        return msg;
+    }
+
+    VecStore store;
+    vs_init(&store, embed_dim());
+    vs_load(&store);   /* tolerate missing file */
+
+    int kept = 0, dropped = 0;
+    int embedded = vs_sync(&store, &kept, &dropped);
+    if (embedded < 0) {
+        vs_clear(&store);
+        free(query);
+        return strdup("docs_vector_search failed during corpus sync.");
+    }
+    if (embedded > 0 || dropped > 0) vs_save(&store);
+
+    if (store.n == 0) {
+        vs_clear(&store);
+        free(query);
+        return strdup(
+            "docs_vector_search: knowledge base is empty. "
+            "Add files via 'basi-cli docs add' or '/note ...'.\n");
+    }
+
+    /* Embed query and score. */
+    float *qvec = malloc(store.dim * sizeof(float));
+    if (embed_text(query, qvec) != 0) {
+        char *msg = malloc(512);
+        snprintf(msg, 512, "docs_vector_search failed embedding query: %s",
+                 embed_last_error());
+        free(qvec); vs_clear(&store); free(query);
+        return msg;
+    }
+
+    Hit hits[VS_TOPK];
+    int n_hits = 0;
+    score_topk(&store, qvec, VS_TOPK, hits, &n_hits);
+    free(qvec);
+
+    StringBuf out;
+    sb_init(&out);
+    char header[256];
+    snprintf(header, sizeof(header),
+        "docs_vector_search: top %d match%s for \"%.80s\" "
+        "(corpus: %zu chunks; reembedded %d this call):\n\n",
+        n_hits, n_hits == 1 ? "" : "es", query, store.n, embedded);
+    sb_append_str(&out, header);
+
+    for (int i = 0; i < n_hits; i++) {
+        const VecEntry *v = &store.e[hits[i].idx];
+        const char *rel = kb_strip_know_prefix(v->path);
+        char line[256];
+        snprintf(line, sizeof(line),
+            "%2d. %s#%s   score=%.3f\n",
+            i + 1, rel, v->anchor, hits[i].score);
+        sb_append_str(&out, line);
+        /* Snippet: first VS_SNIPPET_CAP chars of chunk text. */
+        size_t tlen = strlen(v->text);
+        size_t slen = tlen < VS_SNIPPET_CAP ? tlen : VS_SNIPPET_CAP;
+        sb_append_str(&out, "    │ ");
+        for (size_t k = 0; k < slen; k++) {
+            char c = v->text[k];
+            if (c == '\n') { sb_append_str(&out, "\n    │ "); continue; }
+            sb_append_char(&out, c);
+        }
+        if (slen < tlen) sb_append_str(&out, " …");
+        sb_append_char(&out, '\n');
+    }
+
+    vs_clear(&store);
+    free(query);
+    return sb_to_str(&out);
+}
