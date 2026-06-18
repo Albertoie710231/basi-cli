@@ -3,6 +3,11 @@ zig-out/
 basi-cli
 *.o
 
+# generated clangd artifact (contains absolute local paths)
+compile_commands.json
+# stray screenshots
+Captura de pantalla_*.png
+
 # note-cli mock test artifacts (manager/worker experiment)
 noted/
 pyproject.toml
