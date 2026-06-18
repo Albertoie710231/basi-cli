@@ -97,6 +97,21 @@ static char *extract_tagged(const char *text, const char *tag) {
     return out;
 }
 
+/* Pointer to the ACTION region of the model output — never inside reasoning:
+     - <think> opened AND closed  -> text after the last </think>;
+     - <think> opened, NOT closed -> "" (still thinking / cut off), so a <tool>
+       or <answer> mentioned *inside* the reasoning is NOT taken as the real
+       action (the round becomes a no-action reprompt instead of executing a
+       hypothetical/half-written tool call from the think);
+     - no <think> at all          -> the whole output (non-thinking models). */
+static const char *after_think(const char *s) {
+    const char *close = NULL, *p = s, *q;
+    while ((q = strstr(p, "</think>")) != NULL) { close = q; p = q + 8; }
+    if (close) return close + 8;
+    if (strstr(s, "<think>")) return s + strlen(s);   /* unclosed think → no action */
+    return s;
+}
+
 /* strdup, but truncate to max chars with a marker if longer. */
 static char *cap_dup(const char *s, size_t max) {
     if (!s) return strdup("");
@@ -141,9 +156,9 @@ static void msgs_add(struct llama_chat_message **m, size_t *n, size_t *cap,
    whole conversation. Returns malloc'd model output (caller frees), or NULL on
    template failure. */
 static char *ds_generate(struct llama_context *dctx, const struct llama_vocab *vocab,
-                         struct llama_sampler *smpl, const char *tmpl,
+                         struct llama_sampler *smpl, const struct llama_model *model,
                          const struct llama_chat_message *msgs, size_t nmsg, char *fmt_buf) {
-    int len = apply_template(tmpl, msgs, nmsg, true, fmt_buf, DEEPSEARCH_FMT_SZ);
+    int len = apply_template(model, msgs, nmsg, true, fmt_buf, DEEPSEARCH_FMT_SZ);
     if (len < 0) return NULL;
     llama_memory_clear(llama_get_memory(dctx), true);
     GenerateResult r = generate(dctx, vocab, smpl, fmt_buf, (size_t)len);
@@ -167,7 +182,7 @@ static char *dispatch_research_tool(const char *name, const char *arg, const cha
 /* Distill a raw tool result into goal-relevant evidence (the only thing that
    enters the chat). Tiny results pass through verbatim. Returns malloc'd. */
 static char *distill_result(struct llama_context *dctx, const struct llama_vocab *vocab,
-                            struct llama_sampler *xsmpl, const char *tmpl,
+                            struct llama_sampler *xsmpl, const struct llama_model *model,
                             const char *question, const char *raw, char *fmt_buf) {
     if (strlen(raw) < EXTRACT_SKIP_BELOW) return cap_dup(raw, OBS_MAX_CHARS);
 
@@ -185,7 +200,7 @@ static char *distill_result(struct llama_context *dctx, const struct llama_vocab
     struct llama_chat_message xm[2];
     xm[0].role = "system"; xm[0].content = (char *)EXTRACTOR_SYSTEM;
     xm[1].role = "user";   xm[1].content = x.data;
-    char *distilled = ds_generate(dctx, vocab, xsmpl, tmpl, xm, 2, fmt_buf);
+    char *distilled = ds_generate(dctx, vocab, xsmpl, model, xm, 2, fmt_buf);
     sb_free(&x);
 
     if (distilled && distilled[0]) { trim(distilled); char *c = cap_dup(distilled, OBS_MAX_CHARS); free(distilled); return c; }
@@ -259,8 +274,6 @@ char *execute_deep_search(struct llama_model *model,
         return strdup("Error: out of memory.");
     }
 
-    const char *tmpl = llama_model_chat_template(model, NULL);
-
     char system_prompt[4096];
     {
         time_t t = time(NULL);
@@ -272,6 +285,9 @@ char *execute_deep_search(struct llama_model *model,
 
     sig_atomic_t prev_quiet = generate_quiet;
     generate_quiet = 1;
+    /* Keep <think> in the model's turns so reasoning models stay consistent. */
+    sig_atomic_t prev_keep_think = generate_keep_think;
+    generate_keep_think = 1;
 
     struct sigaction old_sa, sa;
     memset(&sa, 0, sizeof(sa));
@@ -291,19 +307,39 @@ char *execute_deep_search(struct llama_model *model,
     msgs_add(&msgs, &nmsg, &capmsg, "user",   strdup(question));
 
     char *answer = NULL;
+    int tools_run = 0;   /* must-search-before-answer guard: # of real searches/fetches done */
     int round;
     for (round = 1; round <= max_rounds; round++) {
-        char *out = ds_generate(dctx, vocab, dsmpl, tmpl, msgs, nmsg, fmt_buf);
+        char *out = ds_generate(dctx, vocab, dsmpl, model, msgs, nmsg, fmt_buf);
         if (!out) { printf("\033[31m[deepsearch] template error; stopping.\033[0m\n"); fflush(stdout); break; }
         if (generation_interrupted) { free(out); printf("\033[33m[deepsearch] interrupted.\033[0m\n"); fflush(stdout); break; }
 
-        /* The assistant turn IS the model output (think already stripped by
-           generate()). Transfer ownership into the chat, then parse it. */
-        msgs_add(&msgs, &nmsg, &capmsg, "assistant", out);
-        const char *astr = msgs[nmsg - 1].content;
+        if (getenv("BASI_DEBUG_DEEPSEARCH"))
+            fprintf(stderr, "\n\033[35m[ds raw round %d]\033[0m\n%s\n\033[35m[/ds raw round %d]\033[0m\n",
+                    round, out, round);
 
-        char *ans = extract_tagged(astr, "answer");
+        /* The assistant turn IS the model output, INCLUDING its <think> block
+           (generate_keep_think) so a reasoning model's history stays consistent.
+           Transfer ownership into the chat; parse actions from AFTER the think. */
+        msgs_add(&msgs, &nmsg, &capmsg, "assistant", out);
+        const char *act = after_think(msgs[nmsg - 1].content);
+
+        char *ans = extract_tagged(act, "answer");
         if (ans) {
+            if (tools_run == 0) {
+                /* Reject a premature answer: the model must investigate before
+                   concluding. This stops over-confident (esp. reasoning) models
+                   from answering from stale memory without ever searching. */
+                free(ans);
+                msgs_add(&msgs, &nmsg, &capmsg, "user",
+                         strdup("You tried to answer WITHOUT searching. Your training data is stale and "
+                                "must not be trusted for this. Investigate FIRST: issue one "
+                                "<tool>web_search \"...\"</tool> (or web_fetch/docs_*). Only answer after "
+                                "you have real findings."));
+                printf("\033[33m[deepsearch %d/%d] answer rejected — must search first\033[0m\n", round, max_rounds);
+                fflush(stdout);
+                continue;
+            }
             answer = trim(ans);
             printf("\033[36m[deepsearch %d/%d] answer ready\033[0m\n", round, max_rounds);
             fflush(stdout);
@@ -311,7 +347,7 @@ char *execute_deep_search(struct llama_model *model,
         }
 
         size_t tlen = 0;
-        const char *tbody = extract_tool_call(astr, &tlen);
+        const char *tbody = extract_tool_call(act, &tlen);
         if (!tbody) {
             msgs_add(&msgs, &nmsg, &capmsg, "user",
                      strdup("Your last turn had neither a <tool> action nor an <answer>. "
@@ -334,15 +370,39 @@ char *execute_deep_search(struct llama_model *model,
         const char *tool_name = al.args[0];
         const char *tool_arg  = al.count >= 2 ? al.args[1] : "";
 
+        /* Reasoning models often emit a bare "<tool>web_search</tool>" and leave
+           the actual query in their prose/thinking. Reject an argument-less call
+           with a precise correction instead of running an empty search. */
+        if ((strcasecmp(tool_name, "web_search") == 0 || strcasecmp(tool_name, "web_fetch") == 0 ||
+             strcasecmp(tool_name, "docs_search") == 0 || strcasecmp(tool_name, "docs_get") == 0)
+            && !tool_arg[0]) {
+            StringBuf m; sb_init(&m);
+            sb_append_str(&m, "Your <tool>");
+            sb_append_str(&m, tool_name);
+            sb_append_str(&m, "</tool> call was missing its argument. Put the query/URL/path INSIDE the "
+                              "tag, quoted, e.g. <tool>");
+            sb_append_str(&m, tool_name);
+            sb_append_str(&m, " \"your query here\"</tool> — do not describe it in prose. Re-issue it now.");
+            printf("\033[33m[deepsearch %d/%d] %s had no argument — reprompting\033[0m\n",
+                   round, max_rounds, tool_name);
+            fflush(stdout);
+            arglist_free(&al);
+            msgs_add(&msgs, &nmsg, &capmsg, "user", sb_to_str(&m));
+            continue;
+        }
+
         const char *phase = "";
         char *raw = dispatch_research_tool(tool_name, tool_arg, &phase);
+        if (strcasecmp(tool_name, "web_search") == 0 || strcasecmp(tool_name, "web_fetch") == 0 ||
+            strcasecmp(tool_name, "docs_search") == 0 || strcasecmp(tool_name, "docs_get") == 0)
+            tools_run++;   /* a real investigation happened — answers now allowed */
         printf("\033[90m[deepsearch %d/%d] %s: %.80s\033[0m\n", round, max_rounds, phase, tool_arg);
         fflush(stdout);
         if (!raw) raw = strdup("(no result)");
 
         if (generation_interrupted) { free(raw); arglist_free(&al); printf("\033[33m[deepsearch] interrupted.\033[0m\n"); fflush(stdout); break; }
 
-        char *obs = distill_result(dctx, vocab, xsmpl, tmpl, question, raw, fmt_buf);
+        char *obs = distill_result(dctx, vocab, xsmpl, model, question, raw, fmt_buf);
         free(raw);
 
         /* Record the result as a user turn, prefixed with the action it answers
@@ -380,13 +440,14 @@ char *execute_deep_search(struct llama_model *model,
                      strdup("[Research budget reached. Give your final, thorough, cited <answer> now.]"));
         }
         generation_interrupted = 0;   /* let the synthesis run even after a Ctrl+C */
-        char *out = ds_generate(dctx, vocab, dsmpl, tmpl, msgs, nmsg, fmt_buf);
+        char *out = ds_generate(dctx, vocab, dsmpl, model, msgs, nmsg, fmt_buf);
         if (out) {
             /* Prefer <answer>; the 4B sometimes emits <report> instead — use that
                body then, never raw tagged text. */
-            char *ans = extract_tagged(out, "answer");
-            if (!ans) ans = extract_tagged(out, "report");
-            answer = ans ? (trim(ans), ans) : strdup(out);
+            const char *fact = after_think(out);
+            char *ans = extract_tagged(fact, "answer");
+            if (!ans) ans = extract_tagged(fact, "report");
+            answer = ans ? (trim(ans), ans) : strdup(fact);  /* never surface <think> in the result */
             free(out);
         }
     }
@@ -400,6 +461,7 @@ char *execute_deep_search(struct llama_model *model,
     sigaction(SIGINT, &old_sa, NULL);
     generation_interrupted = 0;
     generate_quiet = prev_quiet;
+    generate_keep_think = prev_keep_think;
     for (size_t i = 0; i < nmsg; i++) free((void *)msgs[i].content);
     free(msgs);
     free(fmt_buf);

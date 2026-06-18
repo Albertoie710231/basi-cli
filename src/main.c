@@ -158,6 +158,7 @@ static const char *SYSTEM_PROMPT_FMT =
 volatile sig_atomic_t generation_interrupted = 0;
 volatile sig_atomic_t show_thinking = 0;
 volatile sig_atomic_t generate_quiet = 0;
+volatile sig_atomic_t generate_keep_think = 0;
 
 static void sigint_handler(int sig) {
     (void)sig;
@@ -1433,10 +1434,10 @@ int main(int argc, char **argv) {
          * can echo the original request back to the model — small models drift
          * after several tool rounds otherwise. Freed at end of turn. */
 
-        /* Apply chat template (falls back to ChatML if model template is Jinja) */
-        const char *tmpl = llama_model_chat_template(model, NULL);
+        /* Apply chat template — renders the model's native format via the jinja
+           engine (chat_tmpl shim), with ChatML fallback. */
         int new_len = apply_template(
-            tmpl, messages, msg_count, true,
+            model, messages, msg_count, true,
             formatted_buf, sizeof(formatted_buf));
 
         if (new_len < 0) {
@@ -1521,7 +1522,7 @@ int main(int argc, char **argv) {
 
                 /* Update template for next iteration */
                 int next_len = apply_template(
-                    tmpl, messages, msg_count, true,
+                    model, messages, msg_count, true,
                     formatted_buf, sizeof(formatted_buf));
                 if (next_len < 0) {
                     printf("Error: Failed to apply chat template\n");
@@ -1529,7 +1530,7 @@ int main(int argc, char **argv) {
                     break;
                 }
                 int prev = apply_template(
-                    tmpl, messages, msg_count - 1, false, NULL, 0);
+                    model, messages, msg_count - 1, false, NULL, 0);
                 prompt = formatted_buf + prev;
                 prompt_len = (size_t)next_len - (size_t)prev;
 
@@ -1568,7 +1569,7 @@ int main(int argc, char **argv) {
 
         /* Update prev_len for next turn */
         int len = apply_template(
-            tmpl, messages, msg_count, false, NULL, 0);
+            model, messages, msg_count, false, NULL, 0);
         if (len >= 0) prev_len = (size_t)len;
 
         free(user_input);

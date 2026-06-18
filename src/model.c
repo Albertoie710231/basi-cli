@@ -18,6 +18,7 @@
 #include "globals.h"
 #include "model.h"
 #include "hwinfo.h"
+#include "chat_tmpl.h"
 
 void model_init(void) {
     extern void log_callback(enum ggml_log_level level, const char *text, void *user_data);
@@ -243,6 +244,7 @@ GenerateResult generate(
                         state = STATE_THINKING;
                         tag_len = 0;
                         piece_start = idx + 1;
+                        if (generate_keep_think) sb_append_str(&response, "<think>");
                         if (show_thinking) {
                             if (!generate_quiet) { printf("\033[90m[thinking] "); fflush(stdout); }
                         } else {
@@ -271,15 +273,18 @@ GenerateResult generate(
                     state = STATE_MAYBE_CLOSE;
                     tag_len = 0;
                     tag_buf[tag_len++] = ch;
-                } else if (show_thinking) {
-                    if (!generate_quiet) { printf("\033[90m%c", ch); fflush(stdout); }
                 } else {
-                    /* Spinner animation */
-                    double now = time_now();
-                    if (now - last_spinner > 0.08) {
-                        spinner_frame++;
-                        draw_thinking_box(spinner_frame);
-                        last_spinner = now;
+                    if (generate_keep_think) sb_append_char(&response, ch);
+                    if (show_thinking) {
+                        if (!generate_quiet) { printf("\033[90m%c", ch); fflush(stdout); }
+                    } else {
+                        /* Spinner animation */
+                        double now = time_now();
+                        if (now - last_spinner > 0.08) {
+                            spinner_frame++;
+                            draw_thinking_box(spinner_frame);
+                            last_spinner = now;
+                        }
                     }
                 }
                 piece_start = idx + 1;
@@ -294,6 +299,7 @@ GenerateResult generate(
                         state = STATE_NORMAL;
                         tag_len = 0;
                         piece_start = idx + 1;
+                        if (generate_keep_think) sb_append_str(&response, "</think>");
                         if (show_thinking) {
                             if (!generate_quiet) printf("\033[0m\n");
                         } else {
@@ -303,6 +309,7 @@ GenerateResult generate(
                         thinking_box_shown = false;
                     }
                 } else {
+                    if (generate_keep_think) sb_append(&response, tag_buf, tag_len);
                     if (show_thinking && !generate_quiet) {
                         printf("\033[90m");
                         fwrite(tag_buf, 1, tag_len, stdout);
@@ -364,9 +371,9 @@ GenerateResult generate(
 
         /* Stop as soon as a complete <tool>...</tool> has been emitted, so the
            model can't chain dozens of speculative tool calls in one response.
-           Only normal-state text is appended to `response`, so this tail match
-           won't trigger inside <think> blocks. */
-        if (response.len >= 7 &&
+           Gated to STATE_NORMAL so a "</tool>" inside a kept <think> block
+           (generate_keep_think) can't trip it. */
+        if (state == STATE_NORMAL && response.len >= 7 &&
             memcmp(response.data + response.len - 7, "</tool>", 7) == 0) {
             res.gen_time_s = time_now() - timer_start;
             if (thinking_box_shown) {
@@ -457,13 +464,30 @@ static int apply_chatml(
  * to plain ChatML, which is the de-facto format for Qwen/Phi/etc.
  */
 int apply_template(
-    const char *tmpl,
+    const struct llama_model *model,
     const struct llama_chat_message *msgs, size_t n_msgs,
     bool add_gen_prompt,
     char *buf, size_t buf_size)
 {
+    bool dbg = getenv("BASI_DEBUG_TEMPLATE") != NULL;
+
+    /* 1) Native: render the model's actual chat template via the jinja engine.
+          This drives every model in its real format (Gemma/DeepSeek/custom). */
+    char *rendered = basi_render_chat(model, msgs, n_msgs, add_gen_prompt);
+    if (rendered) {
+        size_t len = strlen(rendered);
+        if (dbg) fprintf(stderr, "[tmpl] native jinja render: %zu bytes\n", len);
+        if (!buf) { free(rendered); return (int)len; }       /* length-only query */
+        if (len < buf_size) { memcpy(buf, rendered, len + 1); free(rendered); return (int)len; }
+        free(rendered);   /* doesn't fit this buffer — fall through to legacy */
+        if (dbg) fprintf(stderr, "[tmpl] rendered prompt too big for buffer; falling back\n");
+    }
+
+    /* 2) Legacy fallback: llama.cpp's C-API detection, then ChatML. */
+    const char *tmpl = model ? llama_model_chat_template(model, NULL) : NULL;
     if (tmpl) {
         int r = llama_chat_apply_template(tmpl, msgs, n_msgs, add_gen_prompt, buf, buf_size);
+        if (dbg) fprintf(stderr, "[tmpl] fallback llama_chat_apply_template -> %d\n", r);
         if (r >= 0) return r;
     }
     return apply_chatml(msgs, n_msgs, add_gen_prompt, buf, buf_size);

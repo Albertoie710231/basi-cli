@@ -58,6 +58,11 @@ extern volatile sig_atomic_t show_thinking;
  * internal rounds silently while it prints its own progress lines. */
 extern volatile sig_atomic_t generate_quiet;
 
+/* When set, generate() KEEPS <think>...</think> in the returned text instead of
+ * stripping it. Used by deepsearch so a reasoning model's chat history stays
+ * consistent (its prior turns include their thinking) and it can think freely. */
+extern volatile sig_atomic_t generate_keep_think;
+
 /* y/n/a approval prompt for risky tools.
  * Returns: 0 = deny, 1 = allow once, 2 = always (caller sets flag). */
 int request_approval(const char *tool_label, const char *cmd);
