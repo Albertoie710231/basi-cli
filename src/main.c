@@ -803,7 +803,9 @@ int main(int argc, char **argv) {
                    "  -h              Show this help\n\n"
                    "Environment:\n"
                    "  BASI_MODEL             Default model path if -m not specified\n"
-                   "  BASI_DEEPSEARCH_ROUNDS Max deep-research rounds (default 5)\n\n");
+                   "  BASI_DEEPSEARCH_ROUNDS Max deep-research rounds (default 5)\n"
+                   "  BASI_DEEPSEARCH_CTX    Deep-research context size (default 32768; lower for\n"
+                   "                         interactive /deepsearch on a single GPU)\n\n");
             return 0;
         }
     }
@@ -860,6 +862,12 @@ int main(int argc, char **argv) {
         llama_model_free(model);
         return 1;
     }
+
+    /* In one-shot deep-research the main context is never used for generation
+       (we run deep_search in its own large context, then exit), so shrink it to
+       free VRAM for the research context — important on a single GPU where two
+       full-size contexts won't both fit. */
+    if (oneshot_deepsearch_q) ctx_override = 4096;
 
     /* Create context */
     struct llama_context_params ctx_params = llama_context_default_params();
