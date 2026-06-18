@@ -53,6 +53,11 @@ extern int spike_calls;
 extern volatile sig_atomic_t generation_interrupted;
 extern volatile sig_atomic_t show_thinking;
 
+/* When set, generate() suppresses all terminal output (token stream, thinking
+ * box) but still builds and returns its text. Used by deepsearch to run many
+ * internal rounds silently while it prints its own progress lines. */
+extern volatile sig_atomic_t generate_quiet;
+
 /* y/n/a approval prompt for risky tools.
  * Returns: 0 = deny, 1 = allow once, 2 = always (caller sets flag). */
 int request_approval(const char *tool_label, const char *cmd);

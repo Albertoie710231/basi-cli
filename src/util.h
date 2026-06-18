@@ -40,7 +40,13 @@ double time_now(void);                                    /* seconds since epoch
 char *url_encode(const char *input);  /* malloc'd */
 char *url_decode(const char *input);  /* malloc'd */
 
-/* ── JSON helper ───────────────────────────────────────────────────── */
+/* ── JSON helpers ──────────────────────────────────────────────────── */
 void json_escape_into(StringBuf *sb, const char *s);
+
+/* Minimal JSON path extractor. Paths use dots; numeric segments index arrays
+   (e.g. "results.0.url"). Assumes well-formed JSON. */
+char *jx_get_string(const char *json, const char *path);  /* malloc'd or NULL */
+long  jx_get_int(const char *json, const char *path);     /* -1 if missing    */
+bool  jx_has_key(const char *json, const char *key);
 
 #endif /* BASI_UTIL_H */

@@ -389,7 +389,7 @@ char *execute_assumptions(const char *body) {
             snprintf(msg, 640,
                 "assumptions: %d unverified item(s) — routing to spike phase "
                 "(cycle %d/%d). Use docs_*, code_context, read/grep/wc, "
-                "webfetch, readfile to investigate. Budget: %d tool calls / "
+                "web_search, web_fetch, readfile to investigate. Budget: %d tool calls / "
                 "~%d tokens. When done, call spike_write with ## Question / "
                 "## Findings / ## Decision: PROCEED-TO-PLAN | "
                 "NEED-ANOTHER-SPIKE | ABANDON.",
@@ -683,7 +683,7 @@ bool plan_tool_allowed(PlanPhase phase, const char *command) {
     bool is_patch      = strcmp(tool, "apply_patch") == 0;
     bool is_scaffold   = strcmp(tool, "scaffold") == 0;
     bool is_planwrite  = strcmp(tool, "plan_write") == 0;
-    bool is_webfetch   = strcmp(tool, "webfetch") == 0;
+    bool is_web        = strcmp(tool, "web_search") == 0 || strcmp(tool, "web_fetch") == 0;
     bool is_spikewrite = strcmp(tool, "spike_write") == 0;
     bool is_assume     = strcmp(tool, "assumptions") == 0;
     bool is_planverify = strcmp(tool, "plan_verify") == 0;
@@ -706,7 +706,7 @@ bool plan_tool_allowed(PlanPhase phase, const char *command) {
             return !(is_bash || is_patch || is_scaffold || is_planwrite ||
                      is_assume || is_planverify);
         case PHASE_PREMORTEM:
-            return !(is_bash || is_patch || is_scaffold || is_webfetch ||
+            return !(is_bash || is_patch || is_scaffold || is_web ||
                      is_spikewrite || is_assume || is_planverify);
         case PHASE_ACTIVE:
             return !(is_planwrite || is_spikewrite || is_assume);
@@ -725,7 +725,7 @@ char *plan_block_msg(PlanPhase phase, const char *command) {
 
     bool is_planwrite  = strcmp(tool, "plan_write") == 0;
     bool is_scaffold   = strcmp(tool, "scaffold") == 0;
-    bool is_webfetch   = strcmp(tool, "webfetch") == 0;
+    bool is_web        = strcmp(tool, "web_search") == 0 || strcmp(tool, "web_fetch") == 0;
     bool is_spikewrite = strcmp(tool, "spike_write") == 0;
     bool is_assume     = strcmp(tool, "assumptions") == 0;
     bool is_planverify = strcmp(tool, "plan_verify") == 0;
@@ -771,7 +771,7 @@ char *plan_block_msg(PlanPhase phase, const char *command) {
         sb_append_str(&sb, plan_phase_name(phase));
         sb_append_str(&sb,
             " phase (scaffold list is allowed). Use /plan accept to enter active phase, or /plan off to exit.");
-    } else if (is_webfetch && phase == PHASE_PREMORTEM) {
+    } else if (is_web && phase == PHASE_PREMORTEM) {
         sb_append_str(&sb,
             "blocked in premortem phase — review the existing plan, don't fetch new sources.");
     } else {

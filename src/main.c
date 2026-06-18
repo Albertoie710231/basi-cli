@@ -29,6 +29,7 @@
 #include "model.h"
 #include "verify.h"
 #include "embed.h"
+#include "deepsearch.h"
 
 /* MAX_TOKENS, CONTEXT_SIZE → globals.h */
 #define MAX_FILE_TOKENS     2000
@@ -40,7 +41,7 @@
 
 static const char *SYSTEM_PROMPT_FMT =
     "You are BASI, a helpful AI assistant with access to file and web tools.\n"
-    "Today's date is %s.\n"
+    "The current date is shown at the start of each user message — trust it over any date you remember.\n"
     "Your training data may be outdated. Always use the search tool for current events, recent products, or anything time-sensitive.\n"
     "\n"
     "When you need to read files, search the web, or fetch URLs, use these tools by wrapping commands in <tool> tags:\n"
@@ -125,26 +126,29 @@ static const char *SYSTEM_PROMPT_FMT =
     "- docs_vector_search <query> : Semantic similarity search across the corpus. Last-resort fallback for when docs_search (literal grep) returns nothing — embeds the query and finds chunks with the closest meaning. First call lazily loads the embedding model (one-time slow path); the embeddings sidecar caches results across calls and re-embeds only what changed. Use natural-language phrasing, not keywords. If the model isn't installed, the response tells you how to download it.\n"
     "  Format: <tool>docs_vector_search how does the planner gate tools by phase</tool>\n"
     "\n"
-    "WEB TOOL:\n"
-    "- webfetch \"search query\" \"grep regex\" : Takes exactly 2 quoted arguments. First is a web search query. Second is a regex pattern (use | for OR). Fetches the top 5 results in parallel and extracts paragraphs matching the regex. Handles PDFs transparently: if a result URL ends in .pdf it is parsed as PDF, and if an HTML landing page links to a PDF, the PDF is followed and its text is inlined.\n"
+    "WEB TOOLS:\n"
+    "- web_search \"query\" [day|week|month|year] : Search the web. ALWAYS use it for any current/latest/version/price/news/recent-events question — your training data is months stale, so NEVER answer those from memory. Returns ranked results (title + URL + snippet) AND the full extracted text of the top 3 pages. Answer from that fetched PAGE CONTENT — trust it over snippets and over your own prior knowledge (e.g. version numbers). Only call web_fetch for a different URL not already included. Optional 2nd arg filters by recency (news/latest/today).\n"
+    "- web_fetch \"url\" : Fetch and extract the readable text of ONE page (http/https; a bare domain like example.com is accepted). Follows redirects safely, blocks private/internal addresses, and extracts PDFs transparently. Use after web_search, or when the user names a concrete URL.\n"
     "\n"
     "LOCAL DOCUMENT TOOL:\n"
-    "- readfile <path> [\"regex\"] : Read any local document (pdf, docx, odt, epub, or plain text like txt/md/source code). Optional regex narrows output to matching paragraphs; without it, dumps the first ~5000 chars. ONLY call this when the user explicitly gave you a path on their machine — NEVER invent or guess a path. If they asked about something on the web, use webfetch instead.\n"
+    "- readfile <path> [\"regex\"] : Read any local document (pdf, docx, odt, epub, or plain text like txt/md/source code). Optional regex narrows output to matching paragraphs; without it, dumps the first ~5000 chars. ONLY call this when the user explicitly gave you a path on their machine — NEVER invent or guess a path. If they asked about something on the web, use web_search/web_fetch instead.\n"
     "\n"
     "Examples:\n"
     "<tool>head -n 50 src/main.c</tool>\n"
     "<tool>grep -n \"function main\" src/main.c</tool>\n"
-    "<tool>webfetch \"latest google pixel phone specs\" \"pixel|specs|price|release|camera\"</tool>\n"
-    "<tool>webfetch \"attention is all you need paper\" \"attention|transformer|self-attention|benchmark\"</tool>\n"
+    "<tool>web_search \"latest google pixel phone specs\"</tool>\n"
+    "<tool>web_fetch \"https://arxiv.org/abs/1706.03762\"</tool>\n"
     "\n"
     "Tool results will appear in <tool_result> tags.\n"
     "For large files, first use 'wc' to check size, then 'head' or 'grep' to read relevant parts.\n"
     "CRITICAL RULES:\n"
-    "1. After receiving tool results, you MUST answer the user immediately. Do not call another tool unless the results were completely empty.\n"
+    "1. After receiving tool results, answer the user immediately — EXCEPT you may make one follow-up call to web_fetch a promising URL returned by web_search. Otherwise, do not call another tool unless the results were completely empty.\n"
     "2. Base your answers on the actual content returned by tools. Never assume details.\n"
-    "3. One webfetch call is almost always enough — PDFs linked from landing pages are auto-followed. Answer with what you have.\n"
+    "3. A web_search then a web_fetch of the best result is usually enough — don't over-fetch. Answer with what you have.\n"
     "4. NEVER call readfile unless the user wrote a concrete path in their own message. Do not fabricate paths like /home/user/... — that file does not exist on this machine.\n"
     "5. If a tool returns 'User denied execution.', do NOT retry. Explain in plain language why you need it and ask the user.\n"
+    "6. Cite ONLY URLs that literally appear in the tool results. Never construct, guess, or modify a source link. If you didn't get it from a result, don't cite it.\n"
+    "7. For ANY question about current or time-sensitive facts — latest/newest/current version, release, price, news, recent events, 'as of today', 'what is X now' — you MUST call web_search FIRST and answer only from the results. Your training is months out of date, so answering from memory WILL be wrong. Such a call is NECESSARY, never 'unnecessary'.\n"
     "\n"
     "Always be helpful, concise, and accurate.";
 
@@ -153,6 +157,7 @@ static const char *SYSTEM_PROMPT_FMT =
 
 volatile sig_atomic_t generation_interrupted = 0;
 volatile sig_atomic_t show_thinking = 0;
+volatile sig_atomic_t generate_quiet = 0;
 
 static void sigint_handler(int sig) {
     (void)sig;
@@ -433,11 +438,11 @@ const char *plan_phase_name(PlanPhase p) {
 const char *plan_phase_banner(PlanPhase p) {
     switch (p) {
         case PHASE_DRAFTING:
-            return "[DRAFTING phase — research the task using docs_*, code_context, read/grep/wc, webfetch, readfile. BEFORE you call plan_write, call the assumptions tool with a list (one '- <item>' per line) of every unverified thing the plan depends on; if 3 or more, you'll be auto-routed to a spike phase to investigate first. Then save the Proposal-A3 plan to .basi/plans/<slug>.md via plan_write. bash/apply_patch/scaffold are BLOCKED (scaffold list is allowed).]";
+            return "[DRAFTING phase — research the task using docs_*, code_context, read/grep/wc, web_search, web_fetch, readfile. BEFORE you call plan_write, call the assumptions tool with a list (one '- <item>' per line) of every unverified thing the plan depends on; if 3 or more, you'll be auto-routed to a spike phase to investigate first. Then save the Proposal-A3 plan to .basi/plans/<slug>.md via plan_write. bash/apply_patch/scaffold are BLOCKED (scaffold list is allowed).]";
         case PHASE_SPIKE:
-            return "[SPIKE phase — read-only investigation. Allowed: docs_*, code_context, read/grep/wc, webfetch, readfile. Budget: 12 tool calls / ~8000 tokens; stay tight. When done, call spike_write with this body:\n  ---\n  slug: <same>\n  phase: spike\n  created: YYYY-MM-DD\n  ---\n  ## Question\n  <the specific uncertainty>\n  ## Findings\n  - <bullet, each cites a path or URL>\n  ## Decision\n  PROCEED-TO-PLAN | NEED-ANOTHER-SPIKE | ABANDON\n  PROCEED-TO-PLAN returns to drafting; NEED-ANOTHER-SPIKE starts cycle N+1 (cap 3); ABANDON exits plan mode. plan_write/assumptions are blocked here.]";
+            return "[SPIKE phase — read-only investigation. Allowed: docs_*, code_context, read/grep/wc, web_search, web_fetch, readfile. Budget: 12 tool calls / ~8000 tokens; stay tight. When done, call spike_write with this body:\n  ---\n  slug: <same>\n  phase: spike\n  created: YYYY-MM-DD\n  ---\n  ## Question\n  <the specific uncertainty>\n  ## Findings\n  - <bullet, each cites a path or URL>\n  ## Decision\n  PROCEED-TO-PLAN | NEED-ANOTHER-SPIKE | ABANDON\n  PROCEED-TO-PLAN returns to drafting; NEED-ANOTHER-SPIKE starts cycle N+1 (cap 3); ABANDON exits plan mode. plan_write/assumptions are blocked here.]";
         case PHASE_PREMORTEM:
-            return "[PREMORTEM phase — Klein protocol. Imagine it is three months from now and this plan FAILED. Looking back, explain why. Then call plan_write to rewrite the plan with a new \"## Pre-mortem\" section containing three subsections: ### Failure modes (numbered, distinct, past-tense — \"X happened because Y\"), ### Plan revisions (bullet diff: what you changed in the plan body in response), ### Unaddressed risks (failure modes accepted as residual). The 200-line cap still holds — compress, don't truncate. webfetch is blocked; review what's in front of you. /plan accept transitions to active.]";
+            return "[PREMORTEM phase — Klein protocol. Imagine it is three months from now and this plan FAILED. Looking back, explain why. Then call plan_write to rewrite the plan with a new \"## Pre-mortem\" section containing three subsections: ### Failure modes (numbered, distinct, past-tense — \"X happened because Y\"), ### Plan revisions (bullet diff: what you changed in the plan body in response), ### Unaddressed risks (failure modes accepted as residual). The 200-line cap still holds — compress, don't truncate. web_search/web_fetch are blocked; review what's in front of you. /plan accept transitions to active.]";
         case PHASE_NONE:
         case PHASE_ACTIVE:
         default:
@@ -626,7 +631,8 @@ static char *execute_tool(const char *command) {
 
     /* Whitelist check */
     static const char *allowed[] = {
-        "read", "head", "tail", "grep", "wc", "cat", "webfetch", "readfile", NULL
+        "read", "head", "tail", "grep", "wc", "cat",
+        "web_search", "web_fetch", "readfile", NULL
     };
     bool is_allowed = false;
     for (const char **a = allowed; *a; a++) {
@@ -635,7 +641,7 @@ static char *execute_tool(const char *command) {
     if (!is_allowed) {
         char *msg = malloc(256);
         snprintf(msg, 256,
-            "Error: Command '%s' not allowed. Use: read, head, tail, grep, wc, bash, apply_patch, scaffold, code_context, webfetch, readfile", cmd);
+            "Error: Command '%s' not allowed. Use: read, head, tail, grep, wc, bash, apply_patch, scaffold, code_context, web_search, web_fetch, readfile", cmd);
         arglist_free(&al);
         return msg;
     }
@@ -676,15 +682,29 @@ static char *execute_tool(const char *command) {
         return content;
     }
 
-    /* Handle 'webfetch' — search + parallel fetch + grep */
-    if (strcmp(cmd, "webfetch") == 0) {
-        if (al.count < 3) {
+    /* Handle 'web_search' — ranked search results (no content fetch) */
+    if (strcmp(cmd, "web_search") == 0) {
+        if (al.count < 2) {
             arglist_free(&al);
-            return strdup("Error: webfetch requires two arguments:\n"
-                          "  webfetch \"search query\" \"grep pattern\"\n"
-                          "Example: webfetch \"google pixel 10 specs\" \"pixel 10|price|specs|release\"");
+            return strdup("Error: web_search requires a query:\n"
+                          "  web_search \"search query\" [day|week|month|year]\n"
+                          "Example: web_search \"google pixel 10 specs\"");
         }
-        char *result = execute_webfetch(al.args[1], al.args[2]);
+        const char *time_filter = (al.count >= 3) ? al.args[2] : NULL;
+        char *result = execute_web_search(al.args[1], time_filter);
+        arglist_free(&al);
+        return result;
+    }
+
+    /* Handle 'web_fetch' — fetch + extract one page */
+    if (strcmp(cmd, "web_fetch") == 0) {
+        if (al.count < 2) {
+            arglist_free(&al);
+            return strdup("Error: web_fetch requires a URL:\n"
+                          "  web_fetch \"https://example.com/page\"\n"
+                          "Example: web_fetch \"https://arxiv.org/abs/1706.03762\"");
+        }
+        char *result = execute_web_fetch(al.args[1]);
         arglist_free(&al);
         return result;
     }
@@ -753,6 +773,8 @@ int main(int argc, char **argv) {
 
     const char *model_path = NULL;
     int n_gpu_layers = 99;
+    const char *oneshot_deepsearch_q = NULL;  /* --deepsearch: run deep research and exit */
+    const char *oneshot_prompt = NULL;        /* -p/--prompt: run one agent turn and exit */
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-m") == 0 && i + 1 < argc) {
@@ -761,18 +783,31 @@ int main(int argc, char **argv) {
             n_gpu_layers = atoi(argv[++i]);
         } else if (strcmp(argv[i], "-d") == 0 || strcmp(argv[i], "--debug") == 0) {
             debug_mode = true;
+        } else if ((strcmp(argv[i], "--deepsearch") == 0 || strcmp(argv[i], "-ds") == 0)
+                   && i + 1 < argc) {
+            oneshot_deepsearch_q = argv[++i];
+        } else if ((strcmp(argv[i], "-p") == 0 || strcmp(argv[i], "--prompt") == 0
+                    || strcmp(argv[i], "--print") == 0) && i + 1 < argc) {
+            oneshot_prompt = argv[++i];
         } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             printf("BASI-CLI - AI Chat Interface\n\n"
-                   "Usage: basi-cli -m <model.gguf> [-ngl <gpu_layers>] [-d]\n\n"
-                   "  -m     Path to GGUF model file\n"
-                   "  -ngl   Number of GPU layers (default: 99)\n"
-                   "  -d     Debug mode (show webfetch details)\n"
-                   "  -h     Show this help\n\n"
+                   "Usage:\n"
+                   "  basi-cli -m <model.gguf> [-ngl <n>] [-d]          interactive session\n"
+                   "  basi-cli -m <model.gguf> -p \"<prompt>\"             one-shot agent turn, prints + exits\n"
+                   "  basi-cli -m <model.gguf> --deepsearch \"<question>\" one-shot deep research, prints + exits\n\n"
+                   "  -m              Path to GGUF model file\n"
+                   "  -ngl            Number of GPU layers (default: 99)\n"
+                   "  -p, --prompt    Run a single prompt non-interactively (with tools), then exit\n"
+                   "  --deepsearch    Run multi-round deep research (web + KB) non-interactively, then exit\n"
+                   "  -d              Debug mode (verbose tool output)\n"
+                   "  -h              Show this help\n\n"
                    "Environment:\n"
-                   "  BASI_MODEL  Default model path if -m not specified\n\n");
+                   "  BASI_MODEL             Default model path if -m not specified\n"
+                   "  BASI_DEEPSEARCH_ROUNDS Max deep-research rounds (default 5)\n\n");
             return 0;
         }
     }
+    bool oneshot = (oneshot_deepsearch_q != NULL) || (oneshot_prompt != NULL);
 
     if (!model_path) {
         model_path = getenv("BASI_MODEL");
@@ -781,6 +816,12 @@ int main(int argc, char **argv) {
     static char picked_model[1024];
     int ctx_override = 0;
     float temp_override = -1;
+    if (!model_path && oneshot) {
+        fprintf(stderr,
+            "Error: non-interactive mode (--deepsearch / -p) needs a model — "
+            "pass -m <model.gguf> or set BASI_MODEL.\n");
+        return 1;
+    }
     if (!model_path) {
         LaunchConfig cfg = pick_model();
         if (!cfg.model_path) {
@@ -794,6 +835,9 @@ int main(int argc, char **argv) {
         ctx_override = cfg.ctx_size;
         temp_override = cfg.temperature;
     }
+
+    /* Warm up the local SearXNG (web_search backend) while the model loads. */
+    web_ensure_searxng();
 
     printf("BASI-CLI - Loading model...\n");
     fflush(stdout);
@@ -829,9 +873,35 @@ int main(int argc, char **argv) {
         ctx_params.n_threads_batch = phys;
     }
 
-    struct llama_context *ctx = llama_init_from_model(model, ctx_params);
+    /* Context allocation (KV cache + compute buffers) is where VRAM actually
+     * runs out — the picker's estimate is only a guess. The model weights are
+     * already resident, so on failure we halve n_ctx and retry WITHOUT
+     * reloading. This is the hard backstop that guarantees we never crash on a
+     * mis-estimate: it degrades context length until the KV cache fits. */
+    struct llama_context *ctx = NULL;
+    {
+        const uint32_t requested_ctx = ctx_params.n_ctx;
+        const uint32_t min_ctx = 2048;
+        while (1) {
+            ctx = llama_init_from_model(model, ctx_params);
+            if (ctx) break;
+            if (ctx_params.n_ctx <= min_ctx) break;
+            uint32_t reduced = ctx_params.n_ctx / 2;
+            if (reduced < min_ctx) reduced = min_ctx;
+            fprintf(stderr,
+                "\033[33m[VRAM: context of %u didn't fit — retrying at %u]\033[0m\n",
+                ctx_params.n_ctx, reduced);
+            ctx_params.n_ctx   = reduced;
+            ctx_params.n_batch = reduced;
+        }
+        if (ctx && ctx_params.n_ctx < requested_ctx) {
+            fprintf(stderr,
+                "\033[33m[VRAM: loaded with context %u instead of %u to fit available memory]\033[0m\n",
+                ctx_params.n_ctx, requested_ctx);
+        }
+    }
     if (!ctx) {
-        fprintf(stderr, "Error: Failed to create context\n");
+        fprintf(stderr, "Error: Failed to create context (out of VRAM even at minimum size)\n");
         llama_model_free(model);
         return 1;
     }
@@ -870,15 +940,10 @@ int main(int argc, char **argv) {
         msg_count++; \
     } while(0)
 
-    /* System prompt with current date */
-    char date_str[16];
-    {
-        time_t now = time(NULL);
-        struct tm *t = localtime(&now);
-        strftime(date_str, sizeof(date_str), "%Y-%m-%d", t);
-    }
+    /* The date is injected per-turn (see the REPL loop) so it stays fresh on
+       long-lived / resumed sessions, not stamped once here. */
     char system_prompt[16384];
-    snprintf(system_prompt, sizeof(system_prompt), SYSTEM_PROMPT_FMT, date_str);
+    snprintf(system_prompt, sizeof(system_prompt), "%s", SYSTEM_PROMPT_FMT);
     {
         char *templates_idx = build_templates_index();
         size_t cur_len = strlen(system_prompt);
@@ -919,8 +984,18 @@ int main(int argc, char **argv) {
     }
     ADD_MESSAGE("system", system_prompt);
 
-    /* Session picker: list previous sessions for this cwd, or start a new one */
-    {
+    /* Non-interactive deep research: run it, print the answer, and exit —
+       skipping the session picker and the REPL entirely. */
+    if (oneshot_deepsearch_q) {
+        char *ans = execute_deep_search(model, vocab, oneshot_deepsearch_q);
+        printf("\n%s\n", ans ? ans : "(no answer)");
+        fflush(stdout);
+        free(ans);
+        goto cleanup;
+    }
+
+    /* Session picker (interactive only): list previous sessions, or start new */
+    if (!oneshot) {
         char *sess_dir = session_dir_path();
         if (sess_dir) {
             char *load_path = session_picker(sess_dir);
@@ -946,13 +1021,21 @@ int main(int argc, char **argv) {
     char formatted_buf[FORMATTED_BUF_SZ];
     size_t prev_len = 0;
 
-    /* REPL loop */
+    /* REPL loop (or a single injected turn in -p one-shot mode) */
+    bool oneshot_done = false;
     while (1) {
-        char *user_input = read_line("\033[32m> \033[0m");
-        if (!user_input) break; /* EOF */
-        if (user_input[0] == '\0') {
-            free(user_input);
-            continue;
+        char *user_input;
+        if (oneshot_prompt) {
+            if (oneshot_done) break;          /* one-shot: exit after one turn */
+            user_input = strdup(oneshot_prompt);
+            oneshot_done = true;
+        } else {
+            user_input = read_line("\033[32m> \033[0m");
+            if (!user_input) break; /* EOF */
+            if (user_input[0] == '\0') {
+                free(user_input);
+                continue;
+            }
         }
 
         /* Slash commands intercept (no model call) */
@@ -971,6 +1054,8 @@ int main(int argc, char **argv) {
                     "  /plan [<slug>|accept|off]\n"
                     "                        no args: show phase. <slug>: enter drafting. accept: drafting/premortem -> active. off: exit.\n"
                     "  /premortem            (drafting only) enter premortem — model rewrites the plan with a ## Pre-mortem section\n"
+                    "  /deepsearch <question>\n"
+                    "                        multi-round deep research (web + knowledge base), synthesized + cited\n"
                     "  /model                switch model (requires restart)\n"
                     "\n"
                     "Subcommands (run before model load):\n"
@@ -978,7 +1063,7 @@ int main(int argc, char **argv) {
                     "                        copy a markdown file into ./.basi/knowledge/\n"
                     "\n"
                     "Tools the model can call: read, head, tail, grep, wc, bash,\n"
-                    "  apply_patch, scaffold, webfetch, readfile, code_context,\n"
+                    "  apply_patch, scaffold, web_search, web_fetch, readfile, code_context,\n"
                     "  docs_toc, docs_get, docs_search, docs_recent_notes,\n"
                     "  docs_vector_search,\n"
                     "  plan_write (drafting/premortem), assumptions (drafting),\n"
@@ -1152,6 +1237,33 @@ int main(int argc, char **argv) {
                 free(user_input);
                 continue;
             }
+            if (strncmp(user_input, "/deepsearch", 11) == 0 &&
+                (user_input[11] == '\0' || user_input[11] == ' ')) {
+                const char *q = user_input + 11;
+                while (*q == ' ') q++;
+                if (!*q) {
+                    printf("\033[31m[/deepsearch: needs a question. Usage: /deepsearch <your research question>]\033[0m\n");
+                    fflush(stdout);
+                    free(user_input);
+                    continue;
+                }
+                char *q_copy = strdup(q);
+                char *answer = execute_deep_search(model, vocab, q_copy);
+                printf("\n%s\n\n", answer ? answer : "(no answer)");
+                fflush(stdout);
+                /* Record the exchange so follow-up turns have context. The
+                 * research ran in its own context, so the main KV cache is
+                 * untouched and out of sync with these new messages — clear it
+                 * (like /clear) so the next turn cleanly re-decodes everything. */
+                ADD_MESSAGE("user", q_copy);
+                ADD_MESSAGE("assistant", answer ? answer : "(no answer)");
+                llama_memory_clear(llama_get_memory(ctx), true);
+                prev_len = 0;
+                free(q_copy);
+                free(answer);
+                free(user_input);
+                continue;
+            }
             if (strncmp(user_input, "/plan", 5) == 0 &&
                 (user_input[5] == '\0' || user_input[5] == ' ')) {
                 const char *arg = user_input + 5;
@@ -1287,15 +1399,27 @@ int main(int argc, char **argv) {
             continue;
         }
 
+        /* Recompute the date every turn and ride it in with the user message.
+           The system prompt is decoded once and cached, so only tokens added now
+           reach the model — this keeps "today" correct on sessions left open for
+           days or resumed weeks later. */
+        char today[16];
+        {
+            time_t now = time(NULL);
+            struct tm *t = localtime(&now);
+            strftime(today, sizeof(today), "%Y-%m-%d", t);
+        }
+
         const char *banner = plan_phase_banner(plan_phase);
-        if (banner) {
-            size_t blen = strlen(user_input) + strlen(banner) + 8;
+        {
+            size_t blen = strlen(user_input) + (banner ? strlen(banner) : 0) + 64;
             char *msg = malloc(blen);
-            snprintf(msg, blen, "%s\n\n%s", banner, user_input);
+            if (banner)
+                snprintf(msg, blen, "[Today's date: %s]\n%s\n\n%s", today, banner, user_input);
+            else
+                snprintf(msg, blen, "[Today's date: %s]\n%s", today, user_input);
             ADD_MESSAGE("user", msg);
             free(msg);
-        } else {
-            ADD_MESSAGE("user", user_input);
         }
         /* keep user_input alive across tool iterations so the context reminder
          * can echo the original request back to the model — small models drift
@@ -1442,6 +1566,7 @@ int main(int argc, char **argv) {
         free(user_input);
     }
 
+cleanup:
     /* Cleanup */
     if (session_fp) fclose(session_fp);
     lsp_shutdown();

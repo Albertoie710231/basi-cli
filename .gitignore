@@ -2,3 +2,8 @@
 zig-out/
 basi-cli
 *.o
+
+# note-cli mock test artifacts (manager/worker experiment)
+noted/
+pyproject.toml
+*.egg-info/

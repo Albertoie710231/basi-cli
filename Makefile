@@ -6,7 +6,7 @@ LLAMA_BUILD = $(LLAMA_DIR)/build_vulkan
 
 INCLUDES = -I$(LLAMA_DIR)/include -I$(LLAMA_DIR)/ggml/include -Isrc
 LDFLAGS = -L$(LLAMA_BUILD)/bin -Wl,-rpath,$(LLAMA_BUILD)/bin
-LIBS = -lllama -lggml -lggml-base -lm
+LIBS = -lllama -lggml -lggml-base -lm -lvulkan
 
 TARGET = basi-cli
 SRCS = $(wildcard src/*.c)
