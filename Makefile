@@ -5,8 +5,10 @@ CFLAGS = -Wall -Wextra -O2
 # static helpers; that's upstream, not our code.
 CXXFLAGS = -std=c++17 -Wall -Wextra -O2 -Wno-unused-function
 
-LLAMA_DIR = /home/alberto/llama.cpp
-LLAMA_BUILD = $(LLAMA_DIR)/build_vulkan
+# Point these at your llama.cpp checkout + build dir, e.g.:
+#   make LLAMA_DIR=/path/to/llama.cpp LLAMA_BUILD=/path/to/llama.cpp/build
+LLAMA_DIR ?= /home/alberto/llama.cpp
+LLAMA_BUILD ?= $(LLAMA_DIR)/build_vulkan
 
 INCLUDES = -I$(LLAMA_DIR)/include -I$(LLAMA_DIR)/ggml/include -Isrc
 # The C++ shim (chat_tmpl.cpp) calls llama.cpp's chat-template engine, so it
