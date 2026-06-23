@@ -299,20 +299,6 @@ static bool lsp_initialize(LspClient *c) {
     return true;
 }
 
-/* JSON-escape a string into a StringBuf (NO surrounding quotes — caller adds them). */
-static void lsp_json_escape(StringBuf *out, const char *s) {
-    for (const char *p = s; *p; p++) {
-        unsigned char b = (unsigned char)*p;
-        if      (*p == '"')  sb_append_str(out, "\\\"");
-        else if (*p == '\\') sb_append_str(out, "\\\\");
-        else if (*p == '\n') sb_append_str(out, "\\n");
-        else if (*p == '\r') sb_append_str(out, "\\r");
-        else if (*p == '\t') sb_append_str(out, "\\t");
-        else if (b < 0x20)   { char hx[8]; snprintf(hx, sizeof(hx), "\\u%04x", b); sb_append_str(out, hx); }
-        else                 sb_append_char(out, *p);
-    }
-}
-
 static char *abs_uri(const char *path) {
     char abspath[2048];
     if (path[0] == '/') {
@@ -340,11 +326,11 @@ static bool lsp_sync_file(LspClient *c, const char *path, const char *content) {
     StringBuf p;
     sb_init(&p);
     if (first) {
-        sb_append_str(&p, "{\"textDocument\":{\"uri\":\"");
-        lsp_json_escape(&p, uri);
-        sb_append_str(&p, "\",\"languageId\":\"c\",\"version\":1,\"text\":\"");
-        lsp_json_escape(&p, content);
-        sb_append_str(&p, "\"}}");
+        sb_append_str(&p, "{\"textDocument\":{\"uri\":");
+        json_escape_into(&p, uri);
+        sb_append_str(&p, ",\"languageId\":\"c\",\"version\":1,\"text\":");
+        json_escape_into(&p, content);
+        sb_append_str(&p, "}}");
         bool ok = lsp_notify(c, "textDocument/didOpen", p.data, p.len);
         sb_free(&p);
         if (ok && c->n_opened < LSP_MAX_OPENED)
@@ -353,11 +339,11 @@ static bool lsp_sync_file(LspClient *c, const char *path, const char *content) {
             free(uri);
         return ok;
     } else {
-        sb_append_str(&p, "{\"textDocument\":{\"uri\":\"");
-        lsp_json_escape(&p, uri);
-        sb_append_str(&p, "\",\"version\":2},\"contentChanges\":[{\"text\":\"");
-        lsp_json_escape(&p, content);
-        sb_append_str(&p, "\"}]}");
+        sb_append_str(&p, "{\"textDocument\":{\"uri\":");
+        json_escape_into(&p, uri);
+        sb_append_str(&p, ",\"version\":2},\"contentChanges\":[{\"text\":");
+        json_escape_into(&p, content);
+        sb_append_str(&p, "}]}");
         bool ok = lsp_notify(c, "textDocument/didChange", p.data, p.len);
         sb_free(&p);
         free(uri);
@@ -476,7 +462,7 @@ char *execute_code_context(const char *args) {
     while (*args == ' ' || *args == '\t' || *args == '\n') args++;
     if (!*args) {
         return strdup("Error: code_context requires <file>:<line> or <file> <symbol>. "
-                      "Examples: <tool>code_context src/main.c execute_apply_patch</tool> "
+                      "Examples: <tool>code_context src/main.c execute_edit</tool> "
                       "(by symbol — preferred), or <tool>code_context src/main.c:2102</tool>");
     }
 
@@ -488,7 +474,7 @@ char *execute_code_context(const char *args) {
         const char *sep = strpbrk(args, " \t");
         if (!sep) {
             return strdup("Error: code_context expects exactly two whitespace-separated arguments: <file> <symbol>. "
-                          "Example: <tool>code_context src/main.c execute_apply_patch</tool>");
+                          "Example: <tool>code_context src/main.c execute_edit</tool>");
         }
         size_t flen = (size_t)(sep - args);
         if (flen == 0) {
@@ -521,7 +507,7 @@ char *execute_code_context(const char *args) {
             snprintf(err, 512,
                 "Error: code_context: '%.100s' is not a valid C identifier. "
                 "Pass only the symbol's name (no line numbers, no colons, no parens). "
-                "Example: <tool>code_context src/main.c execute_apply_patch</tool>",
+                "Example: <tool>code_context src/main.c execute_edit</tool>",
                 s);
             free(file);
             return err;
@@ -544,26 +530,21 @@ char *execute_code_context(const char *args) {
     }
     int line0 = line_1based - 1;
 
-    /* Read file content. */
-    FILE *f = fopen(file, "r");
-    if (!f) {
+    /* Read file content via the shared slurp; enforce the 8 MiB cap on the
+     * returned length (read_file_all guards ftell()<0 internally). */
+    size_t nread = 0;
+    char *content = read_file_all(file, &nread);
+    if (!content) {
         char *e = malloc(512);
         snprintf(e, 512, "code_context: cannot open '%.300s' (%s)", file, strerror(errno));
         free(file); free(symbol);
         return e;
     }
-    fseek(f, 0, SEEK_END);
-    long fsize = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    if (fsize <= 0 || fsize > 8 * 1024 * 1024) {
-        fclose(f);
+    if (nread == 0 || nread > 8 * 1024 * 1024) {
+        free(content);
         free(file); free(symbol);
         return strdup("code_context: file is empty or larger than 8MB");
     }
-    char *content = malloc(fsize + 1);
-    size_t nread = fread(content, 1, fsize, f);
-    content[nread] = '\0';
-    fclose(f);
 
     int total_lines = 0;
     for (size_t i = 0; i < nread; i++) if (content[i] == '\n') total_lines++;

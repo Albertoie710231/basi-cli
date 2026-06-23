@@ -1,7 +1,7 @@
 #ifndef BASI_PATCH_H
 #define BASI_PATCH_H
 
-/* apply_patch tool — Codex-style freeform diff. */
-char *execute_apply_patch(const char *patch_text);
+/* edit tool — SEARCH/REPLACE blocks, applied with an exact->fuzzy cascade. */
+char *execute_edit(const char *args);
 
 #endif /* BASI_PATCH_H */

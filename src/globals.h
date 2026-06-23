@@ -67,4 +67,11 @@ extern volatile sig_atomic_t generate_keep_think;
  * Returns: 0 = deny, 1 = allow once, 2 = always (caller sets flag). */
 int request_approval(const char *tool_label, const char *cmd);
 
+/* Read-before-edit tracker. A file is "seen" once it has been viewed this
+ * session via read/head/tail/grep/cat/readfile; apply_patch uses this to
+ * refuse editing a file the model has not grounded itself in. Paths are
+ * canonicalised, so relative/absolute spellings of the same file match. */
+void read_tracker_mark(const char *path);
+bool read_tracker_seen(const char *path);
+
 #endif /* BASI_GLOBALS_H */

@@ -14,6 +14,8 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdarg.h>
+#include <limits.h>
+#include <sys/utsname.h>
 
 #include "llama.h"
 
@@ -30,6 +32,8 @@
 #include "verify.h"
 #include "embed.h"
 #include "deepsearch.h"
+#include "chat_tmpl.h"
+#include "tooldefs.h"
 
 /* MAX_TOKENS, CONTEXT_SIZE → globals.h */
 #define MAX_FILE_TOKENS     2000
@@ -56,7 +60,7 @@ static const char *SYSTEM_PROMPT_FMT =
     "\n"
     "CODE TOOL (C only, requires clangd):\n"
     "- code_context <file> <symbol> : Returns ONLY clangd's structural info (signature, type, doc) for a symbol. EXACTLY two whitespace-separated arguments — no colons, no line numbers. The symbol must be a top-level identifier (function, typedef, global). Output is fenced between '=== begin clangd ===' and '=== end clangd ===' — quote that block verbatim if asked, do NOT paraphrase surrounding code as 'clangd output'. Use grep -C separately if you also want to see the code.\n"
-    "  Format: <tool>code_context src/main.c execute_apply_patch</tool>\n"
+    "  Format: <tool>code_context src/main.c execute_edit</tool>\n"
     "  Use this when the user asks 'what is X', 'signature of X', or 'show me the definition of X'.\n"
     "\n"
     "SHELL TOOL:\n"
@@ -64,30 +68,25 @@ static const char *SYSTEM_PROMPT_FMT =
     "  Examples: <tool>bash make</tool>  <tool>bash git status</tool>  <tool>bash ls -la src/</tool>\n"
     "\n"
     "EDIT TOOL:\n"
-    "- apply_patch : Create, modify, or delete files using a structured patch. Requires user approval. After applying, do NOT re-read the file — the result tells you success or failure. Format:\n"
-    "  <tool>apply_patch\n"
-    "  *** Begin Patch\n"
-    "  *** Update File: <path>          (or 'Add File:' / 'Delete File:')\n"
-    "  @@                                (separates hunks; only needed for >1 hunk per file)\n"
-    "   context line                     (1-3 unchanged lines, prefix with single space)\n"
-    "  -line to remove                   (prefix with '-')\n"
-    "  +line to add                      (prefix with '+')\n"
-    "  *** End Patch</tool>\n"
-    "  'Add File' body is all '+'-prefixed lines (full file content). 'Delete File' has no body. Include enough surrounding ' ' context that the location is unique; if context matches multiple places the patch fails. Paths must be relative.\n"
-    "  Example:\n"
-    "  <tool>apply_patch\n"
-    "  *** Begin Patch\n"
-    "  *** Update File: src/foo.c\n"
-    "  @@\n"
-    "   int main(void) {\n"
-    "  -    return 0;\n"
-    "  +    printf(\"hello\\n\");\n"
-    "  +    return 0;\n"
-    "   }\n"
-    "  *** End Patch</tool>\n"
+    "- edit <path> : Create or modify a file with one or more SEARCH/REPLACE blocks. Requires user approval. After it succeeds, do NOT re-read the file — the result tells you what happened. You MUST read the file first (read/head/grep) before editing it. Format:\n"
+    "  <tool>edit <path>\n"
+    "  <<<<<<< SEARCH\n"
+    "  <text exactly as it currently appears in the file>\n"
+    "  =======\n"
+    "  <the replacement text>\n"
+    "  >>>>>>> REPLACE</tool>\n"
+    "  Rules: The SEARCH text is matched against the CURRENT file content — copy it verbatim (whitespace can drift a little, but the words must be exact). It must be UNIQUE; if it could match several places, include a few surrounding lines. You may stack multiple SEARCH/REPLACE blocks in one edit call (applied top-to-bottom). To CREATE a new file, leave the SEARCH section empty and put the whole file content in REPLACE. Paths are relative. To delete a file, use bash (rm).\n"
+    "  Example (change a fragment — SEARCH need not be a whole line):\n"
+    "  <tool>edit src/foo.c\n"
+    "  <<<<<<< SEARCH\n"
+    "  return 0;\n"
+    "  =======\n"
+    "  printf(\"hello\\n\");\n"
+    "      return 0;\n"
+    "  >>>>>>> REPLACE</tool>\n"
     "\n"
     "SCAFFOLD TOOL:\n"
-    "- scaffold <name> [<dest_dir>] : Materialize a code template into <dest_dir> (default: .). Requires user approval. Use this BEFORE apply_patch when the user asks for boilerplate (e.g. 'add a new C tool', 'create a server') — the template gives you correct structure (includes, error handling, build snippets), and you only need to apply_patch the parts that need customization. The list of available templates is in 'AVAILABLE TEMPLATES' at the end of this prompt; if you don't see one that fits, skip scaffold and write the file with apply_patch directly.\n"
+    "- scaffold <name> [<dest_dir>] : Materialize a code template into <dest_dir> (default: .). Requires user approval. Use this BEFORE edit when the user asks for boilerplate (e.g. 'add a new C tool', 'create a server') — the template gives you correct structure (includes, error handling, build snippets), and you only need to edit the parts that need customization. The list of available templates is in 'AVAILABLE TEMPLATES' at the end of this prompt; if you don't see one that fits, skip scaffold and write the file with edit directly.\n"
     "  Examples: <tool>scaffold c-tool src/server.c</tool>  <tool>scaffold list</tool>\n"
     "\n"
     "PLANNING TOOLS (gated by plan phase):\n"
@@ -151,6 +150,24 @@ static const char *SYSTEM_PROMPT_FMT =
     "7. For ANY question about current or time-sensitive facts — latest/newest/current version, release, price, news, recent events, 'as of today', 'what is X now' — you MUST call web_search FIRST and answer only from the results. Your training is months out of date, so answering from memory WILL be wrong. Such a call is NECESSARY, never 'unnecessary'.\n"
     "\n"
     "Always be helpful, concise, and accurate.";
+
+/* Slim system prompt used in NATIVE tool-calling mode: the model's own
+ * template already advertises the tools (names + JSON schemas), so we drop the
+ * <tool>-prose catalog and keep only behavioural steering. */
+static const char *SYSTEM_PROMPT_NATIVE =
+    "You are BASI, a helpful AI assistant. You have tools for reading and editing files, running shell commands, searching a local knowledge base, and searching/fetching the web — they are provided to you as callable functions.\n"
+    "The current date is shown at the start of each user message — trust it over any date you remember.\n"
+    "Your training data may be outdated; for anything current (latest/version/price/news/recent events) you MUST call web_search first and answer from the results.\n"
+    "\n"
+    "Working rules:\n"
+    "- You MUST read a file (read/head/grep) before you edit it.\n"
+    "- To change a file, call edit with the exact current text in 'search' and the new text in 'replace'. Do not re-read the file after a successful edit.\n"
+    "- After a tool returns, base your answer on its ACTUAL output; never assume details.\n"
+    "- A web_search followed by one web_fetch of the best result is usually enough — then answer.\n"
+    "- Cite ONLY URLs that appear in tool results; never invent or guess links.\n"
+    "- When a tool reports 'User denied execution.', do not retry; explain why you need it.\n"
+    "- Reference code locations as path:line so the user can jump to them.\n"
+    "Be helpful, concise, and accurate.";
 
 
 /* ── Signal handling ───────────────────────────────────────────────── */
@@ -422,6 +439,41 @@ char *current_plan_slug = NULL;
 int spike_cycles = 0;
 int spike_calls  = 0;
 
+/* ── Read-before-edit tracker ──────────────────────────────────────── */
+/* Files the model has viewed this session, canonicalised so "src/x.c",
+ * "./src/x.c" and an absolute path collapse to one entry. edit reads
+ * this (read_tracker_seen) to refuse editing a file that was never read. */
+static char **read_paths     = NULL;
+static int    read_paths_n   = 0;
+static int    read_paths_cap = 0;
+
+static char *canon_path(const char *path) {
+    char buf[PATH_MAX];
+    if (realpath(path, buf)) return strdup(buf);
+    return strdup(path);   /* file may not exist yet; fall back to the literal */
+}
+
+void read_tracker_mark(const char *path) {
+    if (!path || !*path) return;
+    char *cp = canon_path(path);
+    for (int i = 0; i < read_paths_n; i++)
+        if (strcmp(read_paths[i], cp) == 0) { free(cp); return; }
+    if (read_paths_n >= read_paths_cap) {
+        read_paths_cap = read_paths_cap ? read_paths_cap * 2 : 16;
+        read_paths = realloc(read_paths, sizeof(char *) * read_paths_cap);
+    }
+    read_paths[read_paths_n++] = cp;
+}
+
+bool read_tracker_seen(const char *path) {
+    char *cp = canon_path(path);
+    bool found = false;
+    for (int i = 0; i < read_paths_n; i++)
+        if (strcmp(read_paths[i], cp) == 0) { found = true; break; }
+    free(cp);
+    return found;
+}
+
 const char *perm_mode_name(PermissionMode m) {
     return m == PERM_DEFAULT      ? "default"
          : m == PERM_ACCEPT_EDITS ? "accept-edits"
@@ -439,7 +491,7 @@ const char *plan_phase_name(PlanPhase p) {
 const char *plan_phase_banner(PlanPhase p) {
     switch (p) {
         case PHASE_DRAFTING:
-            return "[DRAFTING phase — research the task using docs_*, code_context, read/grep/wc, web_search, web_fetch, readfile. BEFORE you call plan_write, call the assumptions tool with a list (one '- <item>' per line) of every unverified thing the plan depends on; if 3 or more, you'll be auto-routed to a spike phase to investigate first. Then save the Proposal-A3 plan to .basi/plans/<slug>.md via plan_write. bash/apply_patch/scaffold are BLOCKED (scaffold list is allowed).]";
+            return "[DRAFTING phase — research the task using docs_*, code_context, read/grep/wc, web_search, web_fetch, readfile. BEFORE you call plan_write, call the assumptions tool with a list (one '- <item>' per line) of every unverified thing the plan depends on; if 3 or more, you'll be auto-routed to a spike phase to investigate first. Then save the Proposal-A3 plan to .basi/plans/<slug>.md via plan_write. bash/edit/scaffold are BLOCKED (scaffold list is allowed).]";
         case PHASE_SPIKE:
             return "[SPIKE phase — read-only investigation. Allowed: docs_*, code_context, read/grep/wc, web_search, web_fetch, readfile. Budget: 12 tool calls / ~8000 tokens; stay tight. When done, call spike_write with this body:\n  ---\n  slug: <same>\n  phase: spike\n  created: YYYY-MM-DD\n  ---\n  ## Question\n  <the specific uncertainty>\n  ## Findings\n  - <bullet, each cites a path or URL>\n  ## Decision\n  PROCEED-TO-PLAN | NEED-ANOTHER-SPIKE | ABANDON\n  PROCEED-TO-PLAN returns to drafting; NEED-ANOTHER-SPIKE starts cycle N+1 (cap 3); ABANDON exits plan mode. plan_write/assumptions are blocked here.]";
         case PHASE_PREMORTEM:
@@ -479,12 +531,65 @@ int request_approval(const char *tool_label, const char *cmd) {
 
 /* ── Execute tool command ──────────────────────────────────────────── */
 
+/* Read a small file with the `read` tool's token-budget guard. Returns
+ * malloc'd content on success (and marks the path read), or a malloc'd
+ * "Error: …" string. Caller frees either way. */
+static char *read_small_file(const char *filepath) {
+    FILE *f = fopen(filepath, "r");
+    if (!f) {
+        char *msg = malloc(512);
+        snprintf(msg, 512, "Error: Cannot open file '%s'", filepath);
+        return msg;
+    }
+    struct stat st;
+    fstat(fileno(f), &st);
+    size_t estimated_tokens = st.st_size / 4;
+    if (estimated_tokens > MAX_FILE_TOKENS) {
+        size_t lines = count_lines(f);
+        char *msg = malloc(512);
+        snprintf(msg, 512,
+            "Error: File too large (~%zu tokens, max %d). Use 'head', 'tail', or 'grep' to read in chunks.\n"
+            "File has %ld bytes, %zu lines (use 'wc %s' for exact count)",
+            estimated_tokens, MAX_FILE_TOKENS, (long)st.st_size, lines, filepath);
+        fclose(f);
+        return msg;
+    }
+    char *content = malloc(st.st_size + 1);
+    if (!content) {
+        fclose(f);
+        return strdup("Error: out of memory reading file");
+    }
+    size_t nread = fread(content, 1, st.st_size, f);
+    content[nread] = '\0';
+    fclose(f);
+    read_tracker_mark(filepath);
+    return content;
+}
+
+/* Append one argument to a shell-command buffer, single-quote escaped so that
+ * shell metacharacters — including embedded quotes and spaces — pass through
+ * literally and are never re-split. Used by both the legacy tokenized path and
+ * the native structured-dispatch path. */
+static void sh_append_arg(StringBuf *sb, const char *arg) {
+    sb_append_char(sb, ' ');
+    if (strpbrk(arg, " \t\"'$`\\")) {
+        sb_append_char(sb, '\'');
+        for (const char *c = arg; *c; c++) {
+            if (*c == '\'') sb_append_str(sb, "'\"'\"'");
+            else sb_append_char(sb, *c);
+        }
+        sb_append_char(sb, '\'');
+    } else {
+        sb_append_str(sb, arg);
+    }
+}
+
 static char *execute_tool(const char *command) {
     /* trim whitespace */
     while (*command == ' ' || *command == '\t' || *command == '\n') command++;
     if (!*command) return strdup("Error: Empty command");
 
-    /* Phase gate (Decision #5): single check covers bash/apply_patch/scaffold
+    /* Phase gate (Decision #5): single check covers bash/edit/scaffold
      * blocking during drafting/spike/premortem AND plan_write availability. */
     if (!plan_tool_allowed(plan_phase, command)) {
         return plan_block_msg(plan_phase, command);
@@ -578,16 +683,16 @@ static char *execute_tool(const char *command) {
         }
     }
 
-    /* apply_patch: pass through entire patch body, parse + apply. */
-    if (strncmp(command, "apply_patch", 11) == 0) {
-        char after = command[11];
+    /* edit: SEARCH/REPLACE blocks; parse + apply with the fuzzy cascade. */
+    if (strncmp(command, "edit", 4) == 0) {
+        char after = command[4];
         if (after == ' ' || after == '\t' || after == '\n' || after == '\0') {
-            const char *patch_text = command + 11;
-            while (*patch_text == ' ' || *patch_text == '\t' || *patch_text == '\n') patch_text++;
-            if (!*patch_text) {
-                return strdup("Error: apply_patch requires a patch body. See system prompt for grammar.");
+            const char *body = command + 4;
+            while (*body == ' ' || *body == '\t' || *body == '\n') body++;
+            if (!*body) {
+                return strdup("Error: edit requires a file path and a SEARCH/REPLACE block. See system prompt for the format.");
             }
-            return execute_apply_patch(patch_text);
+            return execute_edit(body);
         }
     }
 
@@ -642,7 +747,7 @@ static char *execute_tool(const char *command) {
     if (!is_allowed) {
         char *msg = malloc(256);
         snprintf(msg, 256,
-            "Error: Command '%s' not allowed. Use: read, head, tail, grep, wc, bash, apply_patch, scaffold, code_context, web_search, web_fetch, readfile", cmd);
+            "Error: Command '%s' not allowed. Use: read, head, tail, grep, wc, bash, edit, scaffold, code_context, web_search, web_fetch, readfile", cmd);
         arglist_free(&al);
         return msg;
     }
@@ -653,32 +758,7 @@ static char *execute_tool(const char *command) {
             arglist_free(&al);
             return strdup("Error: read requires a file path");
         }
-        const char *filepath = al.args[1];
-        FILE *f = fopen(filepath, "r");
-        if (!f) {
-            char *msg = malloc(512);
-            snprintf(msg, 512, "Error: Cannot open file '%s'", filepath);
-            arglist_free(&al);
-            return msg;
-        }
-        struct stat st;
-        fstat(fileno(f), &st);
-        size_t estimated_tokens = st.st_size / 4;
-        if (estimated_tokens > MAX_FILE_TOKENS) {
-            size_t lines = count_lines(f);
-            char *msg = malloc(512);
-            snprintf(msg, 512,
-                "Error: File too large (~%zu tokens, max %d). Use 'head', 'tail', or 'grep' to read in chunks.\n"
-                "File has %ld bytes, %zu lines (use 'wc %s' for exact count)",
-                estimated_tokens, MAX_FILE_TOKENS, (long)st.st_size, lines, filepath);
-            fclose(f);
-            arglist_free(&al);
-            return msg;
-        }
-        char *content = malloc(st.st_size + 1);
-        size_t nread = fread(content, 1, st.st_size, f);
-        content[nread] = '\0';
-        fclose(f);
+        char *content = read_small_file(al.args[1]);
         arglist_free(&al);
         return content;
     }
@@ -720,6 +800,7 @@ static char *execute_tool(const char *command) {
         }
         const char *regex = (al.count >= 3) ? al.args[2] : NULL;
         char *result = execute_readfile(al.args[1], regex);
+        read_tracker_mark(al.args[1]);
         arglist_free(&al);
         return result;
     }
@@ -732,27 +813,135 @@ static char *execute_tool(const char *command) {
     sb_append_str(&shell_cmd, actual);
 
     for (int i = 1; i < al.count; i++) {
-        sb_append_char(&shell_cmd, ' ');
-        /* Quote arguments that need it */
-        if (strpbrk(al.args[i], " \t\"'$`\\")) {
-            sb_append_char(&shell_cmd, '\'');
-            for (const char *c = al.args[i]; *c; c++) {
-                if (*c == '\'') {
-                    sb_append_str(&shell_cmd, "'\"'\"'");
-                } else {
-                    sb_append_char(&shell_cmd, *c);
-                }
-            }
-            sb_append_char(&shell_cmd, '\'');
-        } else {
-            sb_append_str(&shell_cmd, al.args[i]);
-        }
+        sh_append_arg(&shell_cmd, al.args[i]);
+    }
+
+    /* Mark any file argument as seen, so a subsequent edit to a file the
+     * model inspected with head/tail/grep/wc/cat passes the read-before-edit
+     * gate (these tools are how the harness reads files too large for 'read'). */
+    for (int i = 1; i < al.count; i++) {
+        struct stat fst;
+        if (stat(al.args[i], &fst) == 0 && S_ISREG(fst.st_mode))
+            read_tracker_mark(al.args[i]);
     }
 
     char *result = run_command(sb_to_str(&shell_cmd), 512 * 1024);
     sb_free(&shell_cmd);
     arglist_free(&al);
     return result;
+}
+
+/* ── Native function-call dispatch ─────────────────────────────────────
+ * Take the model's already-parsed JSON args straight to the existing
+ * handlers, bypassing basi_build_command + tokenize_command so a value that
+ * contains a quote or a space (e.g. a grep pattern `foo"bar`, or a path with a
+ * space) survives intact instead of being silently re-split (CODE_REVIEW_PLAN
+ * Task 3). Returns a malloc'd result string, or NULL if `name` is not a known
+ * tool (the caller then reports the unknown-tool error). */
+static char *execute_tool_native(const char *name, const char *args_json) {
+    if (!name) return NULL;
+    if (!args_json) args_json = "{}";
+
+    /* Tools dispatched directly here (parsed args → handler / escaped shell
+     * command). Every other tool falls through to basi_build_command +
+     * execute_tool below, which already passes free-text safely (body-style
+     * tools) and re-runs the phase gate itself. The two sets are DISJOINT, so
+     * the phase gate + spike accounting run exactly once per call. */
+    bool direct = strcmp(name, "read") == 0  || strcmp(name, "head") == 0 ||
+                  strcmp(name, "tail") == 0  || strcmp(name, "grep") == 0 ||
+                  strcmp(name, "wc")   == 0  || strcmp(name, "web_search") == 0 ||
+                  strcmp(name, "web_fetch") == 0 || strcmp(name, "readfile") == 0;
+
+    if (!direct) {
+        char *cmd = basi_build_command(name, args_json);
+        if (!cmd) return NULL;                 /* unknown tool */
+        char *r = execute_tool(cmd);            /* gate + accounting happen here */
+        free(cmd);
+        return r;
+    }
+
+    /* IMPORTANT: bypassing execute_tool also bypasses its phase gate + spike
+     * accounting, so re-run them here keyed on the bare tool name (the gate
+     * only inspects the first token). Without this, web_search/web_fetch would
+     * escape the PHASE_PREMORTEM block and the spike-call budget would not
+     * tick during a spike. read/head/tail/grep/wc are allowed in every phase,
+     * but gating them too is harmless and keeps the invariant simple. */
+    if (!plan_tool_allowed(plan_phase, name)) {
+        return plan_block_msg(plan_phase, name);
+    }
+    if (plan_phase == PHASE_SPIKE && strcmp(name, "spike_write") != 0) {
+        spike_calls++;
+    }
+
+    if (strcmp(name, "read") == 0) {
+        char *file = jx_get_string(args_json, "file");
+        if (!file) return strdup("Error: read requires a file path");
+        char *r = read_small_file(file);
+        free(file);
+        return r;
+    }
+    if (strcmp(name, "web_search") == 0) {
+        char *query = jx_get_string(args_json, "query");
+        if (!query) return strdup("Error: web_search requires a query");
+        char *recency = jx_get_string(args_json, "recency");   /* may be NULL */
+        char *r = execute_web_search(query, recency);
+        free(query); free(recency);
+        return r;
+    }
+    if (strcmp(name, "web_fetch") == 0) {
+        char *url = jx_get_string(args_json, "url");
+        if (!url) return strdup("Error: web_fetch requires a url");
+        char *r = execute_web_fetch(url);
+        free(url);
+        return r;
+    }
+    if (strcmp(name, "readfile") == 0) {
+        char *path = jx_get_string(args_json, "path");
+        if (!path) return strdup("Error: readfile requires a path");
+        char *regex = jx_get_string(args_json, "regex");       /* may be NULL */
+        char *r = execute_readfile(path, regex);
+        read_tracker_mark(path);
+        free(path); free(regex);
+        return r;
+    }
+
+    /* head / tail / grep / wc — build the final shell command with proper
+     * single-quote escaping (sh_append_arg), never via tokenize_command. */
+    char *file = jx_get_string(args_json, "file");
+    if (!file) {
+        char *e = malloc(64);
+        snprintf(e, 64, "Error: %s requires a file path", name);
+        return e;
+    }
+    StringBuf sh;
+    sb_init(&sh);
+    if (strcmp(name, "grep") == 0) {
+        sb_append_str(&sh, "grep -n");
+        long ctx = jx_get_int(args_json, "context");
+        if (ctx > 0) { char b[32]; snprintf(b, sizeof(b), " -C %ld", ctx); sb_append_str(&sh, b); }
+        char *pattern = jx_get_string(args_json, "pattern");
+        if (!pattern) { free(file); sb_free(&sh); return strdup("Error: grep requires a pattern"); }
+        sh_append_arg(&sh, pattern);
+        sh_append_arg(&sh, file);
+        free(pattern);
+    } else if (strcmp(name, "wc") == 0) {
+        sb_append_str(&sh, "wc");
+        sh_append_arg(&sh, file);
+    } else {  /* head or tail */
+        sb_append_str(&sh, name);
+        long lines = jx_get_int(args_json, "lines");
+        if (lines > 0) { char b[32]; snprintf(b, sizeof(b), " -n %ld", lines); sb_append_str(&sh, b); }
+        sh_append_arg(&sh, file);
+    }
+
+    /* Mark the file read so a later edit passes the read-before-edit gate. */
+    struct stat fst;
+    if (stat(file, &fst) == 0 && S_ISREG(fst.st_mode)) read_tracker_mark(file);
+    free(file);
+
+    char *r = run_command(sb_to_str(&sh), 512 * 1024);
+    sb_free(&sh);
+    return r;
 }
 
 
@@ -776,12 +965,28 @@ int main(int argc, char **argv) {
     int n_gpu_layers = 99;
     const char *oneshot_deepsearch_q = NULL;  /* --deepsearch: run deep research and exit */
     const char *oneshot_prompt = NULL;        /* -p/--prompt: run one agent turn and exit */
+    bool no_tools = false;                    /* --no-tools: flat completion, no tool loop */
+    const char *system_override = NULL;       /* -s/--system: system prompt for --no-tools */
+    bool ngl_set = false;                     /* was -ngl/--ngl passed explicitly? */
+    int  cli_ctx  = 0;                        /* -c/--ctx: context size (0 = default) */
+    float cli_temp = -1.0f;                   /* -t/--temp: sampling temp (<0 = default) */
+    uint32_t cli_seed = LLAMA_DEFAULT_SEED;   /* --seed: RNG seed for sampling */
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-m") == 0 && i + 1 < argc) {
             model_path = argv[++i];
-        } else if (strcmp(argv[i], "-ngl") == 0 && i + 1 < argc) {
-            n_gpu_layers = atoi(argv[++i]);
+        } else if ((strcmp(argv[i], "-ngl") == 0 || strcmp(argv[i], "--ngl") == 0)
+                   && i + 1 < argc) {
+            n_gpu_layers = atoi(argv[++i]);  /* 0 = CPU only */
+            ngl_set = true;
+        } else if ((strcmp(argv[i], "-c") == 0 || strcmp(argv[i], "--ctx") == 0)
+                   && i + 1 < argc) {
+            cli_ctx = atoi(argv[++i]);
+        } else if ((strcmp(argv[i], "-t") == 0 || strcmp(argv[i], "--temp") == 0)
+                   && i + 1 < argc) {
+            cli_temp = (float)atof(argv[++i]);
+        } else if (strcmp(argv[i], "--seed") == 0 && i + 1 < argc) {
+            cli_seed = (uint32_t)strtoul(argv[++i], NULL, 10);
         } else if (strcmp(argv[i], "-d") == 0 || strcmp(argv[i], "--debug") == 0) {
             debug_mode = true;
         } else if ((strcmp(argv[i], "--deepsearch") == 0 || strcmp(argv[i], "-ds") == 0)
@@ -790,15 +995,30 @@ int main(int argc, char **argv) {
         } else if ((strcmp(argv[i], "-p") == 0 || strcmp(argv[i], "--prompt") == 0
                     || strcmp(argv[i], "--print") == 0) && i + 1 < argc) {
             oneshot_prompt = argv[++i];
+        } else if (strcmp(argv[i], "--no-tools") == 0) {
+            no_tools = true;
+        } else if ((strcmp(argv[i], "-s") == 0 || strcmp(argv[i], "--system") == 0)
+                   && i + 1 < argc) {
+            system_override = argv[++i];
         } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             printf("BASI-CLI - AI Chat Interface\n\n"
                    "Usage:\n"
                    "  basi-cli -m <model.gguf> [-ngl <n>] [-d]          interactive session\n"
                    "  basi-cli -m <model.gguf> -p \"<prompt>\"             one-shot agent turn, prints + exits\n"
+                   "  basi-cli -m <model.gguf> -p \"<prompt>\" --no-tools  one-shot flat completion (no tools)\n"
                    "  basi-cli -m <model.gguf> --deepsearch \"<question>\" one-shot deep research, prints + exits\n\n"
                    "  -m              Path to GGUF model file\n"
-                   "  -ngl            Number of GPU layers (default: 99)\n"
+                   "  -ngl, --ngl     Number of model layers to offload to GPU (default: 99).\n"
+                   "                  Use 0 to run entirely on CPU.\n"
+                   "  -c, --ctx       Context size in tokens (default: 32768)\n"
+                   "  -t, --temp      Sampling temperature (default: 0.4; 0 = greedy)\n"
+                   "  --seed          RNG seed for sampling (default: random). Fix it for\n"
+                   "                  reproducible output.\n"
                    "  -p, --prompt    Run a single prompt non-interactively (with tools), then exit\n"
+                   "  --no-tools      With -p: one flat completion, no tool loop, no tool system prompt.\n"
+                   "                  Prints only the completion to stdout (clean for scripting/data-gen).\n"
+                   "  -s, --system    With --no-tools: system prompt to use (default: a minimal\n"
+                   "                  \"helpful assistant\" prompt). Pass \"\" for a pure completion.\n"
                    "  --deepsearch    Run multi-round deep research (web + KB) non-interactively, then exit\n"
                    "  -d              Debug mode (verbose tool output)\n"
                    "  -h              Show this help\n\n"
@@ -811,6 +1031,15 @@ int main(int argc, char **argv) {
         }
     }
     bool oneshot = (oneshot_deepsearch_q != NULL) || (oneshot_prompt != NULL);
+
+    /* --no-tools is a modifier on -p: it only makes sense for the one-shot
+     * prompt path. Reject it standalone rather than silently ignoring it. */
+    if (no_tools && !oneshot_prompt) {
+        fprintf(stderr,
+            "Error: --no-tools only applies to -p/--prompt. "
+            "Use: basi-cli -m <model> -p \"<prompt>\" --no-tools\n");
+        return 1;
+    }
 
     if (!model_path) {
         model_path = getenv("BASI_MODEL");
@@ -832,18 +1061,26 @@ int main(int argc, char **argv) {
             return 1;
         }
         strncpy(picked_model, cfg.model_path, sizeof(picked_model) - 1);
+        picked_model[sizeof(picked_model) - 1] = '\0';  /* strncpy may not NUL-terminate */
         free(cfg.model_path);
         model_path = picked_model;
-        n_gpu_layers = cfg.gpu_layers;
+        if (!ngl_set) n_gpu_layers = cfg.gpu_layers;
         ctx_override = cfg.ctx_size;
         temp_override = cfg.temperature;
     }
 
-    /* Warm up the local SearXNG (web_search backend) while the model loads. */
-    web_ensure_searxng();
+    /* Explicit CLI knobs win over picker / built-in defaults. */
+    if (cli_ctx  > 0)   ctx_override  = cli_ctx;
+    if (cli_temp >= 0)  temp_override = cli_temp;
 
-    printf("BASI-CLI - Loading model...\n");
-    fflush(stdout);
+    /* Warm up the local SearXNG (web_search backend) while the model loads.
+     * --no-tools never touches the web, so don't spin SearXNG up for it. */
+    if (!no_tools) web_ensure_searxng();
+
+    /* In --no-tools mode stdout must carry only the completion, so load chatter
+     * goes to stderr. */
+    fprintf(no_tools ? stderr : stdout, "BASI-CLI - Loading model...\n");
+    fflush(no_tools ? stderr : stdout);
 
     model_init();
 
@@ -919,10 +1156,12 @@ int main(int argc, char **argv) {
     struct llama_sampler *smpl = llama_sampler_chain_init(llama_sampler_chain_default_params());
     llama_sampler_chain_add(smpl, llama_sampler_init_min_p(0.05f, 1));
     llama_sampler_chain_add(smpl, llama_sampler_init_temp(temp_override >= 0 ? temp_override : 0.4f));
-    llama_sampler_chain_add(smpl, llama_sampler_init_dist(LLAMA_DEFAULT_SEED));
+    llama_sampler_chain_add(smpl, llama_sampler_init_dist(cli_seed));
 
-    printf("Model loaded. Type your message (empty line to quit).\n\n");
-    fflush(stdout);
+    if (!no_tools) {
+        printf("Model loaded. Type your message (empty line to quit).\n\n");
+        fflush(stdout);
+    }
 
     /* Chat messages (dynamic array) */
     struct llama_chat_message *messages = NULL;
@@ -949,10 +1188,81 @@ int main(int argc, char **argv) {
         msg_count++; \
     } while(0)
 
+    /* Non-interactive flat completion (`-p "..." --no-tools`): one generation,
+     * no tool loop, none of the tool-heavy system prompt. Built for clean,
+     * scriptable output — e.g. a local teacher for distillation data-gen, where
+     * the agentic loop's latency, web injection, and <tool> chatter are noise.
+     * stdout carries only the completion; everything else went to stderr above. */
+    if (no_tools) {
+        /* Default to a minimal assistant prompt; -s overrides; -s "" drops the
+         * system message entirely for a pure completion. */
+        const char *sys = system_override
+            ? system_override
+            : "You are a helpful assistant. Answer directly and concisely.";
+        if (sys && *sys) ADD_MESSAGE("system", sys);
+        ADD_MESSAGE("user", oneshot_prompt);
+
+        char *buf = malloc(FORMATTED_BUF_SZ);
+        int len = apply_template(model, messages, msg_count, true,
+                                 buf, FORMATTED_BUF_SZ);
+        if (len < 0) {
+            fprintf(stderr, "Error: Failed to apply chat template\n");
+            free(buf);
+            goto cleanup;
+        }
+
+        generate_quiet = 1;  /* suppress streaming/decoration; we print result.text */
+        GenerateResult r = generate(ctx, vocab, smpl, buf, (size_t)len);
+        printf("%s\n", r.text ? r.text : "");
+        fflush(stdout);
+        free(r.text);
+        free(buf);
+        goto cleanup;
+    }
+
+    /* Native tool-calling (phase 2a): register the tool set, then ask whether
+       THIS model's template supports tool calls. If so, the model emits its
+       own trained <tool_call> JSON and we parse it; otherwise we fall back to
+       the legacy <tool>-prose path. The system prompt is slimmed to match. */
+    int tool_n = 0;
+    const BasiToolDef *tool_defs = basi_tool_defs(&tool_n);
+    basi_set_tools(tool_defs, tool_n);
+    int native_tools = basi_tools_active(model);
+    printf("\033[90m[Tool mode: %s]\033[0m\n", native_tools ? "native (function-calling)" : "legacy (<tool> tags)");
+    fflush(stdout);
+    if (!native_tools) basi_set_tools(NULL, 0);   /* don't advertise tools the model can't format */
+
     /* The date is injected per-turn (see the REPL loop) so it stays fresh on
        long-lived / resumed sessions, not stamped once here. */
     char system_prompt[16384];
-    snprintf(system_prompt, sizeof(system_prompt), "%s", SYSTEM_PROMPT_FMT);
+    snprintf(system_prompt, sizeof(system_prompt), "%s",
+             native_tools ? SYSTEM_PROMPT_NATIVE : SYSTEM_PROMPT_FMT);
+    /* Environment + identity block: grounds the model in where it is running,
+     * what OS, whether this is a git repo, and which model it is — removing a
+     * whole class of wrong path/command/self-identity guesses. Cheap, static,
+     * built once at session start. */
+    {
+        char cwd[PATH_MAX];
+        if (!getcwd(cwd, sizeof(cwd))) snprintf(cwd, sizeof(cwd), "(unknown)");
+        struct utsname uts;
+        const char *osname = (uname(&uts) == 0) ? uts.sysname  : "unknown";
+        const char *osrel  = (uname(&uts) == 0) ? uts.release  : "";
+        const char *mname = "(local model)";
+        if (model_path && *model_path) {
+            const char *slash = strrchr(model_path, '/');
+            mname = slash ? slash + 1 : model_path;
+        }
+        size_t cur_len = strlen(system_prompt);
+        snprintf(system_prompt + cur_len, sizeof(system_prompt) - cur_len,
+            "\n\n<env>\n"
+            "You are powered by a locally-run model loaded from: %s\n"
+            "Working directory: %s\n"
+            "Platform: %s %s\n"
+            "Is a git repo: %s\n"
+            "</env>\n",
+            mname, cwd, osname, osrel,
+            access(".git", F_OK) == 0 ? "yes" : "no");
+    }
     {
         char *templates_idx = build_templates_index();
         size_t cur_len = strlen(system_prompt);
@@ -1072,7 +1382,7 @@ int main(int argc, char **argv) {
                     "                        copy a markdown file into ./.basi/knowledge/\n"
                     "\n"
                     "Tools the model can call: read, head, tail, grep, wc, bash,\n"
-                    "  apply_patch, scaffold, web_search, web_fetch, readfile, code_context,\n"
+                    "  edit, scaffold, web_search, web_fetch, readfile, code_context,\n"
                     "  docs_toc, docs_get, docs_search, docs_recent_notes,\n"
                     "  docs_vector_search,\n"
                     "  plan_write (drafting/premortem), assumptions (drafting),\n"
@@ -1115,17 +1425,15 @@ int main(int argc, char **argv) {
                            path, strerror(errno));
                 } else {
                     for (size_t i = 0; i < msg_count; i++) {
-                        fprintf(out, "{\"role\":\"%s\",\"content\":\"", messages[i].role);
-                        for (const char *c = messages[i].content; *c; c++) {
-                            if (*c == '"')       fputs("\\\"", out);
-                            else if (*c == '\\') fputs("\\\\", out);
-                            else if (*c == '\n') fputs("\\n", out);
-                            else if (*c == '\r') fputs("\\r", out);
-                            else if (*c == '\t') fputs("\\t", out);
-                            else if ((unsigned char)*c < 32) fprintf(out, "\\u%04x", (unsigned char)*c);
-                            else fputc(*c, out);
-                        }
-                        fputs("\"}\n", out);
+                        StringBuf line;
+                        sb_init(&line);
+                        sb_append_str(&line, "{\"role\":");
+                        json_escape_into(&line, messages[i].role);
+                        sb_append_str(&line, ",\"content\":");
+                        json_escape_into(&line, messages[i].content);
+                        sb_append_str(&line, "}\n");
+                        fwrite(line.data, 1, line.len, out);
+                        sb_free(&line);
                     }
                     fclose(out);
                     printf("\033[90m[Saved %zu messages to %s]\033[0m\n", msg_count, path);
@@ -1382,8 +1690,8 @@ int main(int argc, char **argv) {
                 if (!*arg) {
                     printf("\033[90m[Permission mode: %s]\033[0m\n", perm_mode_name(permission_mode));
                     printf("Modes:\n"
-                           "  default       prompt before bash, apply_patch, scaffold\n"
-                           "  accept-edits  auto-approve apply_patch + scaffold; bash still prompts\n"
+                           "  default       prompt before bash, edit, scaffold\n"
+                           "  accept-edits  auto-approve edit + scaffold; bash still prompts\n"
                            "  bypass        auto-approve everything\n"
                            "Use: /permissions <mode>\n");
                 } else if (strcmp(arg, "default") == 0) {
@@ -1472,21 +1780,55 @@ int main(int argc, char **argv) {
                    prompt_tps, gen_tps);
             fflush(stdout);
 
-            /* Check for tool call */
-            size_t tool_cmd_len;
-            const char *tool_cmd = extract_tool_call(result.text, &tool_cmd_len);
+            /* Detect a tool call: native function-calling if the model's
+               template supports it, else the legacy <tool> tag. Both resolve
+               to a command string that execute_tool() runs (reusing all
+               dispatch + plan-phase gating). */
+            char *cmd_str = NULL;          /* legacy <tool> path: command for execute_tool */
+            char *unknown_tool = NULL;     /* malloc'd name if a native call hit an unknown tool */
+            char *tool_result = NULL;      /* native path computes this directly */
+            bool have_call = false;
+            BasiToolCall *ncalls = NULL;
+            int n_ncalls = 0;
 
-            if (tool_cmd) {
-                /* Execute tool */
-                char *cmd_str = malloc(tool_cmd_len + 1);
-                memcpy(cmd_str, tool_cmd, tool_cmd_len);
-                cmd_str[tool_cmd_len] = '\0';
+            if (native_tools) {
+                n_ncalls = basi_parse_tool_calls(result.text, &ncalls);
+                if (n_ncalls > 0) {        /* one tool per turn for now (2a) */
+                    const char *nm = ncalls[0].name ? ncalls[0].name : "?";
+                    printf("\033[90m[Executing: %s]\033[0m\n", nm);
+                    fflush(stdout);
+                    /* Structured dispatch: parsed JSON args go straight to the
+                       handlers, never round-tripped through a shell string. */
+                    tool_result = execute_tool_native(ncalls[0].name, ncalls[0].arguments);
+                    if (!tool_result) unknown_tool = strdup(nm);
+                    have_call = true;
+                }
+            } else {
+                size_t tool_cmd_len;
+                const char *tc = extract_tool_call(result.text, &tool_cmd_len);
+                if (tc) {
+                    cmd_str = malloc(tool_cmd_len + 1);
+                    memcpy(cmd_str, tc, tool_cmd_len);
+                    cmd_str[tool_cmd_len] = '\0';
+                    have_call = true;
+                }
+            }
 
-                printf("\033[90m[Executing: %s]\033[0m\n", cmd_str);
-                fflush(stdout);
-
-                char *tool_result = execute_tool(cmd_str);
-                free(cmd_str);
+            if (have_call) {
+                if (cmd_str) {                 /* legacy path: build → execute */
+                    printf("\033[90m[Executing: %s]\033[0m\n", cmd_str);
+                    fflush(stdout);
+                    tool_result = execute_tool(cmd_str);
+                    free(cmd_str);
+                } else if (!tool_result) {     /* native path hit an unknown tool */
+                    tool_result = malloc(256);
+                    snprintf(tool_result, 256,
+                        "Error: unknown tool '%s' — it is not one of the available functions.", unknown_tool);
+                    printf("\033[90m[Unknown tool: %s]\033[0m\n", unknown_tool ? unknown_tool : "?");
+                    fflush(stdout);
+                }
+                free(unknown_tool);
+                if (ncalls) basi_free_tool_calls(ncalls, n_ncalls);
 
                 /* Truncate tool result if too large */
                 size_t tr_len = strlen(tool_result);
@@ -1497,30 +1839,45 @@ int main(int argc, char **argv) {
                            "\n\n[... content truncated ...]");
                 }
 
-                /* Add assistant response */
+                /* Add assistant turn — raw text, incl. the model's native
+                   <tool_call> markup; re-rendered verbatim next turn. */
                 ADD_MESSAGE("assistant", result.text);
                 free(result.text);
 
-                /* Add tool result with context budget info */
                 llama_memory_t mem = llama_get_memory(ctx);
                 int used = llama_memory_seq_pos_max(mem, 0) + 1;
                 int remaining = (int)llama_n_ctx(ctx) - used;
 
-                StringBuf tool_resp;
-                sb_init(&tool_resp);
-                sb_append_str(&tool_resp, "<tool_result>\n");
-                sb_append_str(&tool_resp, tool_result);
-                char budget[512];
-                snprintf(budget, sizeof(budget),
-                    "\n</tool_result>\n[Context: %d/%d tokens used, %d remaining. "
-                    "Original request: \"%.180s\". You MUST answer now if remaining < 8000.]",
-                    used, (int)llama_n_ctx(ctx), remaining, user_input);
-                sb_append_str(&tool_resp, budget);
-                ADD_MESSAGE("user", sb_to_str(&tool_resp));
-                sb_free(&tool_resp);
+                if (native_tools) {
+                    /* Feed back as a tool message → the template renders the
+                       model's native <tool_response>. */
+                    StringBuf tr;
+                    sb_init(&tr);
+                    sb_append_str(&tr, tool_result);
+                    char budget[256];
+                    snprintf(budget, sizeof(budget),
+                        "\n[Context: %d/%d tokens used, %d remaining. Answer now if remaining < 8000.]",
+                        used, (int)llama_n_ctx(ctx), remaining);
+                    sb_append_str(&tr, budget);
+                    ADD_MESSAGE("tool", sb_to_str(&tr));
+                    sb_free(&tr);
+                } else {
+                    StringBuf tool_resp;
+                    sb_init(&tool_resp);
+                    sb_append_str(&tool_resp, "<tool_result>\n");
+                    sb_append_str(&tool_resp, tool_result);
+                    char budget[512];
+                    snprintf(budget, sizeof(budget),
+                        "\n</tool_result>\n[Context: %d/%d tokens used, %d remaining. "
+                        "Original request: \"%.180s\". You MUST answer now if remaining < 8000.]",
+                        used, (int)llama_n_ctx(ctx), remaining, user_input);
+                    sb_append_str(&tool_resp, budget);
+                    ADD_MESSAGE("user", sb_to_str(&tool_resp));
+                    sb_free(&tool_resp);
+                }
                 free(tool_result);
 
-                /* Update template for next iteration */
+                /* Update template for next iteration (delta prompt) */
                 int next_len = apply_template(
                     model, messages, msg_count, true,
                     formatted_buf, sizeof(formatted_buf));
@@ -1537,6 +1894,7 @@ int main(int argc, char **argv) {
                 printf("\n");
                 fflush(stdout);
             } else {
+                if (ncalls) basi_free_tool_calls(ncalls, n_ncalls);
                 /* No tool call — done */
                 ADD_MESSAGE("assistant", result.text);
                 free(result.text);
@@ -1589,6 +1947,7 @@ cleanup:
     llama_free(ctx);
     llama_model_free(model);
 
-    printf("\nGoodbye!\n");
+    /* --no-tools keeps stdout to the completion alone; no sign-off banner. */
+    if (!no_tools) printf("\nGoodbye!\n");
     return 0;
 }

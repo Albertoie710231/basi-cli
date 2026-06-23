@@ -680,7 +680,7 @@ bool plan_tool_allowed(PlanPhase phase, const char *command) {
     plan_tool_name(command, tool, sizeof(tool));
 
     bool is_bash       = strcmp(tool, "bash") == 0;
-    bool is_patch      = strcmp(tool, "apply_patch") == 0;
+    bool is_patch      = strcmp(tool, "edit") == 0;
     bool is_scaffold   = strcmp(tool, "scaffold") == 0;
     bool is_planwrite  = strcmp(tool, "plan_write") == 0;
     bool is_web        = strcmp(tool, "web_search") == 0 || strcmp(tool, "web_fetch") == 0;
