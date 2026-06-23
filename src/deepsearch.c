@@ -431,10 +431,12 @@ char *execute_deep_search(struct llama_model *model,
         if (nmsg > 0 && strcmp(msgs[nmsg - 1].role, "user") == 0) {
             size_t ol = strlen(msgs[nmsg - 1].content);
             char *nc = malloc(ol + strlen(synth) + 1);
-            memcpy(nc, msgs[nmsg - 1].content, ol);
-            strcpy(nc + ol, synth);
-            free((void *)msgs[nmsg - 1].content);
-            msgs[nmsg - 1].content = nc;
+            if (nc) {   /* on OOM, skip the append and keep the original prompt */
+                memcpy(nc, msgs[nmsg - 1].content, ol);
+                strcpy(nc + ol, synth);
+                free((void *)msgs[nmsg - 1].content);
+                msgs[nmsg - 1].content = nc;
+            }
         } else {
             msgs_add(&msgs, &nmsg, &capmsg, "user",
                      strdup("[Research budget reached. Give your final, thorough, cited <answer> now.]"));

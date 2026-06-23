@@ -191,21 +191,10 @@ int kb_parse_frontmatter(const char *text, size_t len, KbFrontmatter *out) {
 /* ── Knowledge-base librarian toolkit (read-only) ──────────────────── */
 
 /* Read a whole file into a malloc'd buffer; returns NULL on error.
- * *out_len is filled (excludes the appended '\0'). Caller frees. */
+ * *out_len is filled (excludes the appended '\0'). Caller frees.
+ * Thin wrapper over the shared read_file_all() so there is one slurp. */
 char *kb_read_file(const char *path, size_t *out_len) {
-    FILE *f = fopen(path, "r");
-    if (!f) return NULL;
-    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return NULL; }
-    long sz = ftell(f);
-    if (sz < 0) { fclose(f); return NULL; }
-    fseek(f, 0, SEEK_SET);
-    char *buf = malloc((size_t)sz + 1);
-    if (!buf) { fclose(f); return NULL; }
-    size_t n = fread(buf, 1, (size_t)sz, f);
-    buf[n] = '\0';
-    fclose(f);
-    if (out_len) *out_len = n;
-    return buf;
+    return read_file_all(path, out_len);
 }
 
 /* Visit every .md file under `dir` recursively, calling `visit(path, ud)`.
@@ -404,7 +393,7 @@ char *execute_docs_get(const char *args) {
     char *buf = kb_read_file(full, &file_len);
     if (!buf) {
         char *msg = malloc(512);
-        snprintf(msg, 512, "docs_get not allowed: file not found at '%s'. Use docs_toc to list available paths.", path);
+        snprintf(msg, 512, "docs_get not allowed: file not found at '%.400s'. Use docs_toc to list available paths.", path);
         return msg;
     }
 
@@ -534,7 +523,7 @@ char *execute_docs_search(const char *args) {
     if (!result || !*result) {
         free(result);
         char *msg = malloc(256);
-        snprintf(msg, 256, "docs_search: no matches for '%s' in knowledge base.\n", query);
+        snprintf(msg, 256, "docs_search: no matches for '%.180s' in knowledge base.\n", query);
         return msg;
     }
 

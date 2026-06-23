@@ -3,6 +3,7 @@
 #include <string.h>
 #include <time.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <errno.h>
 
 #include "util.h"
@@ -26,7 +27,11 @@ void sb_ensure(StringBuf *sb, size_t extra) {
     if (need <= sb->cap) return;
     size_t newcap = sb->cap ? sb->cap * 2 : 256;
     while (newcap < need) newcap *= 2;
-    sb->data = realloc(sb->data, newcap);
+    /* Save into a temp so a failed realloc doesn't leak the original block
+     * (CERT MEM32-C / PVS V701); StringBuf is infrastructure, so abort. */
+    char *tmp = realloc(sb->data, newcap);
+    if (!tmp) { perror("realloc"); abort(); }
+    sb->data = tmp;
     sb->cap = newcap;
 }
 
@@ -84,7 +89,9 @@ ArgList tokenize_command(const char *cmd) {
         if (end > start) {
             if (al.count >= cap) {
                 cap = cap ? cap * 2 : 8;
-                al.args = realloc(al.args, cap * sizeof(char *));
+                char **tmp = realloc(al.args, cap * sizeof(char *));
+                if (!tmp) { perror("realloc"); abort(); }
+                al.args = tmp;
             }
             size_t len = end - start;
             al.args[al.count] = malloc(len + 1);
@@ -106,7 +113,8 @@ void arglist_free(ArgList *al) {
 
 /* ── Run a shell command and capture output ────────────────────────── */
 
-char *run_command(const char *cmd, size_t max_output) {
+char *run_command_status(const char *cmd, size_t max_output, int *exit_code) {
+    if (exit_code) *exit_code = -1;
     FILE *fp = popen(cmd, "r");
     if (!fp) return strdup("Error: failed to execute command");
 
@@ -118,9 +126,19 @@ char *run_command(const char *cmd, size_t max_output) {
         size_t take = n;
         if (sb.len + take > max_output) take = max_output - sb.len;
         if (take > 0) sb_append(&sb, buf, take);
-        if (sb.len >= max_output) break;
+        if (sb.len >= max_output) {
+            /* Drain the remainder so the child isn't blocked writing into a
+             * full pipe (which would make pclose hang). */
+            while (fread(buf, 1, sizeof(buf), fp) > 0) { /* discard */ }
+            break;
+        }
     }
-    pclose(fp);
+    int status = pclose(fp);
+    if (exit_code) {
+        if (WIFEXITED(status))        *exit_code = WEXITSTATUS(status);
+        else if (WIFSIGNALED(status)) *exit_code = -WTERMSIG(status);
+        else                          *exit_code = -1;
+    }
 
     if (sb.len == 0) {
         sb_free(&sb);
@@ -129,11 +147,37 @@ char *run_command(const char *cmd, size_t max_output) {
     return sb_to_str(&sb);
 }
 
+char *run_command(const char *cmd, size_t max_output) {
+    return run_command_status(cmd, max_output, NULL);
+}
+
+/* ── Read a whole file into a malloc'd, NUL-terminated buffer ───────── */
+/* Returns NULL on any error (open/seek/tell/alloc). Guards ftell() < 0 so a
+ * non-seekable / errored stream can't underflow the malloc size. Caller frees.
+ * *out_len (optional) gets the byte count, excluding the appended '\0'. */
+
+char *read_file_all(const char *path, size_t *out_len) {
+    FILE *f = fopen(path, "r");
+    if (!f) return NULL;
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return NULL; }
+    long sz = ftell(f);
+    if (sz < 0) { fclose(f); return NULL; }
+    fseek(f, 0, SEEK_SET);
+    char *buf = malloc((size_t)sz + 1);
+    if (!buf) { fclose(f); return NULL; }
+    size_t n = fread(buf, 1, (size_t)sz, f);
+    buf[n] = '\0';
+    fclose(f);
+    if (out_len) *out_len = n;
+    return buf;
+}
+
 /* ── Recursive mkdir ───────────────────────────────────────────────── */
 
 int mkdir_p(const char *path) {
     char tmp[1024];
-    snprintf(tmp, sizeof(tmp), "%s", path);
+    int k = snprintf(tmp, sizeof(tmp), "%s", path);
+    if (k < 0 || (size_t)k >= sizeof(tmp)) return -1;  /* refuse a truncated path */
     size_t len = strlen(tmp);
     if (len && tmp[len - 1] == '/') tmp[len - 1] = '\0';
     for (char *p = tmp + 1; *p; p++) {

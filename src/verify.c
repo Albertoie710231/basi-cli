@@ -141,42 +141,16 @@ static VerifyResult run_clause(const char *clause) {
     }
     sb_append_str(&wrapped, "' 2>&1");
 
-    FILE *fp = popen(sb_to_str(&wrapped), "r");
+    /* Shared popen→capped-read→drain→pclose loop; gives us the wait-status
+     * decoded exit code (127 = setup, negative = signal). */
+    int exit_code = -1;
+    char *out = run_command_status(sb_to_str(&wrapped), VERIFY_TAIL_BYTES, &exit_code);
     sb_free(&wrapped);
-    if (!fp) {
-        r.kind = VRES_SETUP;
-        r.exit_code = -1;
-        r.tail = strdup("popen failed");
-        return r;
-    }
-
-    StringBuf out;
-    sb_init(&out);
-    char buf[1024];
-    size_t n;
-    while ((n = fread(buf, 1, sizeof(buf), fp)) > 0) {
-        size_t take = n;
-        if (out.len + take > VERIFY_TAIL_BYTES) take = VERIFY_TAIL_BYTES - out.len;
-        if (take > 0) sb_append(&out, buf, take);
-        if (out.len >= VERIFY_TAIL_BYTES) {
-            /* drain remainder so the child can exit cleanly */
-            while (fread(buf, 1, sizeof(buf), fp) > 0) { /* discard */ }
-            break;
-        }
-    }
-    int status = pclose(fp);
-
-    if (WIFEXITED(status)) {
-        r.exit_code = WEXITSTATUS(status);
-    } else if (WIFSIGNALED(status)) {
-        r.exit_code = -WTERMSIG(status);
-    } else {
-        r.exit_code = -1;
-    }
+    r.exit_code = exit_code;
 
     /* Keep only the last VERIFY_TAIL_LINES lines. */
-    const char *p = out.data;
-    size_t total = out.len;
+    const char *p = out;
+    size_t total = strlen(out);
     if (total > 0) {
         int newlines = 0;
         size_t cut = total;
@@ -195,7 +169,7 @@ static VerifyResult run_clause(const char *clause) {
     } else {
         r.tail = strdup("");
     }
-    sb_free(&out);
+    free(out);
 
     if (r.exit_code == 0)        r.kind = VRES_OK;
     else if (r.exit_code == 127) r.kind = VRES_SETUP;
@@ -258,7 +232,7 @@ char *execute_plan_verify(const char *args) {
     char *file = kb_read_file(path, &flen);
     if (!file) {
         char *msg = malloc(512);
-        snprintf(msg, 512, "plan_verify failed: cannot read %s (%s).\n",
+        snprintf(msg, 512, "plan_verify failed: cannot read %.300s (%s).\n",
                  path, strerror(errno));
         return msg;
     }
