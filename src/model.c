@@ -88,6 +88,7 @@ typedef enum {
     STATE_MAYBE_OPEN,
     STATE_THINKING,
     STATE_MAYBE_CLOSE,
+    STATE_SUPPRESS,     /* inside a native tool call: kept in text, hidden from display */
 } ThinkingState;
 
 /* ── Generate response ─────────────────────────────────────────────── */
@@ -129,8 +130,44 @@ GenerateResult generate(
 
     /* Thinking state */
     ThinkingState state = STATE_NORMAL;
-    char tag_buf[16];
+    char tag_buf[64];
     size_t tag_len = 0;
+
+    /* Reasoning delimiters: use the ones common_chat derives from THIS model's
+       template, so Gemma's "<|channel>thought"/"<channel|>", Qwen's
+       "<think>"/"</think>", etc. are all hidden automatically — falling back to
+       <think>/</think> when the model declares none. Copied locally so the
+       pointers stay valid for the whole generation, and length-bounded so they
+       can never overflow tag_buf. */
+    const char *think_open = "<think>", *think_close = "</think>";
+    char think_open_buf[48], think_close_buf[48];
+    {
+        const char *o = NULL, *c = NULL;
+        if (basi_thinking_tags(&o, &c) && o && c &&
+            strlen(o) > 0 && strlen(o) < sizeof(think_open_buf) &&
+            strlen(c) > 0 && strlen(c) < sizeof(think_close_buf)) {
+            strcpy(think_open_buf, o);
+            strcpy(think_close_buf, c);
+            think_open  = think_open_buf;
+            think_close = think_close_buf;
+        }
+    }
+    const size_t think_open_len  = strlen(think_open);
+    const size_t think_close_len = strlen(think_close);
+
+    /* Openers the STATE_MAYBE_OPEN matcher recognizes: the reasoning tag (→ hide
+       as a thinking box) plus, in native tool mode, the tool-call markers (→
+       hide the raw JSON; the [Executing:] line is the clean indicator). The
+       tool-call markers are a display-only heuristic covering the families in
+       use — a miss just means the markup shows, never a parse/behaviour change. */
+    enum { OPEN_THINK = 1, OPEN_TOOLCALL = 2 };
+    struct { const char *s; size_t len; int act; } openers[3];
+    int n_openers = 0;
+    openers[n_openers].s = think_open; openers[n_openers].len = think_open_len; openers[n_openers].act = OPEN_THINK; n_openers++;
+    if (generate_native_tools) {
+        openers[n_openers].s = "<tool_call>";  openers[n_openers].len = 11; openers[n_openers].act = OPEN_TOOLCALL; n_openers++;
+        openers[n_openers].s = "<|tool_call>"; openers[n_openers].len = 12; openers[n_openers].act = OPEN_TOOLCALL; n_openers++;
+    }
     size_t spinner_frame = 0;
     double last_spinner = 0;
     bool thinking_box_shown = false;
@@ -238,23 +275,39 @@ GenerateResult generate(
 
             case STATE_MAYBE_OPEN: {
                 tag_buf[tag_len++] = ch;
-                const char *target = "<think>";
-                if (tag_len <= 7 && tag_buf[tag_len - 1] == target[tag_len - 1]) {
-                    if (tag_len == 7) {
-                        state = STATE_THINKING;
-                        tag_len = 0;
-                        piece_start = idx + 1;
-                        if (generate_keep_think) sb_append_str(&response, "<think>");
-                        if (show_thinking) {
-                            if (!generate_quiet) { printf("\033[90m[thinking] "); fflush(stdout); }
-                        } else {
-                            draw_thinking_box(spinner_frame);
-                            last_spinner = time_now();
-                        }
-                        thinking_box_shown = true;
+                /* Match the accumulating tag against every opener; an opener is
+                   "alive" while tag_buf is a prefix of it. */
+                int matched = 0;       /* action of a fully-matched opener */
+                bool alive = false;
+                for (int oi = 0; oi < n_openers; oi++) {
+                    if (tag_len <= openers[oi].len &&
+                        memcmp(tag_buf, openers[oi].s, tag_len) == 0) {
+                        alive = true;
+                        if (tag_len == openers[oi].len) { matched = openers[oi].act; break; }
                     }
-                } else {
-                    /* Not <think>, flush tag buffer */
+                }
+                if (matched == OPEN_THINK) {
+                    state = STATE_THINKING;
+                    tag_len = 0;
+                    piece_start = idx + 1;
+                    if (generate_keep_think) sb_append_str(&response, think_open);
+                    if (show_thinking) {
+                        if (!generate_quiet) { printf("\033[90m[thinking] "); fflush(stdout); }
+                    } else {
+                        draw_thinking_box(spinner_frame);
+                        last_spinner = time_now();
+                    }
+                    thinking_box_shown = true;
+                } else if (matched == OPEN_TOOLCALL) {
+                    /* Keep the markup in the returned text (the parser needs it)
+                       but stop displaying it — the [Executing:] line is shown
+                       after the call is parsed. */
+                    sb_append(&response, tag_buf, tag_len);
+                    state = STATE_SUPPRESS;
+                    tag_len = 0;
+                    piece_start = idx + 1;
+                } else if (!alive) {
+                    /* Matched no opener — flush the buffer as normal text. */
                     if (!generate_quiet) {
                         printf("\033[33m");
                         fwrite(tag_buf, 1, tag_len, stdout);
@@ -265,8 +318,16 @@ GenerateResult generate(
                     tag_len = 0;
                     piece_start = idx + 1;
                 }
+                /* else: still a viable prefix of some opener — keep buffering */
                 break;
             }
+
+            case STATE_SUPPRESS:
+                /* Native tool-call markup: retained in `response` for parsing,
+                   never displayed. Remains until the generation ends. */
+                sb_append_char(&response, ch);
+                piece_start = idx + 1;
+                break;
 
             case STATE_THINKING: {
                 if (ch == '<') {
@@ -293,13 +354,13 @@ GenerateResult generate(
 
             case STATE_MAYBE_CLOSE: {
                 tag_buf[tag_len++] = ch;
-                const char *target = "</think>";
-                if (tag_len <= 8 && tag_buf[tag_len - 1] == target[tag_len - 1]) {
-                    if (tag_len == 8) {
+                const char *target = think_close;
+                if (tag_len <= think_close_len && tag_buf[tag_len - 1] == target[tag_len - 1]) {
+                    if (tag_len == think_close_len) {
                         state = STATE_NORMAL;
                         tag_len = 0;
                         piece_start = idx + 1;
-                        if (generate_keep_think) sb_append_str(&response, "</think>");
+                        if (generate_keep_think) sb_append_str(&response, think_close);
                         if (show_thinking) {
                             if (!generate_quiet) printf("\033[0m\n");
                         } else {

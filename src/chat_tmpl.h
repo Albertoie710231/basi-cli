@@ -42,6 +42,14 @@ int  basi_tools_active(const struct llama_model *model);
 int  basi_parse_tool_calls(const char *text, BasiToolCall **out);
 void basi_free_tool_calls(BasiToolCall *calls, int n);
 
+/* The reasoning ("thinking") open/close delimiters this model's template
+   declares, as derived by common_chat (e.g. "<think>"/"</think>", or Gemma's
+   "<|channel>thought"/"<channel|>"). Returns 1 and points start and end at
+   interned strings when the model supports thinking with non-empty tags; else
+   0, and the caller keeps its own default. Pointers are valid until the next
+   render — copy them if you need to hold them. */
+int  basi_thinking_tags(const char **start, const char **end);
+
 /* Render `msgs` into a prompt using the MODEL'S OWN chat template, via
    llama.cpp's jinja engine (libllama-common). This is what makes BASI drive
    each model in its native format (Gemma, DeepSeek, custom merges, …) instead

@@ -4,6 +4,7 @@
 // rest of BASI is C; this is the one C++ translation unit, exposing extern "C".
 #include <cstdlib>
 #include <cstring>
+#include <cstdio>
 #include <chrono>
 #include <string>
 #include <vector>
@@ -11,6 +12,7 @@
 
 #include "llama.h"
 #include "chat.h"          // llama.cpp common/chat.h (common_chat_*)
+#include "nlohmann/json.hpp"
 #include "chat_tmpl.h"
 
 // Single model, single-threaded: cache the parsed templates, the pinned `now`
@@ -46,9 +48,38 @@ static common_chat_templates_inputs make_inputs(
     }
     in.messages.reserve(n_msgs);
     for (size_t i = 0; i < n_msgs; i++) {
+        const char *role    = msgs[i].role    ? msgs[i].role    : "";
+        const char *content = msgs[i].content ? msgs[i].content : "";
         common_chat_msg m;
-        m.role    = msgs[i].role    ? msgs[i].role    : "";
-        m.content = msgs[i].content ? msgs[i].content : "";
+        if (strcmp(role, "tool_call") == 0) {
+            /* content = {"name":..., "arguments":<json>} — rebuild a STRUCTURED
+               assistant tool call so common_chat renders it in this model's own
+               format (instead of replaying raw text the template can't pair). */
+            m.role = "assistant";
+            try {
+                auto j = nlohmann::ordered_json::parse(content);
+                common_chat_tool_call tc;
+                if (j.contains("name")) tc.name = j["name"].get<std::string>();
+                if (j.contains("arguments"))
+                    tc.arguments = j["arguments"].is_string()
+                        ? j["arguments"].get<std::string>()
+                        : j["arguments"].dump();
+                m.tool_calls.push_back(std::move(tc));
+            } catch (...) { m.content = content; }
+        } else if (strcmp(role, "tool_result") == 0) {
+            /* content = {"name":..., "content":...} — a PROPER tool message, so
+               the template emits its native tool-response slot. (A bare
+               role:"tool" content message is silently dropped by e.g. Gemma.) */
+            m.role = "tool";
+            try {
+                auto j = nlohmann::ordered_json::parse(content);
+                if (j.contains("name"))    m.tool_name = j["name"].get<std::string>();
+                if (j.contains("content")) m.content   = j["content"].get<std::string>();
+            } catch (...) { m.content = content; }
+        } else {
+            m.role    = role;
+            m.content = content;
+        }
         in.messages.push_back(std::move(m));
     }
     return in;
@@ -108,6 +139,15 @@ extern "C" int basi_parse_tool_calls(const char *text, BasiToolCall **out) {
     }
 }
 
+extern "C" int basi_thinking_tags(const char **start, const char **end) {
+    if (!g_have_params || !g_last_params.supports_thinking) return 0;
+    if (g_last_params.thinking_start_tag.empty() ||
+        g_last_params.thinking_end_tag.empty()) return 0;
+    if (start) *start = g_last_params.thinking_start_tag.c_str();
+    if (end)   *end   = g_last_params.thinking_end_tag.c_str();
+    return 1;
+}
+
 extern "C" void basi_free_tool_calls(BasiToolCall *calls, int n) {
     if (!calls) return;
     for (int i = 0; i < n; i++) {
@@ -127,6 +167,24 @@ extern "C" char *basi_render_chat(const struct llama_model *model,
         common_chat_params params = common_chat_templates_apply(g_tmpls.get(), in);
         g_last_params = params;     // cache for basi_parse_tool_calls (format/grammar)
         g_have_params = true;
+        if (getenv("BASI_DEBUG_THINK")) {
+            // Diagnostic: what reasoning format/tags does common_chat derive
+            // for THIS model's template? (One-shot, stderr, opt-in.)
+            static bool printed = false;
+            if (!printed) {
+                printed = true;
+                fprintf(stderr,
+                    "[think] format=%s supports_thinking=%d start=<<%s>> end=<<%s>>\n",
+                    common_chat_format_name(params.format),
+                    (int)params.supports_thinking,
+                    params.thinking_start_tag.c_str(),
+                    params.thinking_end_tag.c_str());
+            }
+        }
+        if (getenv("BASI_DEBUG_PROMPT")) {
+            fprintf(stderr, "\n===RENDERED PROMPT (%zu bytes)===\n%s\n===END===\n",
+                    params.prompt.size(), params.prompt.c_str());
+        }
         const std::string &p = params.prompt;
         char *out = static_cast<char *>(malloc(p.size() + 1));
         if (!out) return nullptr;

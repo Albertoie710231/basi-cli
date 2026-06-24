@@ -176,6 +176,7 @@ volatile sig_atomic_t generation_interrupted = 0;
 volatile sig_atomic_t show_thinking = 0;
 volatile sig_atomic_t generate_quiet = 0;
 volatile sig_atomic_t generate_keep_think = 0;
+volatile sig_atomic_t generate_native_tools = 0;
 
 static void sigint_handler(int sig) {
     (void)sig;
@@ -831,6 +832,31 @@ static char *execute_tool(const char *command) {
     return result;
 }
 
+/* ── Structured tool-turn envelopes ────────────────────────────────────
+ * In native mode the assistant's tool call and the tool result are stored as
+ * small JSON envelopes under the reserved roles "tool_call"/"tool_result";
+ * the chat_tmpl shim decodes them into STRUCTURED common_chat messages so each
+ * model's template renders the call/response pair in its own format. (Storing
+ * raw text + a bare role:"tool" works for Qwen but is dropped by Gemma.) */
+static char *tool_call_envelope(const char *name, const char *args_json) {
+    StringBuf e; sb_init(&e);
+    sb_append_str(&e, "{\"name\":");
+    json_escape_into(&e, name ? name : "");
+    sb_append_str(&e, ",\"arguments\":");
+    sb_append_str(&e, (args_json && *args_json) ? args_json : "{}");
+    sb_append_char(&e, '}');
+    return sb_to_str(&e);
+}
+static char *tool_result_envelope(const char *name, const char *content) {
+    StringBuf e; sb_init(&e);
+    sb_append_str(&e, "{\"name\":");
+    json_escape_into(&e, name ? name : "");
+    sb_append_str(&e, ",\"content\":");
+    json_escape_into(&e, content ? content : "");
+    sb_append_char(&e, '}');
+    return sb_to_str(&e);
+}
+
 /* ── Native function-call dispatch ─────────────────────────────────────
  * Take the model's already-parsed JSON args straight to the existing
  * handlers, bypassing basi_build_command + tokenize_command so a value that
@@ -946,60 +972,58 @@ static char *execute_tool_native(const char *name, const char *args_json) {
 
 
 
-/* ── Main ──────────────────────────────────────────────────────────── */
+/* ── CLI argument parsing ──────────────────────────────────────────── */
 
+typedef struct {
+    const char *model_path;
+    int         n_gpu_layers;
+    bool        ngl_set;            /* was -ngl passed explicitly? */
+    const char *deepsearch_q;       /* --deepsearch: run deep research and exit */
+    const char *prompt;             /* -p/--prompt: run one agent turn and exit */
+    bool        no_tools;           /* --no-tools: flat completion, no tool loop */
+    const char *system_override;    /* -s/--system: system prompt for --no-tools */
+    int         cli_ctx;            /* -c/--ctx: context size (0 = default) */
+    float       cli_temp;           /* -t/--temp: sampling temp (<0 = default) */
+    uint32_t    cli_seed;           /* --seed: RNG seed for sampling */
+    bool        want_exit;          /* -h/--help: caller should return exit_code */
+    int         exit_code;
+} Cli;
 
-int main(int argc, char **argv) {
-    /* `basi-cli docs ...` subcommand: handle and exit before model load. */
-    if (argc >= 2 && strcmp(argv[1], "docs") == 0) {
-        if (argc >= 3 && strcmp(argv[2], "add") == 0) {
-            return cmd_docs_add(argc, argv);
-        }
-        fprintf(stderr,
-            "Usage:\n"
-            "  basi-cli docs add <file.md> [--shelf=notes|pinned|docs]\n");
-        return 2;
-    }
-
-    const char *model_path = NULL;
-    int n_gpu_layers = 99;
-    const char *oneshot_deepsearch_q = NULL;  /* --deepsearch: run deep research and exit */
-    const char *oneshot_prompt = NULL;        /* -p/--prompt: run one agent turn and exit */
-    bool no_tools = false;                    /* --no-tools: flat completion, no tool loop */
-    const char *system_override = NULL;       /* -s/--system: system prompt for --no-tools */
-    bool ngl_set = false;                     /* was -ngl/--ngl passed explicitly? */
-    int  cli_ctx  = 0;                        /* -c/--ctx: context size (0 = default) */
-    float cli_temp = -1.0f;                   /* -t/--temp: sampling temp (<0 = default) */
-    uint32_t cli_seed = LLAMA_DEFAULT_SEED;   /* --seed: RNG seed for sampling */
-
+static Cli parse_args(int argc, char **argv) {
+    Cli c = {
+        .model_path = NULL, .n_gpu_layers = 99, .ngl_set = false,
+        .deepsearch_q = NULL, .prompt = NULL, .no_tools = false,
+        .system_override = NULL, .cli_ctx = 0, .cli_temp = -1.0f,
+        .cli_seed = LLAMA_DEFAULT_SEED, .want_exit = false, .exit_code = 0,
+    };
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-m") == 0 && i + 1 < argc) {
-            model_path = argv[++i];
+            c.model_path = argv[++i];
         } else if ((strcmp(argv[i], "-ngl") == 0 || strcmp(argv[i], "--ngl") == 0)
                    && i + 1 < argc) {
-            n_gpu_layers = atoi(argv[++i]);  /* 0 = CPU only */
-            ngl_set = true;
+            c.n_gpu_layers = atoi(argv[++i]);  /* 0 = CPU only */
+            c.ngl_set = true;
         } else if ((strcmp(argv[i], "-c") == 0 || strcmp(argv[i], "--ctx") == 0)
                    && i + 1 < argc) {
-            cli_ctx = atoi(argv[++i]);
+            c.cli_ctx = atoi(argv[++i]);
         } else if ((strcmp(argv[i], "-t") == 0 || strcmp(argv[i], "--temp") == 0)
                    && i + 1 < argc) {
-            cli_temp = (float)atof(argv[++i]);
+            c.cli_temp = (float)atof(argv[++i]);
         } else if (strcmp(argv[i], "--seed") == 0 && i + 1 < argc) {
-            cli_seed = (uint32_t)strtoul(argv[++i], NULL, 10);
+            c.cli_seed = (uint32_t)strtoul(argv[++i], NULL, 10);
         } else if (strcmp(argv[i], "-d") == 0 || strcmp(argv[i], "--debug") == 0) {
             debug_mode = true;
         } else if ((strcmp(argv[i], "--deepsearch") == 0 || strcmp(argv[i], "-ds") == 0)
                    && i + 1 < argc) {
-            oneshot_deepsearch_q = argv[++i];
+            c.deepsearch_q = argv[++i];
         } else if ((strcmp(argv[i], "-p") == 0 || strcmp(argv[i], "--prompt") == 0
                     || strcmp(argv[i], "--print") == 0) && i + 1 < argc) {
-            oneshot_prompt = argv[++i];
+            c.prompt = argv[++i];
         } else if (strcmp(argv[i], "--no-tools") == 0) {
-            no_tools = true;
+            c.no_tools = true;
         } else if ((strcmp(argv[i], "-s") == 0 || strcmp(argv[i], "--system") == 0)
                    && i + 1 < argc) {
-            system_override = argv[++i];
+            c.system_override = argv[++i];
         } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             printf("BASI-CLI - AI Chat Interface\n\n"
                    "Usage:\n"
@@ -1027,9 +1051,771 @@ int main(int argc, char **argv) {
                    "  BASI_DEEPSEARCH_ROUNDS Max deep-research rounds (default 5)\n"
                    "  BASI_DEEPSEARCH_CTX    Deep-research context size (default 32768; lower for\n"
                    "                         interactive /deepsearch on a single GPU)\n\n");
-            return 0;
+            c.want_exit = true;
+            c.exit_code = 0;
+            return c;
         }
     }
+    return c;
+}
+
+/* ── System prompt assembly ────────────────────────────────────────── */
+/* Fill `buf` (size `sz`) with the base prompt plus a static <env> identity
+ * block, the scaffold template index, and (if present) a bounded slice of
+ * ./BASI.md project memory. */
+static void build_system_prompt(char *buf, size_t sz, bool native_tools,
+                                const char *model_path) {
+    snprintf(buf, sz, "%s",
+             native_tools ? SYSTEM_PROMPT_NATIVE : SYSTEM_PROMPT_FMT);
+    /* Environment + identity block: grounds the model in where it is running,
+     * what OS, whether this is a git repo, and which model it is — removing a
+     * whole class of wrong path/command/self-identity guesses. Cheap, static,
+     * built once at session start. */
+    {
+        char cwd[PATH_MAX];
+        if (!getcwd(cwd, sizeof(cwd))) snprintf(cwd, sizeof(cwd), "(unknown)");
+        struct utsname uts;
+        const char *osname = (uname(&uts) == 0) ? uts.sysname  : "unknown";
+        const char *osrel  = (uname(&uts) == 0) ? uts.release  : "";
+        const char *mname = "(local model)";
+        if (model_path && *model_path) {
+            const char *slash = strrchr(model_path, '/');
+            mname = slash ? slash + 1 : model_path;
+        }
+        size_t cur_len = strlen(buf);
+        snprintf(buf + cur_len, sz - cur_len,
+            "\n\n<env>\n"
+            "You are powered by a locally-run model loaded from: %s\n"
+            "Working directory: %s\n"
+            "Platform: %s %s\n"
+            "Is a git repo: %s\n"
+            "</env>\n",
+            mname, cwd, osname, osrel,
+            access(".git", F_OK) == 0 ? "yes" : "no");
+    }
+    {
+        char *templates_idx = build_templates_index();
+        size_t cur_len = strlen(buf);
+        snprintf(buf + cur_len, sz - cur_len,
+            "\n\nAVAILABLE TEMPLATES (use the scaffold tool):\n%s", templates_idx);
+        free(templates_idx);
+    }
+    /* Project memory: append ./BASI.md if present. Context for the model,
+     * not enforcement — tools and rules above take precedence. */
+    {
+        FILE *bf = fopen("BASI.md", "r");
+        if (bf) {
+            fseek(bf, 0, SEEK_END);
+            long fsize = ftell(bf);
+            fseek(bf, 0, SEEK_SET);
+            if (fsize > 0) {
+                size_t cur_len = strlen(buf);
+                size_t avail = sz - cur_len - 1;
+                const char *header =
+                    "\n\nPROJECT MEMORY (from ./BASI.md — facts and conventions for this codebase; tools and rules above take precedence):\n";
+                size_t hlen = strlen(header);
+                if (avail > hlen + 200) {
+                    memcpy(buf + cur_len, header, hlen);
+                    cur_len += hlen;
+                    avail -= hlen;
+                    size_t cap = 4000;  /* ~1000 tokens; small models tune out beyond this */
+                    size_t to_read = (size_t)fsize < cap ? (size_t)fsize : cap;
+                    if (to_read > avail - 1) to_read = avail - 1;
+                    size_t nread = fread(buf + cur_len, 1, to_read, bf);
+                    buf[cur_len + nread] = '\0';
+                    printf("\033[90m[Loaded ./BASI.md (%zu bytes%s)]\033[0m\n",
+                           nread, (size_t)fsize > nread ? ", truncated" : "");
+                    fflush(stdout);
+                }
+            }
+            fclose(bf);
+        }
+    }
+}
+
+/* ── Conversation message append ───────────────────────────────────── */
+/* Grow the message array as needed, store the (literal) role + a strdup'd copy
+ * of the content, and mirror non-system turns into the session file. Backs the
+ * ADD_MESSAGE macro in main() and is called directly by the extracted REPL
+ * helpers (which hold the state by pointer). */
+static void repl_add_message(struct llama_chat_message **messages,
+                             size_t *msg_count, size_t *msg_cap,
+                             FILE *session_fp,
+                             const char *role, const char *content) {
+    if (*msg_count >= *msg_cap) {
+        *msg_cap = *msg_cap ? *msg_cap * 2 : 16;
+        *messages = realloc(*messages, *msg_cap * sizeof(struct llama_chat_message));
+    }
+    (*messages)[*msg_count].role    = role;
+    (*messages)[*msg_count].content = strdup(content);
+    if (session_fp && strcmp(role, "system") != 0)
+        session_write_record(session_fp, role, content);
+    (*msg_count)++;
+}
+
+/* ── Main ──────────────────────────────────────────────────────────── */
+
+
+/* ── Slash-command dispatch (interactive REPL) ───── */
+/* Handles any input beginning with '/'. Takes ownership of user_input and
+ * frees it. State the commands mutate is passed by pointer; the macro
+ * aliases keep the moved body verbatim. */
+static void handle_slash_command(char *user_input,
+        struct llama_model *model, const struct llama_vocab *vocab,
+        struct llama_context *ctx,
+        struct llama_chat_message **messages_p, size_t *msg_count_p,
+        size_t *msg_cap_p, FILE *session_fp, size_t *prev_len_p,
+        size_t session_prompt_tokens, size_t session_gen_tokens) {
+    #define messages  (*messages_p)
+    #define msg_count (*msg_count_p)
+    #define prev_len  (*prev_len_p)
+    #define ADD_MESSAGE(role_str, content_str) \
+        repl_add_message(messages_p, msg_count_p, msg_cap_p, session_fp, (role_str), (content_str))
+
+            if (strcmp(user_input, "/help") == 0) {
+                printf(
+                    "\nSlash commands:\n"
+                    "  /help                 this help\n"
+                    "  /clear                drop conversation history (system prompt + project memory kept)\n"
+                    "  /cost                 show session token usage\n"
+                    "  /save [path]          export transcript as JSONL\n"
+                    "  /memory               open ./BASI.md in $EDITOR\n"
+                    "  /note <text>          append a one-line note to the project knowledge base\n"
+                    "  /edit <path>          open a knowledge-base file in $EDITOR (path under .basi/knowledge/)\n"
+                    "  /permissions [mode]   show or set permission mode (default | accept-edits | bypass)\n"
+                    "  /plan [<slug>|accept|off]\n"
+                    "                        no args: show phase. <slug>: enter drafting. accept: drafting/premortem -> active. off: exit.\n"
+                    "  /premortem            (drafting only) enter premortem — model rewrites the plan with a ## Pre-mortem section\n"
+                    "  /deepsearch <question>\n"
+                    "                        multi-round deep research (web + knowledge base), synthesized + cited\n"
+                    "  /model                switch model (requires restart)\n"
+                    "\n"
+                    "Subcommands (run before model load):\n"
+                    "  basi-cli docs add <file.md> [--shelf=notes|pinned|docs]\n"
+                    "                        copy a markdown file into ./.basi/knowledge/\n"
+                    "\n"
+                    "Tools the model can call: read, head, tail, grep, wc, bash,\n"
+                    "  edit, scaffold, web_search, web_fetch, readfile, code_context,\n"
+                    "  docs_toc, docs_get, docs_search, docs_recent_notes,\n"
+                    "  docs_vector_search,\n"
+                    "  plan_write (drafting/premortem), assumptions (drafting),\n"
+                    "  spike_write (spike), plan_verify (active).\n\n");
+                fflush(stdout);
+                free(user_input);
+                return;
+            }
+            if (strcmp(user_input, "/clear") == 0) {
+                for (size_t i = 1; i < msg_count; i++) free((void*)messages[i].content);
+                msg_count = 1;
+                llama_memory_clear(llama_get_memory(ctx), true);
+                prev_len = 0;
+                printf("\033[90m[Cleared conversation history (system prompt kept)]\033[0m\n");
+                fflush(stdout);
+                free(user_input);
+                return;
+            }
+            if (strcmp(user_input, "/cost") == 0) {
+                printf("\033[90m[Session: %zu prompt tokens, %zu generated tokens, %zu total]\033[0m\n",
+                       session_prompt_tokens, session_gen_tokens,
+                       session_prompt_tokens + session_gen_tokens);
+                fflush(stdout);
+                free(user_input);
+                return;
+            }
+            if (strncmp(user_input, "/save", 5) == 0 &&
+                (user_input[5] == '\0' || user_input[5] == ' ')) {
+                const char *path = user_input + 5;
+                while (*path == ' ') path++;
+                char default_path[256];
+                if (!*path) {
+                    snprintf(default_path, sizeof(default_path),
+                             "basi-transcript-%ld.jsonl", (long)time(NULL));
+                    path = default_path;
+                }
+                FILE *out = fopen(path, "w");
+                if (!out) {
+                    printf("\033[31mError: cannot write '%s' (%s)\033[0m\n",
+                           path, strerror(errno));
+                } else {
+                    for (size_t i = 0; i < msg_count; i++) {
+                        StringBuf line;
+                        sb_init(&line);
+                        sb_append_str(&line, "{\"role\":");
+                        json_escape_into(&line, messages[i].role);
+                        sb_append_str(&line, ",\"content\":");
+                        json_escape_into(&line, messages[i].content);
+                        sb_append_str(&line, "}\n");
+                        fwrite(line.data, 1, line.len, out);
+                        sb_free(&line);
+                    }
+                    fclose(out);
+                    printf("\033[90m[Saved %zu messages to %s]\033[0m\n", msg_count, path);
+                }
+                fflush(stdout);
+                free(user_input);
+                return;
+            }
+            if (strcmp(user_input, "/memory") == 0) {
+                const char *editor = getenv("EDITOR");
+                if (!editor || !*editor) editor = "vi";
+                char cmd[256];
+                snprintf(cmd, sizeof(cmd), "%s BASI.md", editor);
+                bool was_raw = raw_mode_enabled;
+                if (was_raw) disable_raw_mode();
+                int rc = system(cmd);
+                if (was_raw) enable_raw_mode();
+                if (rc != 0) printf("\033[31m[Editor exited with status %d]\033[0m\n", rc);
+                printf("\033[90m[BASI.md edited. Changes apply on next BASI restart.]\033[0m\n");
+                fflush(stdout);
+                free(user_input);
+                return;
+            }
+            if (strncmp(user_input, "/note", 5) == 0 &&
+                (user_input[5] == '\0' || user_input[5] == ' ')) {
+                const char *text = user_input + 5;
+                while (*text == ' ') text++;
+                if (!*text) {
+                    printf("\033[31m[/note: missing text — usage: /note <one-line note>]\033[0m\n");
+                    fflush(stdout);
+                    free(user_input);
+                    return;
+                }
+                if (kb_ensure_dirs() != 0) {
+                    printf("\033[31m[/note: cannot create .basi/knowledge/ tree (%s)]\033[0m\n",
+                           strerror(errno));
+                    fflush(stdout);
+                    free(user_input);
+                    return;
+                }
+                time_t now = time(NULL);
+                struct tm tm_now;
+                localtime_r(&now, &tm_now);
+                char date[16], hhmm[8];
+                strftime(date, sizeof(date), "%Y-%m-%d", &tm_now);
+                strftime(hhmm, sizeof(hhmm), "%H:%M", &tm_now);
+                char notepath[512];
+                snprintf(notepath, sizeof(notepath), "%s/session-%s.md", KB_NOTES_DIR, date);
+                struct stat st;
+                bool fresh = (stat(notepath, &st) != 0);
+                FILE *nf = fopen(notepath, "a");
+                if (!nf) {
+                    printf("\033[31m[/note: cannot write %s (%s)]\033[0m\n",
+                           notepath, strerror(errno));
+                    fflush(stdout);
+                    free(user_input);
+                    return;
+                }
+                if (fresh) {
+                    fprintf(nf,
+                        "---\nshelf: notes\ntitle: Session notes %s\nfetched: %s\n---\n\n",
+                        date, date);
+                }
+                fprintf(nf, "- %s %s\n", hhmm, text);
+                fclose(nf);
+                printf("\033[90m[note saved to %s]\033[0m\n", notepath);
+                fflush(stdout);
+                free(user_input);
+                return;
+            }
+            if (strncmp(user_input, "/edit", 5) == 0 &&
+                (user_input[5] == '\0' || user_input[5] == ' ')) {
+                const char *arg = user_input + 5;
+                while (*arg == ' ') arg++;
+                if (!*arg) {
+                    printf("\033[31m[/edit: missing path — usage: /edit <path-under-.basi/knowledge/>]\033[0m\n");
+                    fflush(stdout);
+                    free(user_input);
+                    return;
+                }
+                if (strstr(arg, "..") != NULL || arg[0] == '/') {
+                    printf("\033[31m[/edit not allowed: path must be relative under .basi/knowledge/ and may not contain '..']\033[0m\n");
+                    fflush(stdout);
+                    free(user_input);
+                    return;
+                }
+                const char *editor = getenv("EDITOR");
+                if (!editor || !*editor) {
+                    printf("\033[31m[/edit not allowed: $EDITOR is not set]\033[0m\n");
+                    fflush(stdout);
+                    free(user_input);
+                    return;
+                }
+                char fullpath[1280];
+                snprintf(fullpath, sizeof(fullpath), "%s/%s", KB_KNOW_DIR, arg);
+                struct stat est;
+                if (stat(fullpath, &est) != 0) {
+                    printf("\033[31m[/edit not allowed: file not found: %s]\033[0m\n", fullpath);
+                    fflush(stdout);
+                    free(user_input);
+                    return;
+                }
+                char cmdbuf[1536];
+                snprintf(cmdbuf, sizeof(cmdbuf), "%s %s", editor, fullpath);
+                bool was_raw = raw_mode_enabled;
+                if (was_raw) disable_raw_mode();
+                int rc = system(cmdbuf);
+                if (was_raw) enable_raw_mode();
+                if (rc != 0) printf("\033[31m[Editor exited with status %d]\033[0m\n", rc);
+                else printf("\033[90m[%s edited]\033[0m\n", fullpath);
+                fflush(stdout);
+                free(user_input);
+                return;
+            }
+            if (strcmp(user_input, "/model") == 0) {
+                printf("\033[90m[Model switching is not yet implemented — exit (Ctrl-D) and restart BASI to pick a different model.]\033[0m\n");
+                fflush(stdout);
+                free(user_input);
+                return;
+            }
+            if (strncmp(user_input, "/deepsearch", 11) == 0 &&
+                (user_input[11] == '\0' || user_input[11] == ' ')) {
+                const char *q = user_input + 11;
+                while (*q == ' ') q++;
+                if (!*q) {
+                    printf("\033[31m[/deepsearch: needs a question. Usage: /deepsearch <your research question>]\033[0m\n");
+                    fflush(stdout);
+                    free(user_input);
+                    return;
+                }
+                char *q_copy = strdup(q);
+                char *answer = execute_deep_search(model, vocab, q_copy);
+                printf("\n%s\n\n", answer ? answer : "(no answer)");
+                fflush(stdout);
+                /* Record the exchange so follow-up turns have context. The
+                 * research ran in its own context, so the main KV cache is
+                 * untouched and out of sync with these new messages — clear it
+                 * (like /clear) so the next turn cleanly re-decodes everything. */
+                ADD_MESSAGE("user", q_copy);
+                ADD_MESSAGE("assistant", answer ? answer : "(no answer)");
+                llama_memory_clear(llama_get_memory(ctx), true);
+                prev_len = 0;
+                free(q_copy);
+                free(answer);
+                free(user_input);
+                return;
+            }
+            if (strncmp(user_input, "/plan", 5) == 0 &&
+                (user_input[5] == '\0' || user_input[5] == ' ')) {
+                const char *arg = user_input + 5;
+                while (*arg == ' ') arg++;
+                /* Reject anything past the first token. */
+                const char *tail = arg;
+                while (*tail && *tail != ' ' && *tail != '\t') tail++;
+                const char *rest = tail;
+                while (*rest == ' ' || *rest == '\t') rest++;
+                if (*rest) {
+                    printf("\033[31m[/plan: unexpected extra argument. Use /plan, /plan <slug>, /plan accept, or /plan off]\033[0m\n");
+                    fflush(stdout);
+                    free(user_input);
+                    return;
+                }
+
+                if (!*arg) {
+                    if (plan_phase == PHASE_NONE) {
+                        printf("\033[90m[Plan phase: none. Enter drafting with /plan <slug>.]\033[0m\n");
+                    } else {
+                        printf("\033[36m[Plan phase: %s — slug '%s']\033[0m\n",
+                               plan_phase_name(plan_phase),
+                               current_plan_slug ? current_plan_slug : "(unset)");
+                    }
+                } else if (strcmp(arg, "off") == 0) {
+                    if (plan_phase == PHASE_NONE) {
+                        printf("\033[90m[Plan phase already off]\033[0m\n");
+                    } else {
+                        plan_phase = PHASE_NONE;
+                        free(current_plan_slug);
+                        current_plan_slug = NULL;
+                        spike_cycles = 0;
+                        spike_calls  = 0;
+                        printf("\033[90m[Plan phase: off]\033[0m\n");
+                    }
+                } else if (strcmp(arg, "accept") == 0) {
+                    if (plan_phase == PHASE_DRAFTING || plan_phase == PHASE_PREMORTEM) {
+                        plan_phase = PHASE_ACTIVE;
+                        if (current_plan_slug) {
+                            int src = rewrite_plan_status(current_plan_slug, "active");
+                            if (src == -2) {
+                                printf("\033[33m[Plan file has no status: line; runtime phase=active but file untouched.]\033[0m\n");
+                            } else if (src == -1) {
+                                printf("\033[33m[Plan file not yet written; runtime phase=active. Status will be set on the next plan_write.]\033[0m\n");
+                            }
+                        }
+                        printf("\033[36m[Plan accepted: '%s' — phase=active. Tools unblocked.]\033[0m\n",
+                               current_plan_slug ? current_plan_slug : "(unset)");
+                    } else {
+                        printf("\033[31m[/plan accept: only valid from drafting or premortem (current: %s)]\033[0m\n",
+                               plan_phase_name(plan_phase));
+                    }
+                } else {
+                    /* Treat as slug → enter drafting. */
+                    if (plan_phase != PHASE_NONE) {
+                        printf("\033[31m[/plan %s: already in %s phase for '%s'. Use /plan off to exit first.]\033[0m\n",
+                               arg, plan_phase_name(plan_phase),
+                               current_plan_slug ? current_plan_slug : "(unset)");
+                    } else if (!kb_slug_valid(arg)) {
+                        printf("\033[31m[/plan %s: invalid slug. Use lowercase a-z, 0-9, single hyphens; must start with a letter; max 64 chars.]\033[0m\n",
+                               arg);
+                    } else {
+                        plan_phase = PHASE_DRAFTING;
+                        free(current_plan_slug);
+                        current_plan_slug = strdup(arg);
+                        spike_cycles = 0;
+                        spike_calls  = 0;
+                        printf("\033[36m[Plan phase: drafting — slug '%s'. Research first, then save with plan_write. /plan accept when ready.]\033[0m\n",
+                               current_plan_slug);
+                    }
+                }
+                fflush(stdout);
+                free(user_input);
+                return;
+            }
+            if (strcmp(user_input, "/premortem") == 0) {
+                if (plan_phase != PHASE_DRAFTING) {
+                    printf("\033[31m[/premortem: only valid from drafting phase (current: %s)]\033[0m\n",
+                           plan_phase_name(plan_phase));
+                } else if (!current_plan_slug) {
+                    printf("\033[31m[/premortem: no current plan slug — internal state error]\033[0m\n");
+                } else {
+                    char path[1024];
+                    snprintf(path, sizeof(path), "%s/%s.md", KB_PLANS_DIR, current_plan_slug);
+                    struct stat st;
+                    if (stat(path, &st) != 0) {
+                        printf("\033[31m[/premortem: no plan file at %s — model hasn't called plan_write yet. Have it draft the plan first.]\033[0m\n",
+                               path);
+                    } else {
+                        plan_phase = PHASE_PREMORTEM;
+                        int src = rewrite_plan_status(current_plan_slug, "premortem");
+                        if (src == -2) {
+                            printf("\033[33m[Plan file has no status: line; runtime phase=premortem but file untouched.]\033[0m\n");
+                        }
+                        printf("\033[36m[Pre-mortem phase entered for '%s'. On your next message the model will run Klein's protocol — \"imagine the plan failed; explain why\" — and rewrite %s with a ## Pre-mortem section. Use /plan accept when satisfied, or /plan off to abort.]\033[0m\n",
+                               current_plan_slug, path);
+                    }
+                }
+                fflush(stdout);
+                free(user_input);
+                return;
+            }
+            if (strncmp(user_input, "/permissions", 12) == 0 &&
+                (user_input[12] == '\0' || user_input[12] == ' ')) {
+                const char *arg = user_input + 12;
+                while (*arg == ' ') arg++;
+                if (!*arg) {
+                    printf("\033[90m[Permission mode: %s]\033[0m\n", perm_mode_name(permission_mode));
+                    printf("Modes:\n"
+                           "  default       prompt before bash, edit, scaffold\n"
+                           "  accept-edits  auto-approve edit + scaffold; bash still prompts\n"
+                           "  bypass        auto-approve everything\n"
+                           "Use: /permissions <mode>\n");
+                } else if (strcmp(arg, "default") == 0) {
+                    permission_mode = PERM_DEFAULT;
+                    printf("\033[90m[Permission mode: default]\033[0m\n");
+                } else if (strcmp(arg, "accept-edits") == 0) {
+                    permission_mode = PERM_ACCEPT_EDITS;
+                    printf("\033[90m[Permission mode: accept-edits]\033[0m\n");
+                } else if (strcmp(arg, "bypass") == 0) {
+                    permission_mode = PERM_BYPASS;
+                    printf("\033[33m[Permission mode: bypass — all tool calls auto-approved]\033[0m\n");
+                } else {
+                    printf("\033[31m[Unknown mode '%s'. Try: default, accept-edits, bypass]\033[0m\n", arg);
+                }
+                fflush(stdout);
+                free(user_input);
+                return;
+            }
+            printf("\033[33m[Unknown command '%s'. Type /help for the list.]\033[0m\n", user_input);
+            fflush(stdout);
+            free(user_input);
+            return;
+            #undef messages
+    #undef msg_count
+    #undef prev_len
+    #undef ADD_MESSAGE
+}
+
+/* ── One agentic turn (generate → tool loop → answer) ───── */
+/* Runs a single user turn: render the prompt, generate, dispatch any tool
+ * call and feed the result back (up to max_tool_iterations), then a final
+ * answer. State that outlives the turn is passed by pointer; user_input is
+ * borrowed (the caller frees it). */
+static void run_agentic_turn(char *user_input,
+        struct llama_model *model, const struct llama_vocab *vocab,
+        struct llama_context *ctx, struct llama_sampler *smpl,
+        bool native_tools, char *formatted_buf,
+        struct llama_chat_message **messages_p, size_t *msg_count_p,
+        size_t *msg_cap_p, FILE *session_fp, size_t *prev_len_p,
+        size_t *session_prompt_tokens_p, size_t *session_gen_tokens_p) {
+    #define messages  (*messages_p)
+    #define msg_count (*msg_count_p)
+    #define prev_len  (*prev_len_p)
+    #define session_prompt_tokens (*session_prompt_tokens_p)
+    #define session_gen_tokens    (*session_gen_tokens_p)
+    #define ADD_MESSAGE(role_str, content_str) \
+        repl_add_message(messages_p, msg_count_p, msg_cap_p, session_fp, (role_str), (content_str))
+        /* Recompute the date every turn and ride it in with the user message.
+           The system prompt is decoded once and cached, so only tokens added now
+           reach the model — this keeps "today" correct on sessions left open for
+           days or resumed weeks later. */
+        char today[16];
+        {
+            time_t now = time(NULL);
+            struct tm *t = localtime(&now);
+            strftime(today, sizeof(today), "%Y-%m-%d", t);
+        }
+
+        const char *banner = plan_phase_banner(plan_phase);
+        {
+            size_t blen = strlen(user_input) + (banner ? strlen(banner) : 0) + 64;
+            char *msg = malloc(blen);
+            if (banner)
+                snprintf(msg, blen, "[Today's date: %s]\n%s\n\n%s", today, banner, user_input);
+            else
+                snprintf(msg, blen, "[Today's date: %s]\n%s", today, user_input);
+            ADD_MESSAGE("user", msg);
+            free(msg);
+        }
+        /* keep user_input alive across tool iterations so the context reminder
+         * can echo the original request back to the model — small models drift
+         * after several tool rounds otherwise. Freed at end of turn. */
+
+        /* Apply chat template — renders the model's native format via the jinja
+           engine (chat_tmpl shim), with ChatML fallback. */
+        int new_len = apply_template(
+            model, messages, msg_count, true,
+            formatted_buf, FORMATTED_BUF_SZ);
+
+        if (new_len < 0) {
+            printf("Error: Failed to apply chat template\n");
+            fflush(stdout);
+            return;
+        }
+
+        char *prompt = formatted_buf + prev_len;
+        size_t prompt_len = (size_t)new_len - prev_len;
+
+        /* Tool execution loop */
+        int tool_iterations = 0;
+        const int max_tool_iterations = 5;
+
+        while (tool_iterations < max_tool_iterations) {
+            tool_iterations++;
+
+            generation_interrupted = 0;
+            setup_sigint_handler();
+            GenerateResult result = generate(ctx, vocab, smpl, prompt, prompt_len);
+            reset_sigint_handler();
+            session_prompt_tokens += result.prompt_tokens;
+            session_gen_tokens    += result.gen_tokens;
+
+            /* Performance metrics */
+            double prompt_tps = result.prompt_time_s > 0
+                ? result.prompt_tokens / result.prompt_time_s : 0;
+            double gen_tps = result.gen_time_s > 0
+                ? result.gen_tokens / result.gen_time_s : 0;
+            printf("\033[90m[ Prompt: %.1f t/s | Generation: %.1f t/s ]\033[0m\n",
+                   prompt_tps, gen_tps);
+            fflush(stdout);
+
+            /* Detect a tool call: native function-calling if the model's
+               template supports it, else the legacy <tool> tag. Both resolve
+               to a command string that execute_tool() runs (reusing all
+               dispatch + plan-phase gating). */
+            char *cmd_str = NULL;          /* legacy <tool> path: command for execute_tool */
+            char *unknown_tool = NULL;     /* malloc'd name if a native call hit an unknown tool */
+            char *tool_result = NULL;      /* native path computes this directly */
+            char *call_env = NULL;         /* native: structured assistant tool-call envelope */
+            char *call_name = NULL;        /* native: tool name, for the result envelope */
+            bool have_call = false;
+            BasiToolCall *ncalls = NULL;
+            int n_ncalls = 0;
+
+            if (native_tools) {
+                n_ncalls = basi_parse_tool_calls(result.text, &ncalls);
+                if (n_ncalls > 0) {        /* one tool per turn for now (2a) */
+                    const char *nm = ncalls[0].name ? ncalls[0].name : "?";
+                    printf("\033[90m[Executing: %s]\033[0m\n", nm);
+                    fflush(stdout);
+                    /* Structured dispatch: parsed JSON args go straight to the
+                       handlers, never round-tripped through a shell string. */
+                    tool_result = execute_tool_native(ncalls[0].name, ncalls[0].arguments);
+                    if (getenv("BASI_DEBUG_TOOLS"))
+                        fprintf(stderr, "[tool] name=%s args=%s\n  -> result=%.160s\n",
+                                nm, ncalls[0].arguments ? ncalls[0].arguments : "(null)",
+                                tool_result ? tool_result : "(null)");
+                    if (!tool_result) unknown_tool = strdup(nm);
+                    call_name = strdup(nm);
+                    call_env  = tool_call_envelope(ncalls[0].name, ncalls[0].arguments);
+                    have_call = true;
+                }
+            } else {
+                size_t tool_cmd_len;
+                const char *tc = extract_tool_call(result.text, &tool_cmd_len);
+                if (tc) {
+                    cmd_str = malloc(tool_cmd_len + 1);
+                    memcpy(cmd_str, tc, tool_cmd_len);
+                    cmd_str[tool_cmd_len] = '\0';
+                    have_call = true;
+                }
+            }
+
+            if (have_call) {
+                if (cmd_str) {                 /* legacy path: build → execute */
+                    printf("\033[90m[Executing: %s]\033[0m\n", cmd_str);
+                    fflush(stdout);
+                    tool_result = execute_tool(cmd_str);
+                    free(cmd_str);
+                } else if (!tool_result) {     /* native path hit an unknown tool */
+                    tool_result = malloc(256);
+                    snprintf(tool_result, 256,
+                        "Error: unknown tool '%s' — it is not one of the available functions.", unknown_tool);
+                    printf("\033[90m[Unknown tool: %s]\033[0m\n", unknown_tool ? unknown_tool : "?");
+                    fflush(stdout);
+                }
+                free(unknown_tool);
+                if (ncalls) basi_free_tool_calls(ncalls, n_ncalls);
+
+                /* Truncate tool result if too large */
+                size_t tr_len = strlen(tool_result);
+                if (tr_len > MAX_TOOL_RESULT_SZ) {
+                    printf("\033[90m[Truncated: %zu → %d chars]\033[0m\n",
+                           tr_len, MAX_TOOL_RESULT_SZ);
+                    strcpy(tool_result + MAX_TOOL_RESULT_SZ - 40,
+                           "\n\n[... content truncated ...]");
+                }
+
+                llama_memory_t mem = llama_get_memory(ctx);
+                int used = llama_memory_seq_pos_max(mem, 0) + 1;
+                int remaining = (int)llama_n_ctx(ctx) - used;
+
+                if (native_tools) {
+                    /* Structured round-trip: the assistant's tool call and the
+                       result are stored as structured turns (decoded by the
+                       chat_tmpl shim into common_chat tool_calls / a tool
+                       message), so EVERY model's template renders the call and
+                       its response — a bare role:"tool" content message is
+                       dropped by some templates (e.g. Gemma). */
+                    StringBuf tr;
+                    sb_init(&tr);
+                    sb_append_str(&tr, tool_result);
+                    char budget[256];
+                    snprintf(budget, sizeof(budget),
+                        "\n[Context: %d/%d tokens used, %d remaining. Answer now if remaining < 8000.]",
+                        used, (int)llama_n_ctx(ctx), remaining);
+                    sb_append_str(&tr, budget);
+                    char *res_env = tool_result_envelope(call_name, sb_to_str(&tr));
+                    sb_free(&tr);
+                    ADD_MESSAGE("tool_call", call_env);     /* assistant: the call */
+                    ADD_MESSAGE("tool_result", res_env);    /* tool: the result   */
+                    free(res_env);
+                    free(result.text);
+                } else {
+                    /* Legacy <tool> path: raw assistant text + a user-wrapped
+                       <tool_result> block (unchanged). */
+                    ADD_MESSAGE("assistant", result.text);
+                    free(result.text);
+                    StringBuf tool_resp;
+                    sb_init(&tool_resp);
+                    sb_append_str(&tool_resp, "<tool_result>\n");
+                    sb_append_str(&tool_resp, tool_result);
+                    char budget[512];
+                    snprintf(budget, sizeof(budget),
+                        "\n</tool_result>\n[Context: %d/%d tokens used, %d remaining. "
+                        "Original request: \"%.180s\". You MUST answer now if remaining < 8000.]",
+                        used, (int)llama_n_ctx(ctx), remaining, user_input);
+                    sb_append_str(&tool_resp, budget);
+                    ADD_MESSAGE("user", sb_to_str(&tool_resp));
+                    sb_free(&tool_resp);
+                }
+                free(call_env);     /* native built it; NULL (safe) on legacy */
+                free(call_name);
+                free(tool_result);
+
+                /* Update template for next iteration (delta prompt) */
+                int next_len = apply_template(
+                    model, messages, msg_count, true,
+                    formatted_buf, FORMATTED_BUF_SZ);
+                if (next_len < 0) {
+                    printf("Error: Failed to apply chat template\n");
+                    fflush(stdout);
+                    break;
+                }
+                int prev = apply_template(
+                    model, messages, msg_count - 1, false, NULL, 0);
+                prompt = formatted_buf + prev;
+                prompt_len = (size_t)next_len - (size_t)prev;
+
+                printf("\n");
+                fflush(stdout);
+            } else {
+                if (ncalls) basi_free_tool_calls(ncalls, n_ncalls);
+                /* No tool call — done */
+                ADD_MESSAGE("assistant", result.text);
+                free(result.text);
+                break;
+            }
+        }
+
+        /* If we exhausted tool iterations, do one final generation for the answer */
+        if (tool_iterations >= max_tool_iterations) {
+            printf("\033[90m[Generating answer...]\033[0m\n");
+            fflush(stdout);
+            generation_interrupted = 0;
+            setup_sigint_handler();
+            GenerateResult final_result = generate(ctx, vocab, smpl, prompt, prompt_len);
+            reset_sigint_handler();
+            session_prompt_tokens += final_result.prompt_tokens;
+            session_gen_tokens    += final_result.gen_tokens;
+
+            double gen_tps = final_result.gen_time_s > 0
+                ? final_result.gen_tokens / final_result.gen_time_s : 0;
+            printf("\033[90m[ Generation: %.1f t/s ]\033[0m\n", gen_tps);
+            fflush(stdout);
+
+            ADD_MESSAGE("assistant", final_result.text);
+            free(final_result.text);
+        }
+
+        printf("\n");
+        fflush(stdout);
+
+        /* Update prev_len for next turn */
+        int len = apply_template(
+            model, messages, msg_count, false, NULL, 0);
+        if (len >= 0) prev_len = (size_t)len;
+
+    #undef messages
+    #undef msg_count
+    #undef prev_len
+    #undef session_prompt_tokens
+    #undef session_gen_tokens
+    #undef ADD_MESSAGE
+}
+
+int main(int argc, char **argv) {
+    /* `basi-cli docs ...` subcommand: handle and exit before model load. */
+    if (argc >= 2 && strcmp(argv[1], "docs") == 0) {
+        if (argc >= 3 && strcmp(argv[2], "add") == 0) {
+            return cmd_docs_add(argc, argv);
+        }
+        fprintf(stderr,
+            "Usage:\n"
+            "  basi-cli docs add <file.md> [--shelf=notes|pinned|docs]\n");
+        return 2;
+    }
+
+    Cli cli = parse_args(argc, argv);
+    if (cli.want_exit) return cli.exit_code;
+    const char *model_path           = cli.model_path;
+    int         n_gpu_layers         = cli.n_gpu_layers;
+    bool        ngl_set              = cli.ngl_set;
+    const char *oneshot_deepsearch_q = cli.deepsearch_q;
+    const char *oneshot_prompt       = cli.prompt;
+    bool        no_tools             = cli.no_tools;
+    const char *system_override      = cli.system_override;
+    int         cli_ctx              = cli.cli_ctx;
+    float       cli_temp             = cli.cli_temp;
+    uint32_t    cli_seed             = cli.cli_seed;
+
     bool oneshot = (oneshot_deepsearch_q != NULL) || (oneshot_prompt != NULL);
 
     /* --no-tools is a modifier on -p: it only makes sense for the one-shot
@@ -1175,18 +1961,9 @@ int main(int argc, char **argv) {
     /* Session file (set after picker; system messages are not persisted) */
     FILE *session_fp = NULL;
 
-    /* Helper to add a message */
-    #define ADD_MESSAGE(role_str, content_str) do { \
-        if (msg_count >= msg_cap) { \
-            msg_cap = msg_cap ? msg_cap * 2 : 16; \
-            messages = realloc(messages, msg_cap * sizeof(struct llama_chat_message)); \
-        } \
-        messages[msg_count].role = (role_str); \
-        messages[msg_count].content = strdup(content_str); \
-        if (session_fp && strcmp((role_str), "system") != 0) \
-            session_write_record(session_fp, (role_str), (content_str)); \
-        msg_count++; \
-    } while(0)
+    /* Helper to add a message (thin alias over repl_add_message). */
+    #define ADD_MESSAGE(role_str, content_str) \
+        repl_add_message(&messages, &msg_count, &msg_cap, session_fp, (role_str), (content_str))
 
     /* Non-interactive flat completion (`-p "..." --no-tools`): one generation,
      * no tool loop, none of the tool-heavy system prompt. Built for clean,
@@ -1228,6 +2005,7 @@ int main(int argc, char **argv) {
     const BasiToolDef *tool_defs = basi_tool_defs(&tool_n);
     basi_set_tools(tool_defs, tool_n);
     int native_tools = basi_tools_active(model);
+    generate_native_tools = native_tools;   /* hide raw tool-call markup from the live stream */
     printf("\033[90m[Tool mode: %s]\033[0m\n", native_tools ? "native (function-calling)" : "legacy (<tool> tags)");
     fflush(stdout);
     if (!native_tools) basi_set_tools(NULL, 0);   /* don't advertise tools the model can't format */
@@ -1235,72 +2013,7 @@ int main(int argc, char **argv) {
     /* The date is injected per-turn (see the REPL loop) so it stays fresh on
        long-lived / resumed sessions, not stamped once here. */
     char system_prompt[16384];
-    snprintf(system_prompt, sizeof(system_prompt), "%s",
-             native_tools ? SYSTEM_PROMPT_NATIVE : SYSTEM_PROMPT_FMT);
-    /* Environment + identity block: grounds the model in where it is running,
-     * what OS, whether this is a git repo, and which model it is — removing a
-     * whole class of wrong path/command/self-identity guesses. Cheap, static,
-     * built once at session start. */
-    {
-        char cwd[PATH_MAX];
-        if (!getcwd(cwd, sizeof(cwd))) snprintf(cwd, sizeof(cwd), "(unknown)");
-        struct utsname uts;
-        const char *osname = (uname(&uts) == 0) ? uts.sysname  : "unknown";
-        const char *osrel  = (uname(&uts) == 0) ? uts.release  : "";
-        const char *mname = "(local model)";
-        if (model_path && *model_path) {
-            const char *slash = strrchr(model_path, '/');
-            mname = slash ? slash + 1 : model_path;
-        }
-        size_t cur_len = strlen(system_prompt);
-        snprintf(system_prompt + cur_len, sizeof(system_prompt) - cur_len,
-            "\n\n<env>\n"
-            "You are powered by a locally-run model loaded from: %s\n"
-            "Working directory: %s\n"
-            "Platform: %s %s\n"
-            "Is a git repo: %s\n"
-            "</env>\n",
-            mname, cwd, osname, osrel,
-            access(".git", F_OK) == 0 ? "yes" : "no");
-    }
-    {
-        char *templates_idx = build_templates_index();
-        size_t cur_len = strlen(system_prompt);
-        snprintf(system_prompt + cur_len, sizeof(system_prompt) - cur_len,
-            "\n\nAVAILABLE TEMPLATES (use the scaffold tool):\n%s", templates_idx);
-        free(templates_idx);
-    }
-    /* Project memory: append ./BASI.md if present. Context for the model,
-     * not enforcement — tools and rules above take precedence. */
-    {
-        FILE *bf = fopen("BASI.md", "r");
-        if (bf) {
-            fseek(bf, 0, SEEK_END);
-            long fsize = ftell(bf);
-            fseek(bf, 0, SEEK_SET);
-            if (fsize > 0) {
-                size_t cur_len = strlen(system_prompt);
-                size_t avail = sizeof(system_prompt) - cur_len - 1;
-                const char *header =
-                    "\n\nPROJECT MEMORY (from ./BASI.md — facts and conventions for this codebase; tools and rules above take precedence):\n";
-                size_t hlen = strlen(header);
-                if (avail > hlen + 200) {
-                    memcpy(system_prompt + cur_len, header, hlen);
-                    cur_len += hlen;
-                    avail -= hlen;
-                    size_t cap = 4000;  /* ~1000 tokens; small models tune out beyond this */
-                    size_t to_read = (size_t)fsize < cap ? (size_t)fsize : cap;
-                    if (to_read > avail - 1) to_read = avail - 1;
-                    size_t nread = fread(system_prompt + cur_len, 1, to_read, bf);
-                    system_prompt[cur_len + nread] = '\0';
-                    printf("\033[90m[Loaded ./BASI.md (%zu bytes%s)]\033[0m\n",
-                           nread, (size_t)fsize > nread ? ", truncated" : "");
-                    fflush(stdout);
-                }
-            }
-            fclose(bf);
-        }
-    }
+    build_system_prompt(system_prompt, sizeof(system_prompt), native_tools, model_path);
     ADD_MESSAGE("system", system_prompt);
 
     /* Non-interactive deep research: run it, print the answer, and exit —
@@ -1359,577 +2072,16 @@ int main(int argc, char **argv) {
 
         /* Slash commands intercept (no model call) */
         if (user_input[0] == '/') {
-            if (strcmp(user_input, "/help") == 0) {
-                printf(
-                    "\nSlash commands:\n"
-                    "  /help                 this help\n"
-                    "  /clear                drop conversation history (system prompt + project memory kept)\n"
-                    "  /cost                 show session token usage\n"
-                    "  /save [path]          export transcript as JSONL\n"
-                    "  /memory               open ./BASI.md in $EDITOR\n"
-                    "  /note <text>          append a one-line note to the project knowledge base\n"
-                    "  /edit <path>          open a knowledge-base file in $EDITOR (path under .basi/knowledge/)\n"
-                    "  /permissions [mode]   show or set permission mode (default | accept-edits | bypass)\n"
-                    "  /plan [<slug>|accept|off]\n"
-                    "                        no args: show phase. <slug>: enter drafting. accept: drafting/premortem -> active. off: exit.\n"
-                    "  /premortem            (drafting only) enter premortem — model rewrites the plan with a ## Pre-mortem section\n"
-                    "  /deepsearch <question>\n"
-                    "                        multi-round deep research (web + knowledge base), synthesized + cited\n"
-                    "  /model                switch model (requires restart)\n"
-                    "\n"
-                    "Subcommands (run before model load):\n"
-                    "  basi-cli docs add <file.md> [--shelf=notes|pinned|docs]\n"
-                    "                        copy a markdown file into ./.basi/knowledge/\n"
-                    "\n"
-                    "Tools the model can call: read, head, tail, grep, wc, bash,\n"
-                    "  edit, scaffold, web_search, web_fetch, readfile, code_context,\n"
-                    "  docs_toc, docs_get, docs_search, docs_recent_notes,\n"
-                    "  docs_vector_search,\n"
-                    "  plan_write (drafting/premortem), assumptions (drafting),\n"
-                    "  spike_write (spike), plan_verify (active).\n\n");
-                fflush(stdout);
-                free(user_input);
-                continue;
-            }
-            if (strcmp(user_input, "/clear") == 0) {
-                for (size_t i = 1; i < msg_count; i++) free((void*)messages[i].content);
-                msg_count = 1;
-                llama_memory_clear(llama_get_memory(ctx), true);
-                prev_len = 0;
-                printf("\033[90m[Cleared conversation history (system prompt kept)]\033[0m\n");
-                fflush(stdout);
-                free(user_input);
-                continue;
-            }
-            if (strcmp(user_input, "/cost") == 0) {
-                printf("\033[90m[Session: %zu prompt tokens, %zu generated tokens, %zu total]\033[0m\n",
-                       session_prompt_tokens, session_gen_tokens,
-                       session_prompt_tokens + session_gen_tokens);
-                fflush(stdout);
-                free(user_input);
-                continue;
-            }
-            if (strncmp(user_input, "/save", 5) == 0 &&
-                (user_input[5] == '\0' || user_input[5] == ' ')) {
-                const char *path = user_input + 5;
-                while (*path == ' ') path++;
-                char default_path[256];
-                if (!*path) {
-                    snprintf(default_path, sizeof(default_path),
-                             "basi-transcript-%ld.jsonl", (long)time(NULL));
-                    path = default_path;
-                }
-                FILE *out = fopen(path, "w");
-                if (!out) {
-                    printf("\033[31mError: cannot write '%s' (%s)\033[0m\n",
-                           path, strerror(errno));
-                } else {
-                    for (size_t i = 0; i < msg_count; i++) {
-                        StringBuf line;
-                        sb_init(&line);
-                        sb_append_str(&line, "{\"role\":");
-                        json_escape_into(&line, messages[i].role);
-                        sb_append_str(&line, ",\"content\":");
-                        json_escape_into(&line, messages[i].content);
-                        sb_append_str(&line, "}\n");
-                        fwrite(line.data, 1, line.len, out);
-                        sb_free(&line);
-                    }
-                    fclose(out);
-                    printf("\033[90m[Saved %zu messages to %s]\033[0m\n", msg_count, path);
-                }
-                fflush(stdout);
-                free(user_input);
-                continue;
-            }
-            if (strcmp(user_input, "/memory") == 0) {
-                const char *editor = getenv("EDITOR");
-                if (!editor || !*editor) editor = "vi";
-                char cmd[256];
-                snprintf(cmd, sizeof(cmd), "%s BASI.md", editor);
-                bool was_raw = raw_mode_enabled;
-                if (was_raw) disable_raw_mode();
-                int rc = system(cmd);
-                if (was_raw) enable_raw_mode();
-                if (rc != 0) printf("\033[31m[Editor exited with status %d]\033[0m\n", rc);
-                printf("\033[90m[BASI.md edited. Changes apply on next BASI restart.]\033[0m\n");
-                fflush(stdout);
-                free(user_input);
-                continue;
-            }
-            if (strncmp(user_input, "/note", 5) == 0 &&
-                (user_input[5] == '\0' || user_input[5] == ' ')) {
-                const char *text = user_input + 5;
-                while (*text == ' ') text++;
-                if (!*text) {
-                    printf("\033[31m[/note: missing text — usage: /note <one-line note>]\033[0m\n");
-                    fflush(stdout);
-                    free(user_input);
-                    continue;
-                }
-                if (kb_ensure_dirs() != 0) {
-                    printf("\033[31m[/note: cannot create .basi/knowledge/ tree (%s)]\033[0m\n",
-                           strerror(errno));
-                    fflush(stdout);
-                    free(user_input);
-                    continue;
-                }
-                time_t now = time(NULL);
-                struct tm tm_now;
-                localtime_r(&now, &tm_now);
-                char date[16], hhmm[8];
-                strftime(date, sizeof(date), "%Y-%m-%d", &tm_now);
-                strftime(hhmm, sizeof(hhmm), "%H:%M", &tm_now);
-                char notepath[512];
-                snprintf(notepath, sizeof(notepath), "%s/session-%s.md", KB_NOTES_DIR, date);
-                struct stat st;
-                bool fresh = (stat(notepath, &st) != 0);
-                FILE *nf = fopen(notepath, "a");
-                if (!nf) {
-                    printf("\033[31m[/note: cannot write %s (%s)]\033[0m\n",
-                           notepath, strerror(errno));
-                    fflush(stdout);
-                    free(user_input);
-                    continue;
-                }
-                if (fresh) {
-                    fprintf(nf,
-                        "---\nshelf: notes\ntitle: Session notes %s\nfetched: %s\n---\n\n",
-                        date, date);
-                }
-                fprintf(nf, "- %s %s\n", hhmm, text);
-                fclose(nf);
-                printf("\033[90m[note saved to %s]\033[0m\n", notepath);
-                fflush(stdout);
-                free(user_input);
-                continue;
-            }
-            if (strncmp(user_input, "/edit", 5) == 0 &&
-                (user_input[5] == '\0' || user_input[5] == ' ')) {
-                const char *arg = user_input + 5;
-                while (*arg == ' ') arg++;
-                if (!*arg) {
-                    printf("\033[31m[/edit: missing path — usage: /edit <path-under-.basi/knowledge/>]\033[0m\n");
-                    fflush(stdout);
-                    free(user_input);
-                    continue;
-                }
-                if (strstr(arg, "..") != NULL || arg[0] == '/') {
-                    printf("\033[31m[/edit not allowed: path must be relative under .basi/knowledge/ and may not contain '..']\033[0m\n");
-                    fflush(stdout);
-                    free(user_input);
-                    continue;
-                }
-                const char *editor = getenv("EDITOR");
-                if (!editor || !*editor) {
-                    printf("\033[31m[/edit not allowed: $EDITOR is not set]\033[0m\n");
-                    fflush(stdout);
-                    free(user_input);
-                    continue;
-                }
-                char fullpath[1280];
-                snprintf(fullpath, sizeof(fullpath), "%s/%s", KB_KNOW_DIR, arg);
-                struct stat est;
-                if (stat(fullpath, &est) != 0) {
-                    printf("\033[31m[/edit not allowed: file not found: %s]\033[0m\n", fullpath);
-                    fflush(stdout);
-                    free(user_input);
-                    continue;
-                }
-                char cmdbuf[1536];
-                snprintf(cmdbuf, sizeof(cmdbuf), "%s %s", editor, fullpath);
-                bool was_raw = raw_mode_enabled;
-                if (was_raw) disable_raw_mode();
-                int rc = system(cmdbuf);
-                if (was_raw) enable_raw_mode();
-                if (rc != 0) printf("\033[31m[Editor exited with status %d]\033[0m\n", rc);
-                else printf("\033[90m[%s edited]\033[0m\n", fullpath);
-                fflush(stdout);
-                free(user_input);
-                continue;
-            }
-            if (strcmp(user_input, "/model") == 0) {
-                printf("\033[90m[Model switching is not yet implemented — exit (Ctrl-D) and restart BASI to pick a different model.]\033[0m\n");
-                fflush(stdout);
-                free(user_input);
-                continue;
-            }
-            if (strncmp(user_input, "/deepsearch", 11) == 0 &&
-                (user_input[11] == '\0' || user_input[11] == ' ')) {
-                const char *q = user_input + 11;
-                while (*q == ' ') q++;
-                if (!*q) {
-                    printf("\033[31m[/deepsearch: needs a question. Usage: /deepsearch <your research question>]\033[0m\n");
-                    fflush(stdout);
-                    free(user_input);
-                    continue;
-                }
-                char *q_copy = strdup(q);
-                char *answer = execute_deep_search(model, vocab, q_copy);
-                printf("\n%s\n\n", answer ? answer : "(no answer)");
-                fflush(stdout);
-                /* Record the exchange so follow-up turns have context. The
-                 * research ran in its own context, so the main KV cache is
-                 * untouched and out of sync with these new messages — clear it
-                 * (like /clear) so the next turn cleanly re-decodes everything. */
-                ADD_MESSAGE("user", q_copy);
-                ADD_MESSAGE("assistant", answer ? answer : "(no answer)");
-                llama_memory_clear(llama_get_memory(ctx), true);
-                prev_len = 0;
-                free(q_copy);
-                free(answer);
-                free(user_input);
-                continue;
-            }
-            if (strncmp(user_input, "/plan", 5) == 0 &&
-                (user_input[5] == '\0' || user_input[5] == ' ')) {
-                const char *arg = user_input + 5;
-                while (*arg == ' ') arg++;
-                /* Reject anything past the first token. */
-                const char *tail = arg;
-                while (*tail && *tail != ' ' && *tail != '\t') tail++;
-                const char *rest = tail;
-                while (*rest == ' ' || *rest == '\t') rest++;
-                if (*rest) {
-                    printf("\033[31m[/plan: unexpected extra argument. Use /plan, /plan <slug>, /plan accept, or /plan off]\033[0m\n");
-                    fflush(stdout);
-                    free(user_input);
-                    continue;
-                }
-
-                if (!*arg) {
-                    if (plan_phase == PHASE_NONE) {
-                        printf("\033[90m[Plan phase: none. Enter drafting with /plan <slug>.]\033[0m\n");
-                    } else {
-                        printf("\033[36m[Plan phase: %s — slug '%s']\033[0m\n",
-                               plan_phase_name(plan_phase),
-                               current_plan_slug ? current_plan_slug : "(unset)");
-                    }
-                } else if (strcmp(arg, "off") == 0) {
-                    if (plan_phase == PHASE_NONE) {
-                        printf("\033[90m[Plan phase already off]\033[0m\n");
-                    } else {
-                        plan_phase = PHASE_NONE;
-                        free(current_plan_slug);
-                        current_plan_slug = NULL;
-                        spike_cycles = 0;
-                        spike_calls  = 0;
-                        printf("\033[90m[Plan phase: off]\033[0m\n");
-                    }
-                } else if (strcmp(arg, "accept") == 0) {
-                    if (plan_phase == PHASE_DRAFTING || plan_phase == PHASE_PREMORTEM) {
-                        plan_phase = PHASE_ACTIVE;
-                        if (current_plan_slug) {
-                            int src = rewrite_plan_status(current_plan_slug, "active");
-                            if (src == -2) {
-                                printf("\033[33m[Plan file has no status: line; runtime phase=active but file untouched.]\033[0m\n");
-                            } else if (src == -1) {
-                                printf("\033[33m[Plan file not yet written; runtime phase=active. Status will be set on the next plan_write.]\033[0m\n");
-                            }
-                        }
-                        printf("\033[36m[Plan accepted: '%s' — phase=active. Tools unblocked.]\033[0m\n",
-                               current_plan_slug ? current_plan_slug : "(unset)");
-                    } else {
-                        printf("\033[31m[/plan accept: only valid from drafting or premortem (current: %s)]\033[0m\n",
-                               plan_phase_name(plan_phase));
-                    }
-                } else {
-                    /* Treat as slug → enter drafting. */
-                    if (plan_phase != PHASE_NONE) {
-                        printf("\033[31m[/plan %s: already in %s phase for '%s'. Use /plan off to exit first.]\033[0m\n",
-                               arg, plan_phase_name(plan_phase),
-                               current_plan_slug ? current_plan_slug : "(unset)");
-                    } else if (!kb_slug_valid(arg)) {
-                        printf("\033[31m[/plan %s: invalid slug. Use lowercase a-z, 0-9, single hyphens; must start with a letter; max 64 chars.]\033[0m\n",
-                               arg);
-                    } else {
-                        plan_phase = PHASE_DRAFTING;
-                        free(current_plan_slug);
-                        current_plan_slug = strdup(arg);
-                        spike_cycles = 0;
-                        spike_calls  = 0;
-                        printf("\033[36m[Plan phase: drafting — slug '%s'. Research first, then save with plan_write. /plan accept when ready.]\033[0m\n",
-                               current_plan_slug);
-                    }
-                }
-                fflush(stdout);
-                free(user_input);
-                continue;
-            }
-            if (strcmp(user_input, "/premortem") == 0) {
-                if (plan_phase != PHASE_DRAFTING) {
-                    printf("\033[31m[/premortem: only valid from drafting phase (current: %s)]\033[0m\n",
-                           plan_phase_name(plan_phase));
-                } else if (!current_plan_slug) {
-                    printf("\033[31m[/premortem: no current plan slug — internal state error]\033[0m\n");
-                } else {
-                    char path[1024];
-                    snprintf(path, sizeof(path), "%s/%s.md", KB_PLANS_DIR, current_plan_slug);
-                    struct stat st;
-                    if (stat(path, &st) != 0) {
-                        printf("\033[31m[/premortem: no plan file at %s — model hasn't called plan_write yet. Have it draft the plan first.]\033[0m\n",
-                               path);
-                    } else {
-                        plan_phase = PHASE_PREMORTEM;
-                        int src = rewrite_plan_status(current_plan_slug, "premortem");
-                        if (src == -2) {
-                            printf("\033[33m[Plan file has no status: line; runtime phase=premortem but file untouched.]\033[0m\n");
-                        }
-                        printf("\033[36m[Pre-mortem phase entered for '%s'. On your next message the model will run Klein's protocol — \"imagine the plan failed; explain why\" — and rewrite %s with a ## Pre-mortem section. Use /plan accept when satisfied, or /plan off to abort.]\033[0m\n",
-                               current_plan_slug, path);
-                    }
-                }
-                fflush(stdout);
-                free(user_input);
-                continue;
-            }
-            if (strncmp(user_input, "/permissions", 12) == 0 &&
-                (user_input[12] == '\0' || user_input[12] == ' ')) {
-                const char *arg = user_input + 12;
-                while (*arg == ' ') arg++;
-                if (!*arg) {
-                    printf("\033[90m[Permission mode: %s]\033[0m\n", perm_mode_name(permission_mode));
-                    printf("Modes:\n"
-                           "  default       prompt before bash, edit, scaffold\n"
-                           "  accept-edits  auto-approve edit + scaffold; bash still prompts\n"
-                           "  bypass        auto-approve everything\n"
-                           "Use: /permissions <mode>\n");
-                } else if (strcmp(arg, "default") == 0) {
-                    permission_mode = PERM_DEFAULT;
-                    printf("\033[90m[Permission mode: default]\033[0m\n");
-                } else if (strcmp(arg, "accept-edits") == 0) {
-                    permission_mode = PERM_ACCEPT_EDITS;
-                    printf("\033[90m[Permission mode: accept-edits]\033[0m\n");
-                } else if (strcmp(arg, "bypass") == 0) {
-                    permission_mode = PERM_BYPASS;
-                    printf("\033[33m[Permission mode: bypass — all tool calls auto-approved]\033[0m\n");
-                } else {
-                    printf("\033[31m[Unknown mode '%s'. Try: default, accept-edits, bypass]\033[0m\n", arg);
-                }
-                fflush(stdout);
-                free(user_input);
-                continue;
-            }
-            printf("\033[33m[Unknown command '%s'. Type /help for the list.]\033[0m\n", user_input);
-            fflush(stdout);
-            free(user_input);
+            handle_slash_command(user_input, model, vocab, ctx,
+                                 &messages, &msg_count, &msg_cap, session_fp,
+                                 &prev_len, session_prompt_tokens, session_gen_tokens);
             continue;
         }
 
-        /* Recompute the date every turn and ride it in with the user message.
-           The system prompt is decoded once and cached, so only tokens added now
-           reach the model — this keeps "today" correct on sessions left open for
-           days or resumed weeks later. */
-        char today[16];
-        {
-            time_t now = time(NULL);
-            struct tm *t = localtime(&now);
-            strftime(today, sizeof(today), "%Y-%m-%d", t);
-        }
-
-        const char *banner = plan_phase_banner(plan_phase);
-        {
-            size_t blen = strlen(user_input) + (banner ? strlen(banner) : 0) + 64;
-            char *msg = malloc(blen);
-            if (banner)
-                snprintf(msg, blen, "[Today's date: %s]\n%s\n\n%s", today, banner, user_input);
-            else
-                snprintf(msg, blen, "[Today's date: %s]\n%s", today, user_input);
-            ADD_MESSAGE("user", msg);
-            free(msg);
-        }
-        /* keep user_input alive across tool iterations so the context reminder
-         * can echo the original request back to the model — small models drift
-         * after several tool rounds otherwise. Freed at end of turn. */
-
-        /* Apply chat template — renders the model's native format via the jinja
-           engine (chat_tmpl shim), with ChatML fallback. */
-        int new_len = apply_template(
-            model, messages, msg_count, true,
-            formatted_buf, sizeof(formatted_buf));
-
-        if (new_len < 0) {
-            printf("Error: Failed to apply chat template\n");
-            fflush(stdout);
-            continue;
-        }
-
-        char *prompt = formatted_buf + prev_len;
-        size_t prompt_len = (size_t)new_len - prev_len;
-
-        /* Tool execution loop */
-        int tool_iterations = 0;
-        const int max_tool_iterations = 5;
-
-        while (tool_iterations < max_tool_iterations) {
-            tool_iterations++;
-
-            generation_interrupted = 0;
-            setup_sigint_handler();
-            GenerateResult result = generate(ctx, vocab, smpl, prompt, prompt_len);
-            reset_sigint_handler();
-            session_prompt_tokens += result.prompt_tokens;
-            session_gen_tokens    += result.gen_tokens;
-
-            /* Performance metrics */
-            double prompt_tps = result.prompt_time_s > 0
-                ? result.prompt_tokens / result.prompt_time_s : 0;
-            double gen_tps = result.gen_time_s > 0
-                ? result.gen_tokens / result.gen_time_s : 0;
-            printf("\033[90m[ Prompt: %.1f t/s | Generation: %.1f t/s ]\033[0m\n",
-                   prompt_tps, gen_tps);
-            fflush(stdout);
-
-            /* Detect a tool call: native function-calling if the model's
-               template supports it, else the legacy <tool> tag. Both resolve
-               to a command string that execute_tool() runs (reusing all
-               dispatch + plan-phase gating). */
-            char *cmd_str = NULL;          /* legacy <tool> path: command for execute_tool */
-            char *unknown_tool = NULL;     /* malloc'd name if a native call hit an unknown tool */
-            char *tool_result = NULL;      /* native path computes this directly */
-            bool have_call = false;
-            BasiToolCall *ncalls = NULL;
-            int n_ncalls = 0;
-
-            if (native_tools) {
-                n_ncalls = basi_parse_tool_calls(result.text, &ncalls);
-                if (n_ncalls > 0) {        /* one tool per turn for now (2a) */
-                    const char *nm = ncalls[0].name ? ncalls[0].name : "?";
-                    printf("\033[90m[Executing: %s]\033[0m\n", nm);
-                    fflush(stdout);
-                    /* Structured dispatch: parsed JSON args go straight to the
-                       handlers, never round-tripped through a shell string. */
-                    tool_result = execute_tool_native(ncalls[0].name, ncalls[0].arguments);
-                    if (!tool_result) unknown_tool = strdup(nm);
-                    have_call = true;
-                }
-            } else {
-                size_t tool_cmd_len;
-                const char *tc = extract_tool_call(result.text, &tool_cmd_len);
-                if (tc) {
-                    cmd_str = malloc(tool_cmd_len + 1);
-                    memcpy(cmd_str, tc, tool_cmd_len);
-                    cmd_str[tool_cmd_len] = '\0';
-                    have_call = true;
-                }
-            }
-
-            if (have_call) {
-                if (cmd_str) {                 /* legacy path: build → execute */
-                    printf("\033[90m[Executing: %s]\033[0m\n", cmd_str);
-                    fflush(stdout);
-                    tool_result = execute_tool(cmd_str);
-                    free(cmd_str);
-                } else if (!tool_result) {     /* native path hit an unknown tool */
-                    tool_result = malloc(256);
-                    snprintf(tool_result, 256,
-                        "Error: unknown tool '%s' — it is not one of the available functions.", unknown_tool);
-                    printf("\033[90m[Unknown tool: %s]\033[0m\n", unknown_tool ? unknown_tool : "?");
-                    fflush(stdout);
-                }
-                free(unknown_tool);
-                if (ncalls) basi_free_tool_calls(ncalls, n_ncalls);
-
-                /* Truncate tool result if too large */
-                size_t tr_len = strlen(tool_result);
-                if (tr_len > MAX_TOOL_RESULT_SZ) {
-                    printf("\033[90m[Truncated: %zu → %d chars]\033[0m\n",
-                           tr_len, MAX_TOOL_RESULT_SZ);
-                    strcpy(tool_result + MAX_TOOL_RESULT_SZ - 40,
-                           "\n\n[... content truncated ...]");
-                }
-
-                /* Add assistant turn — raw text, incl. the model's native
-                   <tool_call> markup; re-rendered verbatim next turn. */
-                ADD_MESSAGE("assistant", result.text);
-                free(result.text);
-
-                llama_memory_t mem = llama_get_memory(ctx);
-                int used = llama_memory_seq_pos_max(mem, 0) + 1;
-                int remaining = (int)llama_n_ctx(ctx) - used;
-
-                if (native_tools) {
-                    /* Feed back as a tool message → the template renders the
-                       model's native <tool_response>. */
-                    StringBuf tr;
-                    sb_init(&tr);
-                    sb_append_str(&tr, tool_result);
-                    char budget[256];
-                    snprintf(budget, sizeof(budget),
-                        "\n[Context: %d/%d tokens used, %d remaining. Answer now if remaining < 8000.]",
-                        used, (int)llama_n_ctx(ctx), remaining);
-                    sb_append_str(&tr, budget);
-                    ADD_MESSAGE("tool", sb_to_str(&tr));
-                    sb_free(&tr);
-                } else {
-                    StringBuf tool_resp;
-                    sb_init(&tool_resp);
-                    sb_append_str(&tool_resp, "<tool_result>\n");
-                    sb_append_str(&tool_resp, tool_result);
-                    char budget[512];
-                    snprintf(budget, sizeof(budget),
-                        "\n</tool_result>\n[Context: %d/%d tokens used, %d remaining. "
-                        "Original request: \"%.180s\". You MUST answer now if remaining < 8000.]",
-                        used, (int)llama_n_ctx(ctx), remaining, user_input);
-                    sb_append_str(&tool_resp, budget);
-                    ADD_MESSAGE("user", sb_to_str(&tool_resp));
-                    sb_free(&tool_resp);
-                }
-                free(tool_result);
-
-                /* Update template for next iteration (delta prompt) */
-                int next_len = apply_template(
-                    model, messages, msg_count, true,
-                    formatted_buf, sizeof(formatted_buf));
-                if (next_len < 0) {
-                    printf("Error: Failed to apply chat template\n");
-                    fflush(stdout);
-                    break;
-                }
-                int prev = apply_template(
-                    model, messages, msg_count - 1, false, NULL, 0);
-                prompt = formatted_buf + prev;
-                prompt_len = (size_t)next_len - (size_t)prev;
-
-                printf("\n");
-                fflush(stdout);
-            } else {
-                if (ncalls) basi_free_tool_calls(ncalls, n_ncalls);
-                /* No tool call — done */
-                ADD_MESSAGE("assistant", result.text);
-                free(result.text);
-                break;
-            }
-        }
-
-        /* If we exhausted tool iterations, do one final generation for the answer */
-        if (tool_iterations >= max_tool_iterations) {
-            printf("\033[90m[Generating answer...]\033[0m\n");
-            fflush(stdout);
-            generation_interrupted = 0;
-            setup_sigint_handler();
-            GenerateResult final_result = generate(ctx, vocab, smpl, prompt, prompt_len);
-            reset_sigint_handler();
-            session_prompt_tokens += final_result.prompt_tokens;
-            session_gen_tokens    += final_result.gen_tokens;
-
-            double gen_tps = final_result.gen_time_s > 0
-                ? final_result.gen_tokens / final_result.gen_time_s : 0;
-            printf("\033[90m[ Generation: %.1f t/s ]\033[0m\n", gen_tps);
-            fflush(stdout);
-
-            ADD_MESSAGE("assistant", final_result.text);
-            free(final_result.text);
-        }
-
-        printf("\n");
-        fflush(stdout);
-
-        /* Update prev_len for next turn */
-        int len = apply_template(
-            model, messages, msg_count, false, NULL, 0);
-        if (len >= 0) prev_len = (size_t)len;
-
+        run_agentic_turn(user_input, model, vocab, ctx, smpl, native_tools,
+                         formatted_buf, &messages, &msg_count, &msg_cap,
+                         session_fp, &prev_len,
+                         &session_prompt_tokens, &session_gen_tokens);
         free(user_input);
     }
 

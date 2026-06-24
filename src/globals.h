@@ -63,6 +63,12 @@ extern volatile sig_atomic_t generate_quiet;
  * consistent (its prior turns include their thinking) and it can think freely. */
 extern volatile sig_atomic_t generate_keep_think;
 
+/* When set (native tool-calling mode), generate() hides a tool-call's raw
+ * markup (`<tool_call>…` / `<|tool_call>…`) from the live stream — it stays in
+ * the returned text for parsing, but the user sees the clean [Executing:] line
+ * instead of the JSON. Display-only; does not affect parsing or the model. */
+extern volatile sig_atomic_t generate_native_tools;
+
 /* y/n/a approval prompt for risky tools.
  * Returns: 0 = deny, 1 = allow once, 2 = always (caller sets flag). */
 int request_approval(const char *tool_label, const char *cmd);

@@ -62,8 +62,29 @@ Non-interactive (one-shot, prints and exits):
 
 ```sh
 ./basi-cli -m model.gguf -p "your prompt"                  # single agent turn (with tools)
+./basi-cli -m model.gguf -p "your prompt" --no-tools       # flat completion (no tools)
 ./basi-cli -m model.gguf --deepsearch "your question"      # multi-round deep research
 ```
+
+`--no-tools` turns `-p` into a single plain completion: no agent loop, no tool-instruction
+system prompt, and **only the completion is printed to stdout** (load chatter goes to stderr) —
+clean to capture in a pipe or use as a local teacher for data generation. It uses a minimal
+"helpful assistant" system prompt by default; override it with `-s "<system>"`, or pass `-s ""`
+for a pure completion of the prompt alone.
+
+### Model & sampling flags
+
+These apply to every mode (interactive, `-p`, `--no-tools`, `--deepsearch`):
+
+| Flag | Default | Purpose |
+|---|---|---|
+| `-ngl`, `--ngl <n>` | `99` | Model layers to offload to GPU. **`0` = CPU only.** |
+| `-c`, `--ctx <n>` | `32768` | Context size in tokens. |
+| `-t`, `--temp <f>` | `0.4` | Sampling temperature (`0` = greedy). |
+| `--seed <n>` | random | RNG seed. Fix it for reproducible output; vary it for diverse data-gen. |
+
+Explicit flags win over the model picker's chosen values. Example — reproducible CPU-only
+completion: `./basi-cli -m model.gguf -ngl 0 --seed 42 -p "..." --no-tools`.
 
 Interactive slash commands include `/help`, `/deepsearch <q>`, `/plan`, `/permissions`, `/clear`,
 `/cost`, `/model`.
