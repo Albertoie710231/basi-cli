@@ -12,3 +12,4 @@ Captura de pantalla_*.png
 noted/
 pyproject.toml
 *.egg-info/
+tests/mem_bench/last_run.md

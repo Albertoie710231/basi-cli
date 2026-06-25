@@ -10,10 +10,14 @@
 
 #define MEM_DBG(...) do { if (getenv("BASI_DEBUG_RECLAIM")) fprintf(stderr, __VA_ARGS__); } while (0)
 
-/* Store retrieval units as small windows (~225 tokens), not whole turns, so a
- * query retrieves a precise snippet and injecting the top-k stays bounded. A
- * dropped turn is split into MEM_CHUNK_CHARS windows at whitespace. */
-#define MEM_CHUNK_CHARS 900
+/* Store retrieval units at SENTENCE granularity, not fixed windows, so a single
+ * fact ("...the lead architect is ZORRILLA_7741.") becomes its own clean memory
+ * instead of being diluted inside a wide window of unrelated text. This is the
+ * deterministic stand-in for Mem0-style atomic-fact extraction: each stored unit
+ * is 1+ sentences up to MEM_CHUNK_MAX chars; sentences shorter than MEM_CHUNK_MIN
+ * are merged forward so trivial fragments ("OK.") don't become their own vector. */
+#define MEM_CHUNK_MAX 320
+#define MEM_CHUNK_MIN 40
 
 typedef struct { float *vec; char *text; } MemChunk;
 
@@ -56,25 +60,37 @@ static void mem_add_one(const char *text) {
 void mem_add(const char *text) {
     if (blank(text)) return;
     size_t len = strlen(text);
-    if (len <= MEM_CHUNK_CHARS) { mem_add_one(text); return; }
 
-    /* split into ~MEM_CHUNK_CHARS windows, breaking at whitespace so a window
-       doesn't bisect a number/identifier we want to retrieve. */
-    size_t start = 0;
-    while (start < len) {
-        size_t end = start + MEM_CHUNK_CHARS;
-        if (end >= len) {
-            end = len;
-        } else {
-            size_t e = end;                              /* back off to a space */
-            while (e > start && !isspace((unsigned char)text[e])) e--;
-            if (e > start + MEM_CHUNK_CHARS / 2) end = e; /* only if we didn't back off too far */
+    size_t i = 0;
+    while (i < len) {
+        while (i < len && isspace((unsigned char)text[i])) i++;   /* skip leading ws */
+        if (i >= len) break;
+        size_t start = i, end = start;
+        while (end < len) {
+            char c = text[end];
+            end++;
+            /* a real sentence end is . ! ? followed by space/EOF (so "1.6T" and
+               "e.g." don't split); newline also ends a unit. */
+            bool sentence_end = (c == '.' || c == '!' || c == '?') &&
+                                (end >= len || isspace((unsigned char)text[end]));
+            if ((sentence_end || c == '\n') && (end - start) >= MEM_CHUNK_MIN) break;
+            if (end - start >= MEM_CHUNK_MAX) {           /* hard cap: back off to a space */
+                size_t e = end;
+                while (e > start && !isspace((unsigned char)text[e])) e--;
+                if (e > start + MEM_CHUNK_MAX / 2) end = e;
+                break;
+            }
         }
         size_t sl = end - start;
+        while (sl > 0 && isspace((unsigned char)text[start + sl - 1])) sl--;   /* trim */
         char *piece = malloc(sl + 1);
-        if (piece) { memcpy(piece, text + start, sl); piece[sl] = '\0'; mem_add_one(piece); free(piece); }
-        start = end;
-        while (start < len && isspace((unsigned char)text[start])) start++;
+        if (piece) {
+            memcpy(piece, text + start, sl);
+            piece[sl] = '\0';
+            if (!blank(piece)) mem_add_one(piece);
+            free(piece);
+        }
+        i = end;
     }
 }
 

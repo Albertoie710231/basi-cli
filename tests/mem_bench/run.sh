@@ -21,7 +21,7 @@ EMB="${2:-$HOME/.cache/huggingface/hub/models--jinaai--jina-embeddings-v5-text-s
 
 WORK="$(mktemp -d)"
 IN="$WORK/session.txt"
-RESULTS="$ROOT/tests/mem_bench/RESULTS.md"
+RESULTS="$ROOT/tests/mem_bench/last_run.md"   # raw auto-table; RESULTS.md is the curated writeup
 
 # Facts planted at chunk positions 1/3/5/7 (F1 earliest ... F4 latest). DISTINCT
 # topics + unique tokens, so embedding retrieval can disambiguate them (the v1
