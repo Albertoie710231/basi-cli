@@ -1197,6 +1197,80 @@ static void format_context_meter(struct llama_context *ctx, char *out, size_t n)
     snprintf(out, n, "%sctx %s/%s %d%%\033[90m", col, u, t, pct);
 }
 
+/* ── Context reclamation (recent-window compaction) ────────────────────
+ * Resync after any mutation of the message history. The delta-prompt scheme
+ * feeds only formatted_buf+prev_len each turn, trusting the KV cache to hold the
+ * prefix; once we rewrite messages[] that prefix is invalid, so we drop the
+ * whole KV and zero prev_len — the next render+decode rebuilds it from the
+ * (now smaller) history. Shared by /clear, deepsearch-return, and reclaim. */
+static void kv_resync_full(struct llama_context *ctx, size_t *prev_len) {
+    llama_memory_clear(llama_get_memory(ctx), true);
+    *prev_len = 0;
+}
+
+/* Cheap token estimate for window selection (chars/4, like opencode). The
+ * compaction TRIGGER uses the exact KV count; only the choice of which messages
+ * to keep uses this estimate, so approximation is fine. */
+static int est_msg_tokens(const char *s) {
+    return s ? (int)(strlen(s) / 4) : 0;
+}
+
+/* Deterministic recent-window reclamation. When the KV is within RESERVE of full,
+ * pin the system prompt (messages[0]) and keep the newest whole turns that fit in
+ * a KEEP budget, dropping everything older; then resync the KV so the next render
+ * re-decodes the compacted history once. No LLM, no summary (that is phase 2) —
+ * old detail is lost verbatim, but the session never hits the context wall.
+ * Returns true if it compacted. Must be called BEFORE rendering the current turn. */
+static bool reclaim_context_if_needed(
+        struct llama_context *ctx,
+        struct llama_chat_message **messages_p, size_t *msg_count_p,
+        size_t *prev_len_p) {
+    int total = (int)llama_n_ctx(ctx);
+    /* RESERVE: headroom left free for the incoming turn + its answer. ~4k on a
+       full local ctx, scaled down so it never swallows a small ctx whole. */
+    int reserve = total / 4 < 4096 ? total / 4 : 4096;
+    int used = context_used_tokens(ctx);
+    if (used <= total - reserve) return false;          /* room remains */
+
+    struct llama_chat_message *m = *messages_p;
+    size_t mc = *msg_count_p;
+    if (mc <= 2) return false;                          /* system + <=1 turn: nothing to drop */
+
+    /* Keep messages[0] (system) + the longest suffix that starts at a "user"
+       message and fits KEEP. Starting at a user boundary keeps each turn — and
+       any tool_call/tool_result pair inside it — intact. */
+    int keep_budget = (total - reserve) / 2;
+    size_t keep_from = mc;                              /* index where kept suffix begins */
+    int est = 0;
+    for (size_t i = mc; i-- > 1; ) {
+        est += est_msg_tokens(m[i].content);
+        if (strcmp(m[i].role, "user") == 0) {
+            if (est <= keep_budget) keep_from = i;
+            else break;                                 /* extending further overflows KEEP */
+        }
+    }
+    /* If even the newest user turn exceeds KEEP, keep it anyway — progress beats
+       the budget; the per-message truncation guards cap individual sizes. */
+    if (keep_from == mc) {
+        for (size_t i = mc; i-- > 1; )
+            if (strcmp(m[i].role, "user") == 0) { keep_from = i; break; }
+    }
+    if (keep_from <= 1) return false;                   /* nothing older than the kept suffix */
+
+    size_t dropped = keep_from - 1;
+    for (size_t i = 1; i < keep_from; i++) free((void *)m[i].content);
+    size_t tail = mc - keep_from;
+    memmove(&m[1], &m[keep_from], tail * sizeof(struct llama_chat_message));
+    *msg_count_p = 1 + tail;
+
+    kv_resync_full(ctx, prev_len_p);
+    printf("\033[33m[Compacting context: dropped %zu older message%s to free space "
+           "(%d/%d tokens were used)]\033[0m\n",
+           dropped, dropped == 1 ? "" : "s", used, total);
+    fflush(stdout);
+    return true;
+}
+
 /* ── Main ──────────────────────────────────────────────────────────── */
 
 
@@ -1251,8 +1325,7 @@ static void handle_slash_command(char *user_input,
             if (strcmp(user_input, "/clear") == 0) {
                 for (size_t i = 1; i < msg_count; i++) free((void*)messages[i].content);
                 msg_count = 1;
-                llama_memory_clear(llama_get_memory(ctx), true);
-                prev_len = 0;
+                kv_resync_full(ctx, prev_len_p);
                 printf("\033[90m[Cleared conversation history (system prompt kept)]\033[0m\n");
                 fflush(stdout);
                 free(user_input);
@@ -1436,8 +1509,7 @@ static void handle_slash_command(char *user_input,
                  * (like /clear) so the next turn cleanly re-decodes everything. */
                 ADD_MESSAGE("user", q_copy);
                 ADD_MESSAGE("assistant", answer ? answer : "(no answer)");
-                llama_memory_clear(llama_get_memory(ctx), true);
-                prev_len = 0;
+                kv_resync_full(ctx, prev_len_p);
                 free(q_copy);
                 free(answer);
                 free(user_input);
@@ -1626,6 +1698,12 @@ static void run_agentic_turn(char *user_input,
         /* keep user_input alive across tool iterations so the context reminder
          * can echo the original request back to the model — small models drift
          * after several tool rounds otherwise. Freed at end of turn. */
+
+        /* Reclaim context if the KV is near full, BEFORE rendering this turn.
+           Drops oldest whole turns (system prompt pinned) and resyncs the KV, so
+           the render below re-decodes the compacted history once instead of
+           hitting the [Context limit reached] wall. */
+        reclaim_context_if_needed(ctx, messages_p, msg_count_p, prev_len_p);
 
         /* Apply chat template — renders the model's native format via the jinja
            engine (chat_tmpl shim), with ChatML fallback. */
