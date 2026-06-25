@@ -19,6 +19,20 @@ so a token in output = recalled). Reproduce: `tests/mem_bench/run.sh` (writes `l
 0 walls / 0 crashes. The jump from 2/4 → 4/4 came from one change: store memories at
 **sentence (atomic) granularity** instead of fixed 900-char windows.
 
+### Speed (wall-clock for the full 13-turn session, incl. model load)
+
+| mode | recall | time | compactions | note |
+|---|:--:|:--:|:--:|---|
+| off      | 0/4 | 36s  | 4 | floor: load + turns, no memory work |
+| summary  | 0/4 | 343s | 7 | an LLM generation per compaction (~44s each) + compacts more often |
+| retrieve | 4/4 | 89s  | 4 | cheap embeddings + 2nd-model load; fewer compactions |
+| hybrid   | 4/4 | 462s | 8 | pays for both |
+
+**retrieve is ~3.9× faster than summary AND more accurate** — summary's LLM-generation-per-
+compaction is the dominant cost; retrieve only embeds (and compacts less since no summary
+checkpoint inflates the context). hybrid is slowest. (Arc Vulkan, single GPU; absolute times
+are backend-bound, but the *ratio* is the structural result.)
+
 ## Why — from the Mem0 paper (arXiv 2504.19413)
 - Fixed-length raw-chunk RAG is the *baseline* Mem0 beats (~26% LLM-judge); the win comes from
   **LLM-extracted atomic facts**, embedded one per memory.

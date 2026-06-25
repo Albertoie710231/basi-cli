@@ -69,16 +69,18 @@ echo "Session: $(wc -l < "$IN") turns (8 content incl. 4 facts, 4 fact-probes, 1
   echo "Facts planted at chunks 1/3/5/7 (F1 earliest → F4 latest); probed after all 8 chunks."
   echo "Recall = fact token appears in the model's answer (input is not echoed)."
   echo
-  echo "| mode | F1 | F2 | F3 | F4 | recall | gist | compactions | wall | crash |"
-  echo "|---|:--:|:--:|:--:|:--:|:--:|:--:|:--:|:--:|:--:|"
+  echo "| mode | F1 | F2 | F3 | F4 | recall | gist | compactions | wall | crash | secs |"
+  echo "|---|:--:|:--:|:--:|:--:|:--:|:--:|:--:|:--:|:--:|:--:|"
 } > "$RESULTS"
 
 for MODE in off summary retrieve hybrid; do
   RUN=$(mktemp -d)
   OUT="$WORK/out_$MODE.txt"
+  t0=$(date +%s)
   BASI_EMBED_MODEL="$EMB" BASI_COMPACT="$MODE" \
     timeout 600 env -C "$RUN" "$BIN" -m "$CHAT" -c "$CTX" --seed "$SEED" --yolo \
     < "$IN" > "$OUT" 2>&1
+  secs=$(( $(date +%s) - t0 ))
   S="$(sed 's/\x1b\[[0-9;]*m//g' "$OUT")"
 
   row="| $MODE |"; hit=0
@@ -92,8 +94,8 @@ for MODE in off summary retrieve hybrid; do
   gist=$(printf '%s' "$S" | grep -ciE 'deepseek|long.context|million.token|mixture.of.experts|MoE' )
   gmark=$([ "$gist" -gt 0 ] && echo "✅" || echo "❌")
   cmark=$([ "$crash" -gt 0 ] && echo "💥" || echo "—")
-  echo "$row $hit/4 | $gmark | $comp | $wall | $cmark |" >> "$RESULTS"
-  echo "  $MODE: recall $hit/4, compactions=$comp, wall=$wall, crash=$crash"
+  echo "$row $hit/4 | $gmark | $comp | $wall | $cmark | ${secs}s |" >> "$RESULTS"
+  echo "  $MODE: recall $hit/4, compactions=$comp, wall=$wall, crash=$crash, time=${secs}s"
 done
 
 echo
