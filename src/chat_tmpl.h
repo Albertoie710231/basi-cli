@@ -36,6 +36,14 @@ void basi_set_tools(const BasiToolDef *defs, int n);
    uses the legacy <tool> prose path. */
 int  basi_tools_active(const struct llama_model *model);
 
+/* Phase 2b — build the GBNF grammar sampler that constrains decoding to a valid
+   tool call in this model's format (the grammar common_chat already derives from
+   the tool set). Lazy: inactive until a tool-call trigger, so free text/thinking
+   still works. The caller adds the returned sampler to its chain BEFORE the final
+   selector and MUST llama_sampler_reset it between generations. NULL if this
+   format has no tool grammar, or on any error (caller proceeds unconstrained). */
+struct llama_sampler *basi_tool_grammar_sampler(const struct llama_model *model);
+
 /* Parse a finished assistant generation into tool calls. Returns the count
    (0 = none / parse failure → treat as a plain answer). On >0, *out points to
    a malloc'd array the caller frees with basi_free_tool_calls. */

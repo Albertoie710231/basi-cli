@@ -180,6 +180,12 @@ volatile sig_atomic_t generate_quiet = 0;
 volatile sig_atomic_t generate_keep_think = 0;
 volatile sig_atomic_t generate_native_tools = 0;
 
+/* Tool-call grammar sampler (phase 2b): built once when native tools are active,
+   inserted into the sampler chain, and reset before each generation (it is lazy
+   and stateful — without a reset it would carry a prior turn's trigger state).
+   NULL when the model's format has no tool grammar or tools are inactive. */
+static struct llama_sampler *g_tool_grammar = NULL;
+
 static void sigint_handler(int sig) {
     (void)sig;
     generation_interrupted = 1;
@@ -2239,6 +2245,9 @@ static void run_agentic_turn(char *user_input,
                 prompt_len = (size_t)rl;
             }
 
+            /* Reset the lazy tool grammar so this generation starts fresh — no
+               trigger state carried over from the previous tool round. */
+            if (g_tool_grammar) llama_sampler_reset(g_tool_grammar);
             generation_interrupted = 0;
             setup_sigint_handler();
             GenerateResult result = generate(ctx, vocab, smpl, prompt, prompt_len);
@@ -2401,6 +2410,7 @@ static void run_agentic_turn(char *user_input,
         if (tool_iterations >= max_tool_iterations) {
             printf("\033[90m[Generating answer...]\033[0m\n");
             fflush(stdout);
+            if (g_tool_grammar) llama_sampler_reset(g_tool_grammar);
             generation_interrupted = 0;
             setup_sigint_handler();
             GenerateResult final_result = generate(ctx, vocab, smpl, prompt, prompt_len);
@@ -2627,9 +2637,14 @@ int main(int argc, char **argv) {
         if (rp) { float v = (float)atof(rp); if (v >= 1.0f && v <= 2.0f) repeat_pen = v; }
     }
     llama_sampler_chain_add(smpl, llama_sampler_init_penalties(256, repeat_pen, 0.0f, 0.0f));
-    llama_sampler_chain_add(smpl, llama_sampler_init_min_p(0.05f, 1));
-    llama_sampler_chain_add(smpl, llama_sampler_init_temp(temp_override >= 0 ? temp_override : 0.4f));
-    llama_sampler_chain_add(smpl, llama_sampler_init_dist(cli_seed));
+    /* The rest of the chain (min_p → temp → dist) is appended by SAMPLER_TAIL
+       below, AFTER the tool-call grammar (when native tools are active) so the
+       grammar masks invalid tokens before min_p/temp narrow the set. */
+    #define SAMPLER_TAIL() do { \
+        llama_sampler_chain_add(smpl, llama_sampler_init_min_p(0.05f, 1)); \
+        llama_sampler_chain_add(smpl, llama_sampler_init_temp(temp_override >= 0 ? temp_override : 0.4f)); \
+        llama_sampler_chain_add(smpl, llama_sampler_init_dist(cli_seed)); \
+    } while (0)
 
     if (!no_tools && !oneshot_prompt) {
         printf("Model loaded. Type your message (empty line to quit).\n\n");
@@ -2675,6 +2690,7 @@ int main(int argc, char **argv) {
             goto cleanup;
         }
 
+        SAMPLER_TAIL();       /* --no-tools: no grammar, just finish the chain */
         generate_quiet = 1;  /* suppress streaming/decoration; we print result.text */
         GenerateResult r = generate(ctx, vocab, smpl, buf, (size_t)len);
         printf("%s\n", r.text ? r.text : "");
@@ -2699,6 +2715,24 @@ int main(int argc, char **argv) {
     printf("\033[90m[Compaction: %s]\033[0m\n", compact_mode_name(compact_mode));
     fflush(stdout);
     if (!native_tools) basi_set_tools(NULL, 0);   /* don't advertise tools the model can't format */
+
+    /* Phase 2b: constrain decoding to valid tool-call JSON when the model speaks
+       native function-calling. Stops a small model drifting off-format after a
+       few rounds (emitting malformed <tool_call> the PEG parser rejects, which
+       ends the agentic loop). The grammar is LAZY — free text and thinking are
+       unaffected; it only forces valid JSON once a tool call begins. Inserted
+       into the chain BEFORE the min_p/temp/dist tail so it masks first. */
+    if (native_tools) {
+        g_tool_grammar = basi_tool_grammar_sampler(model);
+        if (g_tool_grammar) {
+            llama_sampler_chain_add(smpl, g_tool_grammar);
+            printf("\033[90m[Tool grammar: constrained decoding active]\033[0m\n");
+        } else {
+            printf("\033[90m[Tool grammar: none for this format — unconstrained]\033[0m\n");
+        }
+        fflush(stdout);
+    }
+    SAMPLER_TAIL();
 
     /* The date is injected per-turn (see the REPL loop) so it stays fresh on
        long-lived / resumed sessions, not stamped once here. */

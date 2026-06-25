@@ -12,6 +12,7 @@
 
 #include "llama.h"
 #include "chat.h"          // llama.cpp common/chat.h (common_chat_*)
+#include "common.h"        // regex_escape, common_grammar_trigger
 #include "nlohmann/json.hpp"
 #include "chat_tmpl.h"
 
@@ -136,6 +137,78 @@ extern "C" int basi_parse_tool_calls(const char *text, BasiToolCall **out) {
         return n;
     } catch (...) {
         return 0;   // malformed call → treated as a plain answer (2b grammar prevents this)
+    }
+}
+
+// Phase 2b — tool-call grammar. common_chat already DERIVES a GBNF grammar that
+// constrains the model's output to a valid tool call (chat.h: "incl. tool call
+// grammar constraining"); without it a small model drifts off-format after a few
+// rounds, emits malformed <tool_call> JSON, and the PEG parser rejects it. Build
+// the matching llama grammar sampler so decoding is constrained. The grammar is
+// determined by the tool set + format (session-constant), so a single probe
+// render yields it. Mirrors the trigger conversion in common/sampling.cpp. The
+// grammar is LAZY: it stays inactive until a trigger (e.g. "<tool_call>") so the
+// model can still think and answer freely; it only forces valid JSON once a call
+// begins. Returns a sampler the caller adds to its chain (and must reset between
+// generations), or NULL when this format has no grammar / on any error.
+extern "C" struct llama_sampler *basi_tool_grammar_sampler(const struct llama_model *model) {
+    if (g_tools.empty() || !model) return nullptr;
+    try {
+        if (!ensure_tmpls(model)) return nullptr;
+        llama_chat_message probe[1] = { { "user", "hi" } };
+        common_chat_templates_inputs in = make_inputs(probe, 1, true);
+        common_chat_params params = common_chat_templates_apply(g_tmpls.get(), in);
+        const std::string &grammar = params.grammar;
+        if (grammar.empty()) return nullptr;
+        if (grammar.compare(0, 11, "%llguidance") == 0) return nullptr;  // not built here
+        const llama_vocab *vocab = llama_model_get_vocab(model);
+        if (!vocab) return nullptr;
+
+        std::vector<std::string> trigger_patterns;
+        std::vector<llama_token> trigger_tokens;
+        for (const auto &trigger : params.grammar_triggers) {
+            switch (trigger.type) {
+                case COMMON_GRAMMAR_TRIGGER_TYPE_WORD:
+                    trigger_patterns.push_back(regex_escape(trigger.value));
+                    break;
+                case COMMON_GRAMMAR_TRIGGER_TYPE_PATTERN:
+                    trigger_patterns.push_back(trigger.value);
+                    break;
+                case COMMON_GRAMMAR_TRIGGER_TYPE_PATTERN_FULL: {
+                    const auto &p = trigger.value;
+                    std::string anchored = "^$";
+                    if (!p.empty())
+                        anchored = (p.front() != '^' ? "^" : "") + p + (p.back() != '$' ? "$" : "");
+                    trigger_patterns.push_back(anchored);
+                    break;
+                }
+                case COMMON_GRAMMAR_TRIGGER_TYPE_TOKEN:
+                    trigger_tokens.push_back(trigger.token);
+                    break;
+                default:
+                    break;
+            }
+        }
+        std::vector<const char *> pats;
+        pats.reserve(trigger_patterns.size());
+        for (const auto &r : trigger_patterns) pats.push_back(r.c_str());
+
+        struct llama_sampler *g;
+        if (params.grammar_lazy) {
+            g = llama_sampler_init_grammar_lazy_patterns(
+                    vocab, grammar.c_str(), "root",
+                    pats.data(), pats.size(),
+                    trigger_tokens.data(), trigger_tokens.size());
+        } else {
+            g = llama_sampler_init_grammar(vocab, grammar.c_str(), "root");
+        }
+        if (getenv("BASI_DEBUG_GRAMMAR"))
+            fprintf(stderr, "[grammar] format=%s lazy=%d patterns=%zu tokens=%zu bytes=%zu\n",
+                    common_chat_format_name(params.format), (int)params.grammar_lazy,
+                    trigger_patterns.size(), trigger_tokens.size(), grammar.size());
+        return g;
+    } catch (...) {
+        return nullptr;
     }
 }
 
