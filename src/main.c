@@ -1153,6 +1153,42 @@ static void repl_add_message(struct llama_chat_message **messages,
     (*msg_count)++;
 }
 
+/* ── Context-window occupancy tracking ─────────────────────────────────
+ * The EXACT number of KV cells currently filled for the conversation
+ * sequence. With llama.cpp we own the cache, so this is ground truth — not
+ * the chars/4 estimate a provider-API harness is forced to use. Returns 0
+ * when the cache is empty (seq_pos_max returns -1 before the first decode).
+ * This measures live context OCCUPANCY (what decides the context limit),
+ * which is distinct from the cumulative session token counts /cost reports
+ * (those measure throughput across the whole session). */
+static int context_used_tokens(struct llama_context *ctx) {
+    llama_pos m = llama_memory_seq_pos_max(llama_get_memory(ctx), 0);
+    return m < 0 ? 0 : (int)m + 1;
+}
+
+/* Compact human token count: "830", "12.3k", "131k". */
+static void fmt_token_count(char *buf, size_t n, int t) {
+    if (t < 1000)        snprintf(buf, n, "%d", t);
+    else if (t < 10000)  snprintf(buf, n, "%.1fk", t / 1000.0);
+    else                 snprintf(buf, n, "%dk", (t + 500) / 1000);
+}
+
+/* Format a colour-graded "ctx 12.3k/32k 38%" gauge into `out`. The denominator
+ * is llama_n_ctx(ctx) — the context the model was ACTUALLY loaded with, which
+ * may be smaller than the requested CONTEXT_SIZE if the load OOM-retry halved
+ * it. Colour is the at-a-glance warning: green < 70%, amber 70-89%, red >= 90%.
+ * Trailing reset returns to the caller's dim style. */
+static void format_context_meter(struct llama_context *ctx, char *out, size_t n) {
+    int used  = context_used_tokens(ctx);
+    int total = (int)llama_n_ctx(ctx);
+    int pct   = total > 0 ? (int)((100.0 * used) / total) : 0;
+    char u[16], t[16];
+    fmt_token_count(u, sizeof u, used);
+    fmt_token_count(t, sizeof t, total);
+    const char *col = pct >= 90 ? "\033[31m" : (pct >= 70 ? "\033[33m" : "\033[32m");
+    snprintf(out, n, "%sctx %s/%s %d%%\033[90m", col, u, t, pct);
+}
+
 /* ── Main ──────────────────────────────────────────────────────────── */
 
 
@@ -1218,6 +1254,11 @@ static void handle_slash_command(char *user_input,
                 printf("\033[90m[Session: %zu prompt tokens, %zu generated tokens, %zu total]\033[0m\n",
                        session_prompt_tokens, session_gen_tokens,
                        session_prompt_tokens + session_gen_tokens);
+                int used  = context_used_tokens(ctx);
+                int total = (int)llama_n_ctx(ctx);
+                int pct   = total > 0 ? (int)((100.0 * used) / total) : 0;
+                printf("\033[90m[Context: %d/%d tokens in window (%d%%), %d free]\033[0m\n",
+                       used, total, pct, total - used);
                 fflush(stdout);
                 free(user_input);
                 return;
@@ -1612,8 +1653,10 @@ static void run_agentic_turn(char *user_input,
                 ? result.prompt_tokens / result.prompt_time_s : 0;
             double gen_tps = result.gen_time_s > 0
                 ? result.gen_tokens / result.gen_time_s : 0;
-            printf("\033[90m[ Prompt: %.1f t/s | Generation: %.1f t/s ]\033[0m\n",
-                   prompt_tps, gen_tps);
+            char meter[80];
+            format_context_meter(ctx, meter, sizeof meter);
+            printf("\033[90m[ Prompt: %.1f t/s | Generation: %.1f t/s | %s ]\033[0m\n",
+                   prompt_tps, gen_tps, meter);
             fflush(stdout);
 
             /* Detect a tool call: native function-calling if the model's
@@ -1768,7 +1811,9 @@ static void run_agentic_turn(char *user_input,
 
             double gen_tps = final_result.gen_time_s > 0
                 ? final_result.gen_tokens / final_result.gen_time_s : 0;
-            printf("\033[90m[ Generation: %.1f t/s ]\033[0m\n", gen_tps);
+            char meter[80];
+            format_context_meter(ctx, meter, sizeof meter);
+            printf("\033[90m[ Generation: %.1f t/s | %s ]\033[0m\n", gen_tps, meter);
             fflush(stdout);
 
             ADD_MESSAGE("assistant", final_result.text);
