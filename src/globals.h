@@ -25,6 +25,21 @@ typedef enum {
 extern PermissionMode permission_mode;
 const char *perm_mode_name(PermissionMode m);
 
+/* Context-compaction strategy (Phase 4 experiment; set via BASI_COMPACT env).
+ * summary  = anchored LLM summary of dropped turns (default; Phase 2)
+ * retrieve = embed dropped turns into a vector index, inject top-k per query
+ *            (model-agnostic — no LLM summary call)
+ * hybrid   = summary (gist) + retrieval (exact facts)
+ * off      = drop oldest turns with no memory (Phase 1 baseline) */
+typedef enum {
+    COMPACT_OFF,
+    COMPACT_SUMMARY,
+    COMPACT_RETRIEVE,
+    COMPACT_HYBRID
+} CompactMode;
+extern CompactMode compact_mode;
+const char *compact_mode_name(CompactMode m);
+
 /* Plan-mode phase machine (Decision #5 in .basi/plans/knowledge-base.md).
  * Replaces the legacy bool flag. PHASE_NONE means no plan in progress. */
 typedef enum {

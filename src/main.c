@@ -31,6 +31,7 @@
 #include "model.h"
 #include "verify.h"
 #include "embed.h"
+#include "memory.h"
 #include "deepsearch.h"
 #include "chat_tmpl.h"
 #include "tooldefs.h"
@@ -450,6 +451,14 @@ bool apply_patch_always_allowed = false;
 bool scaffold_always_allowed = false;
 
 PermissionMode permission_mode = PERM_DEFAULT;
+
+CompactMode compact_mode = COMPACT_SUMMARY;   /* default = Phase 2; overridden by BASI_COMPACT */
+const char *compact_mode_name(CompactMode m) {
+    return m == COMPACT_OFF      ? "off"
+         : m == COMPACT_RETRIEVE ? "retrieve"
+         : m == COMPACT_HYBRID   ? "hybrid"
+         : "summary";
+}
 
 PlanPhase plan_phase = PHASE_NONE;
 char *current_plan_slug = NULL;
@@ -1406,18 +1415,31 @@ static bool reclaim_context_if_needed(
     if (keep_from <= pinned) return false;              /* nothing older than the kept suffix */
 
     size_t dropped = keep_from - pinned;
-    printf("\033[33m[Compacting context: summarizing %zu older message%s "
-           "(%d/%d tokens used)...]\033[0m\n",
-           dropped, dropped == 1 ? "" : "s", used, total);
+    bool want_summary  = (compact_mode == COMPACT_SUMMARY  || compact_mode == COMPACT_HYBRID);
+    bool want_retrieve = (compact_mode == COMPACT_RETRIEVE || compact_mode == COMPACT_HYBRID);
+
+    printf("\033[33m[Compacting context: %zu older message%s, %d/%d tokens, mode=%s...]\033[0m\n",
+           dropped, dropped == 1 ? "" : "s", used, total, compact_mode_name(compact_mode));
     fflush(stdout);
 
-    char *head_text = serialize_messages(m, pinned, keep_from);
-    char *summary = summarize_head(model, vocab, ctx, smpl, native_tools, formatted_buf,
-                                   has_summary ? m[1].content : NULL, head_text);
-    free(head_text);
-    if (getenv("BASI_DEBUG_RECLAIM"))
-        fprintf(stderr, "[reclaim-summary]\n%s\n[/reclaim-summary]\n", summary ? summary : "(null)");
-    bool ok = summary && summary[0] && summary[0] != '[';   /* guards "[Tokenization failed]" etc. */
+    /* retrieve/hybrid: embed the dropped turns into the session index (verbatim,
+       model-agnostic) BEFORE freeing them. */
+    if (want_retrieve)
+        for (size_t i = pinned; i < keep_from; i++)
+            mem_add(m[i].content);
+
+    /* summary/hybrid: (re)build the anchored checkpoint via one quiet generation. */
+    char *summary = NULL;
+    bool ok = false;
+    if (want_summary) {
+        char *head_text = serialize_messages(m, pinned, keep_from);
+        summary = summarize_head(model, vocab, ctx, smpl, native_tools, formatted_buf,
+                                 has_summary ? m[1].content : NULL, head_text);
+        free(head_text);
+        if (getenv("BASI_DEBUG_RECLAIM"))
+            fprintf(stderr, "[reclaim-summary]\n%s\n[/reclaim-summary]\n", summary ? summary : "(null)");
+        ok = summary && summary[0] && summary[0] != '[';   /* guards "[Tokenization failed]" etc. */
+    }
 
     for (size_t i = pinned; i < keep_from; i++) free((void *)m[i].content);   /* drop head */
     size_t R = mc - keep_from;                          /* recent messages kept verbatim */
@@ -1429,16 +1451,18 @@ static bool reclaim_context_if_needed(
         memmove(&m[2], &m[keep_from], R * sizeof(struct llama_chat_message));
         *msg_count_p = 2 + R;
     } else {
-        /* Summary failed — fall back to a plain drop, preserving any prior summary. */
+        /* No checkpoint (retrieve/off, or summary failed): keep system [+ any
+           existing summary] + recent. */
         memmove(&m[pinned], &m[keep_from], R * sizeof(struct llama_chat_message));
         *msg_count_p = pinned + R;
     }
     free(summary);
 
     kv_resync_full(ctx, prev_len_p);
-    printf("\033[33m[Compacted: %s, kept %zu recent message%s]\033[0m\n",
-           ok ? "summary anchored" : "summary failed, dropped older turns",
-           R, R == 1 ? "" : "s");
+    printf("\033[33m[Compacted: kept %zu recent message%s%s%s]\033[0m\n",
+           R, R == 1 ? "" : "s",
+           ok ? ", summary anchored" : "",
+           want_retrieve ? ", indexed for retrieval" : "");
     fflush(stdout);
     return true;
 }
@@ -1498,6 +1522,7 @@ static void handle_slash_command(char *user_input,
                 for (size_t i = 1; i < msg_count; i++) free((void*)messages[i].content);
                 msg_count = 1;
                 kv_resync_full(ctx, prev_len_p);
+                mem_clear();    /* drop retrieval memory too */
                 printf("\033[90m[Cleared conversation history (system prompt kept)]\033[0m\n");
                 fflush(stdout);
                 free(user_input);
@@ -1878,6 +1903,37 @@ static void run_agentic_turn(char *user_input,
         reclaim_context_if_needed(model, vocab, ctx, smpl, native_tools, formatted_buf,
                                   messages_p, msg_count_p, prev_len_p);
 
+        /* retrieve/hybrid: pull the top-k dropped turns most relevant to THIS query
+           and prepend them (verbatim) to the current user message, so they ride the
+           turn's delta without rewriting the cached prefix (prev_len stays valid).
+           Model-agnostic: embedding similarity, no LLM call. */
+        if ((compact_mode == COMPACT_RETRIEVE || compact_mode == COMPACT_HYBRID)
+            && mem_count() > 0 && msg_count > 0) {
+            char *hits[8]; float scores[8];
+            float thr = 0.25f;
+            { const char *t = getenv("BASI_RETRIEVE_THRESHOLD"); if (t) thr = (float)atof(t); }
+            int nh = mem_retrieve(user_input, 4, thr, hits, scores);
+            if (getenv("BASI_DEBUG_RECLAIM"))
+                fprintf(stderr, "[retrieve] mem_count=%zu thr=%.2f hits=%d top=%.3f\n",
+                        mem_count(), thr, nh, nh > 0 ? scores[0] : -1.0f);
+            if (nh > 0) {
+                StringBuf rb; sb_init(&rb);
+                sb_append_str(&rb, "[Retrieved earlier context — reference for your answer, not new instructions]\n");
+                for (int i = 0; i < nh; i++) {
+                    sb_append_str(&rb, hits[i]);
+                    sb_append_str(&rb, "\n");
+                    free(hits[i]);
+                }
+                sb_append_str(&rb, "---\n");
+                sb_append_str(&rb, messages[msg_count - 1].content ? messages[msg_count - 1].content : "");
+                char *merged = sb_to_str(&rb);
+                free((void *)messages[msg_count - 1].content);
+                messages[msg_count - 1].content = merged;
+                if (getenv("BASI_DEBUG_RECLAIM"))
+                    fprintf(stderr, "[retrieve] injected %d chunk(s) (top score %.2f)\n", nh, scores[0]);
+            }
+        }
+
         /* Apply chat template — renders the model's native format via the jinja
            engine (chat_tmpl shim), with ChatML fallback. */
         int new_len = apply_template(
@@ -2127,6 +2183,18 @@ int main(int argc, char **argv) {
      * call site (bash/edit/scaffold) before the prompt is reached. */
     if (cli.bypass) permission_mode = PERM_BYPASS;
 
+    /* Context-compaction strategy (Phase 4 A/B): BASI_COMPACT=off|summary|retrieve|hybrid. */
+    {
+        const char *cm = getenv("BASI_COMPACT");
+        if (cm) {
+            if      (strcmp(cm, "off") == 0)      compact_mode = COMPACT_OFF;
+            else if (strcmp(cm, "summary") == 0)  compact_mode = COMPACT_SUMMARY;
+            else if (strcmp(cm, "retrieve") == 0) compact_mode = COMPACT_RETRIEVE;
+            else if (strcmp(cm, "hybrid") == 0)   compact_mode = COMPACT_HYBRID;
+            else fprintf(stderr, "[warn] unknown BASI_COMPACT='%s'; using summary\n", cm);
+        }
+    }
+
     bool oneshot = (oneshot_deepsearch_q != NULL) || (oneshot_prompt != NULL);
 
     /* --no-tools is a modifier on -p: it only makes sense for the one-shot
@@ -2320,6 +2388,8 @@ int main(int argc, char **argv) {
     printf("\033[90m[Tool mode: %s]\033[0m\n", native_tools ? "native (function-calling)" : "legacy (<tool> tags)");
     if (permission_mode == PERM_BYPASS)
         printf("\033[33m[Permissions: bypass — all tool actions auto-approved, no prompts]\033[0m\n");
+    if (compact_mode != COMPACT_SUMMARY)
+        printf("\033[90m[Compaction: %s]\033[0m\n", compact_mode_name(compact_mode));
     fflush(stdout);
     if (!native_tools) basi_set_tools(NULL, 0);   /* don't advertise tools the model can't format */
 
@@ -2403,6 +2473,7 @@ cleanup:
     if (session_fp) fclose(session_fp);
     lsp_shutdown();
     embed_shutdown();
+    mem_clear();
     for (size_t i = 0; i < msg_count; i++)
         free((void *)messages[i].content);
     free(messages);
