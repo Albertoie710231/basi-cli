@@ -208,6 +208,10 @@ GenerateResult generate(
             is_prompt_phase = false;
         }
 
+        /* Tick the pinned status bar so its ctx meter climbs live as the KV
+           fills (throttled internally; no-op when the bar is inactive/quiet). */
+        if (!generate_quiet) statusbar_tick();
+
         llama_token new_token = llama_sampler_sample(smpl, ctx, -1);
 
         if (llama_vocab_is_eog(vocab, new_token)) {

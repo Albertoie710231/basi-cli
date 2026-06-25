@@ -16,6 +16,7 @@
 #include <stdarg.h>
 #include <limits.h>
 #include <sys/utsname.h>
+#include <sys/ioctl.h>
 
 #include "llama.h"
 
@@ -1223,6 +1224,258 @@ static void format_context_meter(struct llama_context *ctx, char *out, size_t n)
     snprintf(out, n, "%sctx %s/%s %d%%\033[90m", col, u, t, pct);
 }
 
+/* ── Sticky status bar ─────────────────────────────────────────────────
+ * An opencode/Hermes-style bar pinned to the terminal's bottom row, always
+ * visible — including while a generation streams above it. The mechanism is a
+ * DECSTBM scroll region: we reserve the last physical row by confining all
+ * normal output to rows 1..R-1, so newlines scroll only the region and row R
+ * stays put. The bar is repainted (save-cursor → jump to row R → write →
+ * restore-cursor) on demand, so it never disturbs the cursor of whatever is
+ * printing above it.
+ *
+ * This is display-only and strictly opt-in to a real TTY: it never enables on a
+ * pipe (the benchmarks) and fully tears the region down around any screen
+ * takeover ($EDITOR), on exit (atexit), and on a terminating signal — leaving a
+ * stranded scroll region is the one failure that outlives the process. */
+static struct {
+    bool   active;
+    bool   suspended;          /* torn down for a shell-out, resume afterwards */
+    bool   hooks_installed;    /* atexit + signal handlers registered once */
+    int    rows, cols;
+    struct llama_context *ctx; /* for the live ctx meter */
+    char   model_tag[32];
+} g_bar = {0};
+
+static volatile sig_atomic_t g_bar_winch = 0;
+static void statusbar_on_winch(int sig) { (void)sig; g_bar_winch = 1; }
+
+static void statusbar_query_size(void) {
+    struct winsize ws;
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_row > 0 && ws.ws_col > 0) {
+        g_bar.rows = ws.ws_row;
+        g_bar.cols = ws.ws_col;
+    } else {
+        g_bar.rows = 24;
+        g_bar.cols = 80;
+    }
+}
+
+/* Build the bar text: a dark background filled to the full width, with fields
+ * appended in priority order (ctx meter first, model tag last) and dropped if
+ * they would overflow — so a narrow terminal degrades gracefully instead of
+ * wrapping (a wrap would push a phantom line and break the pinned layout). */
+static void statusbar_compose(char *out, size_t outsz) {
+    int cols = g_bar.cols > 0 ? g_bar.cols : 80;
+    if (cols < 8)   cols = 8;
+    if (cols > 400) cols = 400;
+    const int budget = cols - 1;          /* leave the last column to avoid auto-wrap */
+
+    char inner[512];
+    size_t off = 0;
+    int    vis = 1;                        /* the leading bg space below */
+    bool   first = true;
+
+    #define BAR_SEP() do { \
+        if (!first && vis + 3 <= budget) { \
+            off += snprintf(inner + off, sizeof inner - off, "\033[38;5;240m \xc2\xb7 "); \
+            vis += 3; } \
+        first = false; \
+    } while (0)
+
+    /* ctx meter — always shown, colour-graded like the footer */
+    {
+        int used  = context_used_tokens(g_bar.ctx);
+        int total = (int)llama_n_ctx(g_bar.ctx);
+        int pct   = total > 0 ? (int)((100.0 * used) / total) : 0;
+        char u[16], t[16];
+        fmt_token_count(u, sizeof u, used);
+        fmt_token_count(t, sizeof t, total);
+        const char *cc = pct >= 90 ? "\033[38;5;167m"
+                       : (pct >= 70 ? "\033[38;5;179m" : "\033[38;5;71m");
+        char plain[48];
+        int vlen = snprintf(plain, sizeof plain, "ctx %d%% %s/%s", pct, u, t);
+        if (vis + vlen <= budget) {
+            off += snprintf(inner + off, sizeof inner - off,
+                            "\033[38;5;245mctx %s%d%%\033[38;5;245m %s/%s", cc, pct, u, t);
+            vis += vlen;
+            first = false;
+        }
+    }
+
+    /* permission mode — only when not the safe default (a standing reminder) */
+    if (permission_mode != PERM_DEFAULT) {
+        const char *nm = perm_mode_name(permission_mode);
+        const char *cc = permission_mode == PERM_BYPASS ? "\033[1;38;5;203m"
+                                                        : "\033[38;5;179m";
+        int vlen = (int)strlen(nm);
+        BAR_SEP();
+        if (vis + vlen <= budget) {
+            off += snprintf(inner + off, sizeof inner - off, "%s%s", cc, nm);
+            vis += vlen;
+        }
+    }
+
+    /* memory index size — only meaningful while retrieval is the active mode */
+    if (compact_mode == COMPACT_RETRIEVE || compact_mode == COMPACT_HYBRID) {
+        size_t mc = mem_count();
+        if (mc > 0) {
+            char plain[32];
+            int vlen = snprintf(plain, sizeof plain, "mem %zu", mc);
+            BAR_SEP();
+            if (vis + vlen <= budget) {
+                off += snprintf(inner + off, sizeof inner - off, "\033[38;5;108mmem %zu", mc);
+                vis += vlen;
+            }
+        }
+    }
+
+    /* model tag — lowest priority, first to drop on a narrow terminal */
+    if (g_bar.model_tag[0]) {
+        int vlen = (int)strlen(g_bar.model_tag);
+        BAR_SEP();
+        if (vis + vlen <= budget) {
+            off += snprintf(inner + off, sizeof inner - off,
+                            "\033[38;5;110m%s", g_bar.model_tag);
+            vis += vlen;
+        }
+    }
+    #undef BAR_SEP
+
+    /* assemble: bg, a leading space, the fields, padding to full width, reset */
+    int pad = budget - vis;
+    if (pad < 0) pad = 0;
+    size_t o = 0;
+    o += snprintf(out + o, outsz - o, "\033[48;5;236m ");
+    if (o + off < outsz) { memcpy(out + o, inner, off); o += off; }
+    while (pad-- > 0 && o + 8 < outsz) out[o++] = ' ';
+    o += snprintf(out + o, outsz - o, "\033[0m");
+    out[o] = '\0';
+}
+
+static void statusbar_draw(void) {
+    if (!g_bar.active) return;
+    if (g_bar_winch) {                     /* terminal resized: re-reserve the row */
+        g_bar_winch = 0;
+        statusbar_query_size();
+        printf("\033[1;%dr", g_bar.rows - 1);
+    }
+    char bar[1280];
+    statusbar_compose(bar, sizeof bar);
+    /* DECSC save → jump to status row → clear → write → DECRC restore. DECSC/DECRC
+       also save/restore SGR, so a colour mid-stream above the bar is preserved. */
+    printf("\0337\033[%d;1H\033[2K%s\0338", g_bar.rows, bar);
+    fflush(stdout);
+}
+
+/* Reserve the bottom row and paint the bar. Shared by enable and resume. */
+static void statusbar_setup_terminal(void) {
+    if (!isatty(STDOUT_FILENO) || !isatty(STDIN_FILENO)) return;
+    statusbar_query_size();
+    if (g_bar.rows < 3) return;            /* too short to spare a row */
+    /* Make a blank physical line at the bottom without clobbering content:
+       go to the last row, print newline (scrolls everything up one), then set
+       the scroll region and park the cursor at the bottom of it. */
+    printf("\033[%d;1H\n", g_bar.rows);
+    printf("\033[1;%dr", g_bar.rows - 1);
+    printf("\033[%d;1H", g_bar.rows - 1);
+    g_bar.active = true;
+    statusbar_draw();
+}
+
+/* Async-signal-safe teardown for a terminating signal: reset the scroll region,
+ * show the cursor, restore cooked mode, then re-raise to die normally. Without
+ * this a kill (terminal closed, SIGTERM) would strand the scroll region. */
+static void statusbar_on_fatal(int sig) {
+    static const char reset[] = "\033[r\033[?25h\r\n";
+    ssize_t w = write(STDOUT_FILENO, reset, sizeof reset - 1);
+    (void)w;
+    if (raw_mode_enabled) tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig_termios);
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
+static void statusbar_disable(void) {
+    if (!g_bar.active) return;
+    g_bar.active = false;
+    printf("\033[r");                      /* reset scroll region to full screen */
+    printf("\033[%d;1H\033[2K", g_bar.rows);
+    fflush(stdout);
+}
+
+static void statusbar_atexit(void) { statusbar_disable(); }
+
+static void statusbar_install_hooks(void) {
+    if (g_bar.hooks_installed) return;
+    g_bar.hooks_installed = true;
+    atexit(statusbar_atexit);
+    struct sigaction fa = {0};
+    fa.sa_handler = statusbar_on_fatal;
+    sigaction(SIGTERM, &fa, NULL);
+    sigaction(SIGHUP,  &fa, NULL);
+    sigaction(SIGQUIT, &fa, NULL);
+    struct sigaction wa = {0};
+    wa.sa_handler = statusbar_on_winch;
+    wa.sa_flags   = SA_RESTART;
+    sigaction(SIGWINCH, &wa, NULL);
+}
+
+static void statusbar_enable(struct llama_context *ctx, const char *model_tag) {
+    if (!isatty(STDOUT_FILENO) || !isatty(STDIN_FILENO)) return;
+    g_bar.ctx = ctx;
+    snprintf(g_bar.model_tag, sizeof g_bar.model_tag, "%s", model_tag ? model_tag : "");
+    statusbar_install_hooks();
+    statusbar_setup_terminal();
+}
+
+/* Tear the region down for a full-screen shell-out ($EDITOR); statusbar_resume
+ * re-reserves it afterward. Both no-op if the bar was never active. */
+static void statusbar_suspend(void) {
+    if (!g_bar.active) return;
+    statusbar_disable();
+    g_bar.suspended = true;
+}
+static void statusbar_resume(void) {
+    if (!g_bar.suspended) return;
+    g_bar.suspended = false;
+    statusbar_setup_terminal();
+}
+
+/* Per-token hook from generate(): redraw every 8th call so the pinned ctx meter
+ * climbs live during a long generation without repainting on every token. */
+void statusbar_tick(void) {
+    if (!g_bar.active) return;
+    static unsigned n = 0;
+    if ((++n & 7u) != 0u) return;
+    statusbar_draw();
+}
+
+/* Derive a short, lower-case model tag from the GGUF path: basename, drop the
+ * .gguf suffix and a trailing quant tag (…-Q4_K_M / …-f16 / …-IQ4_XS). */
+static void derive_model_tag(const char *path, char *out, size_t n) {
+    if (!path || !*path) { out[0] = '\0'; return; }
+    const char *base = strrchr(path, '/');
+    base = base ? base + 1 : path;
+    size_t len = strlen(base);
+    if (len >= n) len = n - 1;             /* bounded copy: out is small (32B) */
+    memcpy(out, base, len);
+    out[len] = '\0';
+    char *dot = strstr(out, ".gguf");
+    if (dot) *dot = '\0';
+    /* strip a trailing quant token (…-Q4_K_M / -Q6_K / -IQ4_XS / -f16 / -bf16),
+       requiring a digit so a real suffix like "-base"/"-flash" is left alone. */
+    char *dash = strrchr(out, '-');
+    if (dash) {
+        const char *s = dash + 1;
+        bool is_quant =
+            (s[0] == 'Q' && s[1] >= '0' && s[1] <= '9') ||
+            (s[0] == 'I' && s[1] == 'Q' && s[2] >= '0' && s[2] <= '9') ||
+            strcmp(s, "f16") == 0 || strcmp(s, "bf16") == 0 || strcmp(s, "f32") == 0;
+        if (is_quant) *dash = '\0';
+    }
+    for (char *p = out; *p; p++)
+        if (*p >= 'A' && *p <= 'Z') *p += 32;
+}
+
 /* ── Context reclamation (recent-window compaction) ────────────────────
  * Resync after any mutation of the message history. The delta-prompt scheme
  * feeds only formatted_buf+prev_len each turn, trusting the KV cache to hold the
@@ -1581,9 +1834,11 @@ static void handle_slash_command(char *user_input,
                 char cmd[256];
                 snprintf(cmd, sizeof(cmd), "%s BASI.md", editor);
                 bool was_raw = raw_mode_enabled;
+                statusbar_suspend();          /* give the bottom row back to $EDITOR */
                 if (was_raw) disable_raw_mode();
                 int rc = system(cmd);
                 if (was_raw) enable_raw_mode();
+                statusbar_resume();
                 if (rc != 0) printf("\033[31m[Editor exited with status %d]\033[0m\n", rc);
                 printf("\033[90m[BASI.md edited. Changes apply on next BASI restart.]\033[0m\n");
                 fflush(stdout);
@@ -1672,9 +1927,11 @@ static void handle_slash_command(char *user_input,
                 char cmdbuf[1536];
                 snprintf(cmdbuf, sizeof(cmdbuf), "%s %s", editor, fullpath);
                 bool was_raw = raw_mode_enabled;
+                statusbar_suspend();          /* give the bottom row back to $EDITOR */
                 if (was_raw) disable_raw_mode();
                 int rc = system(cmdbuf);
                 if (was_raw) enable_raw_mode();
+                statusbar_resume();
                 if (rc != 0) printf("\033[31m[Editor exited with status %d]\033[0m\n", rc);
                 else printf("\033[90m[%s edited]\033[0m\n", fullpath);
                 fflush(stdout);
@@ -1974,6 +2231,7 @@ static void run_agentic_turn(char *user_input,
             printf("\033[90m[ Prompt: %.1f t/s | Generation: %.1f t/s | %s ]\033[0m\n",
                    prompt_tps, gen_tps, meter);
             fflush(stdout);
+            statusbar_draw();   /* refresh the pinned ctx meter after this turn */
 
             /* Detect a tool call: native function-calling if the model's
                template supports it, else the legacy <tool> tag. Both resolve
@@ -2131,6 +2389,7 @@ static void run_agentic_turn(char *user_input,
             format_context_meter(ctx, meter, sizeof meter);
             printf("\033[90m[ Generation: %.1f t/s | %s ]\033[0m\n", gen_tps, meter);
             fflush(stdout);
+            statusbar_draw();   /* refresh the pinned ctx meter after this turn */
 
             ADD_MESSAGE("assistant", final_result.text);
             free(final_result.text);
@@ -2448,6 +2707,14 @@ int main(int argc, char **argv) {
     char formatted_buf[FORMATTED_BUF_SZ];
     size_t prev_len = 0;
 
+    /* Sticky status bar: interactive sessions only (no-op on a pipe / -p).
+       Derive a short model tag for the bar; the ctx meter reads `ctx` live. */
+    if (!oneshot_prompt) {
+        char model_tag[32];
+        derive_model_tag(model_path, model_tag, sizeof model_tag);
+        statusbar_enable(ctx, model_tag);
+    }
+
     /* REPL loop (or a single injected turn in -p one-shot mode) */
     bool oneshot_done = false;
     while (1) {
@@ -2457,6 +2724,7 @@ int main(int argc, char **argv) {
             user_input = strdup(oneshot_prompt);
             oneshot_done = true;
         } else {
+            statusbar_draw();   /* freshen the bar at the prompt (decision point) */
             user_input = read_line("\033[32m> \033[0m");
             if (!user_input) break; /* EOF */
             if (user_input[0] == '\0') {
@@ -2482,6 +2750,7 @@ int main(int argc, char **argv) {
 
 cleanup:
     /* Cleanup */
+    statusbar_disable();   /* release the reserved bottom row before we exit */
     if (session_fp) fclose(session_fp);
     lsp_shutdown();
     embed_shutdown();

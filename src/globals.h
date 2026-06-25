@@ -96,4 +96,9 @@ int request_approval(const char *tool_label, const char *cmd);
 void read_tracker_mark(const char *path);
 bool read_tracker_seen(const char *path);
 
+/* Sticky status bar (main.c): throttled redraw, called once per generated token
+ * from generate() so the pinned ctx meter ticks up live during a long
+ * generation. No-op when the bar isn't active (non-TTY, -p, or while quiet). */
+void statusbar_tick(void);
+
 #endif /* BASI_GLOBALS_H */
