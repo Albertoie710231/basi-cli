@@ -2,6 +2,7 @@
 #define BASI_EMBED_H
 
 #include <stddef.h>
+#include <stdbool.h>
 
 /* Lazy-loaded embedding subsystem (step 10 of the knowledge-base milestone).
  *
@@ -20,6 +21,11 @@
 /* One-shot lazy init. 0 on success, -1 on failure (see embed_last_error()).
  * Safe to call repeatedly; subsequent calls are no-ops once loaded. */
 int  embed_init(void);
+
+/* True if an embedding model can be located (BASI_EMBED_MODEL, ~/.cache/llama.cpp,
+ * or the HF hub cache) WITHOUT loading it — a cheap pre-flight so a caller can warn
+ * and fall back before relying on embeddings. Sets embed_last_error() on false. */
+bool embed_available(void);
 
 /* Embedding dimension after init (1024 for Jina v5, 768 for EmbeddingGemma).
  * Returns -1 before init. */

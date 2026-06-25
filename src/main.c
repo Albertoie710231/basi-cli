@@ -452,7 +452,8 @@ bool scaffold_always_allowed = false;
 
 PermissionMode permission_mode = PERM_DEFAULT;
 
-CompactMode compact_mode = COMPACT_SUMMARY;   /* default = Phase 2; overridden by BASI_COMPACT */
+CompactMode compact_mode = COMPACT_RETRIEVE;  /* default; overridden by BASI_COMPACT, and
+                                                 auto-falls-back to summary if no embedder */
 const char *compact_mode_name(CompactMode m) {
     return m == COMPACT_OFF      ? "off"
          : m == COMPACT_RETRIEVE ? "retrieve"
@@ -2194,6 +2195,18 @@ int main(int argc, char **argv) {
             else fprintf(stderr, "[warn] unknown BASI_COMPACT='%s'; using summary\n", cm);
         }
     }
+    /* retrieve/hybrid need the embedder. Check it's findable up front (no load) and
+       fall back to summary with a LOUD warning rather than silently dropping turns
+       with no memory — important now that retrieve is the default. */
+    if ((compact_mode == COMPACT_RETRIEVE || compact_mode == COMPACT_HYBRID)
+        && !embed_available()) {
+        fprintf(stderr,
+            "\033[33m[warn] compaction '%s' needs an embedding model, but none was found:\n"
+            "       %s\n"
+            "       falling back to 'summary'. Set BASI_EMBED_MODEL to enable retrieval.\033[0m\n",
+            compact_mode_name(compact_mode), embed_last_error());
+        compact_mode = COMPACT_SUMMARY;
+    }
 
     bool oneshot = (oneshot_deepsearch_q != NULL) || (oneshot_prompt != NULL);
 
@@ -2388,8 +2401,7 @@ int main(int argc, char **argv) {
     printf("\033[90m[Tool mode: %s]\033[0m\n", native_tools ? "native (function-calling)" : "legacy (<tool> tags)");
     if (permission_mode == PERM_BYPASS)
         printf("\033[33m[Permissions: bypass — all tool actions auto-approved, no prompts]\033[0m\n");
-    if (compact_mode != COMPACT_SUMMARY)
-        printf("\033[90m[Compaction: %s]\033[0m\n", compact_mode_name(compact_mode));
+    printf("\033[90m[Compaction: %s]\033[0m\n", compact_mode_name(compact_mode));
     fflush(stdout);
     if (!native_tools) basi_set_tools(NULL, 0);   /* don't advertise tools the model can't format */
 

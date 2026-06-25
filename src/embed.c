@@ -46,24 +46,86 @@ static enum llama_pooling_type pooling_from_env(void) {
     return LLAMA_POOLING_TYPE_LAST;
 }
 
-/* Path resolution. Returns malloc'd path or NULL (with err set). */
-static bool fname_looks_like_embed(const char *name) {
-    /* Must be .gguf (allow trailing .etag/.tmp partials to be skipped). */
-    size_t n = strlen(name);
-    if (n < 5 || strcmp(name + n - 5, ".gguf") != 0) return false;
-    /* Lowercase substring scan for "embed" / "embedding" / "jina-embed" /
-     * common patterns. We deliberately do NOT match "qwen3-vl" or similar
-     * pure chat-model names. */
+/* Score a model/repo/file name for "embedding-model-ness". Returns -1 if it
+ * doesn't look like an embedder at all, else a preference score (higher = more
+ * likely a good retrieval embedder). Matches on the NAME, so it works for both a
+ * flat file (jina-embeddings-...gguf) and an HF repo dir (models--jinaai--jina-
+ * embeddings-v5-...-retrieval-GGUF) whose inner .gguf filename may lack "embed". */
+static int embed_name_score(const char *name) {
     char low[1024];
-    size_t cn = (n < sizeof(low) - 1) ? n : sizeof(low) - 1;
+    size_t n = strlen(name), cn = (n < sizeof(low) - 1) ? n : sizeof(low) - 1;
     for (size_t i = 0; i < cn; i++) {
         char c = name[i];
         low[i] = (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c;
     }
     low[cn] = '\0';
-    return strstr(low, "embed") != NULL;
+    bool embedish = strstr(low, "embed") || strstr(low, "jina") || strstr(low, "bge") ||
+                    strstr(low, "gte")   || strstr(low, "nomic") || strstr(low, "minilm");
+    if (!embedish) return -1;
+    int s = 0;
+    if (strstr(low, "jina"))      s += 4;
+    if (strstr(low, "embed"))     s += 3;
+    if (strstr(low, "retrieval")) s += 2;
+    if (strstr(low, "bge") || strstr(low, "gte") || strstr(low, "nomic")) s += 2;
+    if (strstr(low, "qwen3"))     s += 2;
+    if (strstr(low, "v5"))        s += 1;
+    if (strstr(low, "gemma"))     s += 1;
+    return s;
 }
 
+/* Find a .gguf inside an HF repo dir's snapshots/<hash>/ (preferring Q4_K_M).
+ * Returns malloc'd absolute path or NULL. */
+static char *find_gguf_in_snapshots(const char *repo_dir) {
+    char snap[1400];
+    if ((size_t)snprintf(snap, sizeof(snap), "%s/snapshots", repo_dir) >= sizeof(snap)) return NULL;
+    DIR *sd = opendir(snap);
+    if (!sd) return NULL;
+    char *found = NULL;
+    bool found_q4 = false;
+    struct dirent *se;
+    while ((se = readdir(sd)) != NULL && !found_q4) {
+        if (se->d_name[0] == '.') continue;
+        char hashdir[1700];
+        if ((size_t)snprintf(hashdir, sizeof(hashdir), "%s/%s", snap, se->d_name) >= sizeof(hashdir)) continue;
+        DIR *hd = opendir(hashdir);
+        if (!hd) continue;
+        struct dirent *fe;
+        while ((fe = readdir(hd)) != NULL) {
+            size_t fn = strlen(fe->d_name);
+            if (fn < 5 || strcmp(fe->d_name + fn - 5, ".gguf") != 0) continue;
+            char full[2000];
+            if ((size_t)snprintf(full, sizeof(full), "%s/%s", hashdir, fe->d_name) >= sizeof(full)) continue;
+            bool q4 = strstr(fe->d_name, "Q4_K_M") || strstr(fe->d_name, "q4_k_m");
+            if (q4) { free(found); found = strdup(full); found_q4 = true; break; }
+            if (!found) found = strdup(full);
+        }
+        closedir(hd);
+    }
+    closedir(sd);
+    return found;
+}
+
+/* Scan a flat dir of .gguf files; update the best/best_score pair for embed-looking ones. */
+static void scan_flat_dir(const char *dir, char **best, int *best_score) {
+    DIR *d = opendir(dir);
+    if (!d) return;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        if (de->d_name[0] == '.') continue;
+        size_t fn = strlen(de->d_name);
+        if (fn < 5 || strcmp(de->d_name + fn - 5, ".gguf") != 0) continue;
+        int score = embed_name_score(de->d_name);
+        if (score < 0 || score <= *best_score) continue;
+        char full[1280];
+        if ((size_t)snprintf(full, sizeof(full), "%s/%s", dir, de->d_name) >= sizeof(full)) continue;
+        free(*best); *best = strdup(full); *best_score = score;
+    }
+    closedir(d);
+}
+
+/* Path resolution: BASI_EMBED_MODEL override, then ~/.cache/llama.cpp (flat),
+ * then the HF hub cache under ~/.cache/huggingface/hub (a models-- repo dir, then
+ * its snapshots subtree). Returns malloc'd path or NULL (with err set). */
 static char *resolve_embed_model_path(void) {
     const char *override = getenv("BASI_EMBED_MODEL");
     if (override && *override) {
@@ -77,58 +139,46 @@ static char *resolve_embed_model_path(void) {
 
     const char *home = getenv("HOME");
     if (!home || !*home) {
-        set_err("HOME is not set; cannot locate embedding model. "
-                "Set BASI_EMBED_MODEL to a GGUF path.");
+        set_err("HOME is not set; cannot locate embedding model. Set BASI_EMBED_MODEL.");
         return NULL;
     }
-    char dir[1024];
-    if ((size_t)snprintf(dir, sizeof(dir), "%s/.cache/llama.cpp", home) >= sizeof(dir)) {
-        set_err("HOME path too long");
-        return NULL;
-    }
-    DIR *d = opendir(dir);
-    if (!d) {
-        set_err("no embedding model: %s does not exist. "
-                "Download with: llama-embedding -hf jinaai/jina-embeddings-v5-text-small-retrieval-GGUF:Q4_K_M -p test",
-                dir);
-        return NULL;
-    }
-    /* Two-pass: first look for "jina-embed" specifically; then any "embed". */
+
     char *best = NULL;
     int   best_score = -1;
-    struct dirent *de;
-    while ((de = readdir(d)) != NULL) {
-        if (de->d_name[0] == '.') continue;
-        if (!fname_looks_like_embed(de->d_name)) continue;
-        int score = 0;
-        char low[1024];
-        size_t n = strlen(de->d_name);
-        size_t cn = (n < sizeof(low) - 1) ? n : sizeof(low) - 1;
-        for (size_t i = 0; i < cn; i++) {
-            char c = de->d_name[i];
-            low[i] = (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c;
-        }
-        low[cn] = '\0';
-        if (strstr(low, "jina"))      score += 4;
-        if (strstr(low, "retrieval")) score += 2;
-        if (strstr(low, "v5"))        score += 1;
-        if (strstr(low, "qwen3"))     score += 2;
-        if (strstr(low, "gemma"))     score += 1;
-        if (score > best_score) {
-            best_score = score;
-            free(best);
-            char full[1280];
-            snprintf(full, sizeof(full), "%s/%s", dir, de->d_name);
-            best = strdup(full);
+
+    char dir[1024];
+    if ((size_t)snprintf(dir, sizeof(dir), "%s/.cache/llama.cpp", home) < sizeof(dir))
+        scan_flat_dir(dir, &best, &best_score);
+
+    char hub[1024];
+    if ((size_t)snprintf(hub, sizeof(hub), "%s/.cache/huggingface/hub", home) < sizeof(hub)) {
+        DIR *hd = opendir(hub);
+        if (hd) {
+            struct dirent *re;
+            while ((re = readdir(hd)) != NULL) {
+                if (strncmp(re->d_name, "models--", 8) != 0) continue;
+                int score = embed_name_score(re->d_name);
+                if (score < 0 || score <= best_score) continue;
+                char repodir[1300];
+                if ((size_t)snprintf(repodir, sizeof(repodir), "%s/%s", hub, re->d_name) >= sizeof(repodir)) continue;
+                char *gguf = find_gguf_in_snapshots(repodir);
+                if (gguf) { free(best); best = gguf; best_score = score; }
+            }
+            closedir(hd);
         }
     }
-    closedir(d);
-    if (!best) {
-        set_err("no embedding model in %s. Download one (recommended: "
-                "jinaai/jina-embeddings-v5-text-small-retrieval-GGUF:Q4_K_M, "
-                "~397 MB) or set BASI_EMBED_MODEL.", dir);
-    }
+
+    if (!best)
+        set_err("no embedding model found in ~/.cache/llama.cpp or ~/.cache/huggingface/hub. "
+                "Set BASI_EMBED_MODEL=<path.gguf>, or download e.g. "
+                "jinaai/jina-embeddings-v5-text-small-retrieval-GGUF:Q4_K_M.");
     return best;
+}
+
+bool embed_available(void) {
+    char *p = resolve_embed_model_path();
+    if (p) { free(p); return true; }
+    return false;   /* embed_last_error() set by resolve_embed_model_path */
 }
 
 /* L2-normalize `v` of length `n` in place. */
