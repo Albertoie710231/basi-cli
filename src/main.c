@@ -247,6 +247,22 @@ static void disable_raw_mode(void) {
 
 /* Returns malloc'd string, or NULL on EOF. Empty string on Ctrl-C. */
 static char *read_line(const char *prompt) {
+    /* Piped / scripted input (stdin not a TTY): the interactive char-by-char
+       line editor below misreads it — ESC bytes in the data trip the arrow-key
+       handler, and its raw read(fd) loop is inconsistent with the stdio (fgets)
+       reads elsewhere (session picker), losing buffered lines. Use a plain
+       stdio line read instead, which is consistent and control-char-safe. */
+    if (!isatty(STDIN_FILENO)) {
+        printf("%s", prompt);
+        fflush(stdout);
+        char *line = NULL;
+        size_t cap = 0;
+        ssize_t n = getline(&line, &cap, stdin);
+        if (n < 0) { free(line); return NULL; }     /* EOF */
+        while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\r')) line[--n] = '\0';
+        return line;                                 /* malloc'd; caller frees */
+    }
+
     bool raw = enable_raw_mode();
 
     printf("%s", prompt);

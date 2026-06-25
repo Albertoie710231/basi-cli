@@ -176,6 +176,13 @@ GenerateResult generate(
     unsigned char utf8_buf[4];
     size_t utf8_len = 0;
 
+    /* Only poll stdin for Ctrl+T when it's an interactive terminal. On piped /
+       scripted stdin there is always input pending, so the poll-and-read below
+       would steal bytes from the next prompt — corrupting multi-turn scripted
+       sessions. You also can't press Ctrl+T through a pipe, so there's nothing
+       to detect there. */
+    const bool stdin_is_tty = isatty(STDIN_FILENO);
+
     /* Generation loop */
     while (1) {
         /* Check context space */
@@ -218,8 +225,9 @@ GenerateResult generate(
         }
 
         /* Check for Ctrl+T (toggle thinking display) via non-blocking read.
-           Skipped entirely when quiet (deepsearch internal rounds). */
-        if (!generate_quiet) {
+           Skipped when quiet (deepsearch internal rounds) or when stdin is not a
+           TTY (piped/scripted — reading would eat the next prompt). */
+        if (!generate_quiet && stdin_is_tty) {
             struct pollfd pfd = { .fd = STDIN_FILENO, .events = POLLIN };
             if (poll(&pfd, 1, 0) > 0 && (pfd.revents & POLLIN)) {
                 unsigned char key;
