@@ -985,6 +985,7 @@ typedef struct {
     int         cli_ctx;            /* -c/--ctx: context size (0 = default) */
     float       cli_temp;           /* -t/--temp: sampling temp (<0 = default) */
     uint32_t    cli_seed;           /* --seed: RNG seed for sampling */
+    bool        bypass;             /* --yolo/--bypass: auto-approve all tool actions */
     bool        want_exit;          /* -h/--help: caller should return exit_code */
     int         exit_code;
 } Cli;
@@ -994,7 +995,8 @@ static Cli parse_args(int argc, char **argv) {
         .model_path = NULL, .n_gpu_layers = 99, .ngl_set = false,
         .deepsearch_q = NULL, .prompt = NULL, .no_tools = false,
         .system_override = NULL, .cli_ctx = 0, .cli_temp = -1.0f,
-        .cli_seed = LLAMA_DEFAULT_SEED, .want_exit = false, .exit_code = 0,
+        .cli_seed = LLAMA_DEFAULT_SEED, .bypass = false,
+        .want_exit = false, .exit_code = 0,
     };
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-m") == 0 && i + 1 < argc) {
@@ -1021,6 +1023,8 @@ static Cli parse_args(int argc, char **argv) {
             c.prompt = argv[++i];
         } else if (strcmp(argv[i], "--no-tools") == 0) {
             c.no_tools = true;
+        } else if (strcmp(argv[i], "--yolo") == 0 || strcmp(argv[i], "--bypass") == 0) {
+            c.bypass = true;
         } else if ((strcmp(argv[i], "-s") == 0 || strcmp(argv[i], "--system") == 0)
                    && i + 1 < argc) {
             c.system_override = argv[++i];
@@ -1043,6 +1047,10 @@ static Cli parse_args(int argc, char **argv) {
                    "                  Prints only the completion to stdout (clean for scripting/data-gen).\n"
                    "  -s, --system    With --no-tools: system prompt to use (default: a minimal\n"
                    "                  \"helpful assistant\" prompt). Pass \"\" for a pure completion.\n"
+                   "  --yolo, --bypass  Auto-approve ALL tool actions (bash/edit/scaffold) without\n"
+                   "                  prompting. Required for -p runs that use tools (a non-interactive\n"
+                   "                  approval prompt is auto-denied otherwise). Dangerous: only on\n"
+                   "                  code/dirs you trust.\n"
                    "  --deepsearch    Run multi-round deep research (web + KB) non-interactively, then exit\n"
                    "  -d              Debug mode (verbose tool output)\n"
                    "  -h              Show this help\n\n"
@@ -1861,6 +1869,13 @@ int main(int argc, char **argv) {
     float       cli_temp             = cli.cli_temp;
     uint32_t    cli_seed             = cli.cli_seed;
 
+    /* --yolo/--bypass: auto-approve every tool action. Without it, a
+     * non-interactive -p run that triggers an approval prompt reads EOF on
+     * stdin and the tool is denied (request_approval returns 0), so tools
+     * silently never run. PERM_BYPASS short-circuits the approval at every
+     * call site (bash/edit/scaffold) before the prompt is reached. */
+    if (cli.bypass) permission_mode = PERM_BYPASS;
+
     bool oneshot = (oneshot_deepsearch_q != NULL) || (oneshot_prompt != NULL);
 
     /* --no-tools is a modifier on -p: it only makes sense for the one-shot
@@ -1989,7 +2004,7 @@ int main(int argc, char **argv) {
     llama_sampler_chain_add(smpl, llama_sampler_init_temp(temp_override >= 0 ? temp_override : 0.4f));
     llama_sampler_chain_add(smpl, llama_sampler_init_dist(cli_seed));
 
-    if (!no_tools) {
+    if (!no_tools && !oneshot_prompt) {
         printf("Model loaded. Type your message (empty line to quit).\n\n");
         fflush(stdout);
     }
@@ -2052,6 +2067,8 @@ int main(int argc, char **argv) {
     int native_tools = basi_tools_active(model);
     generate_native_tools = native_tools;   /* hide raw tool-call markup from the live stream */
     printf("\033[90m[Tool mode: %s]\033[0m\n", native_tools ? "native (function-calling)" : "legacy (<tool> tags)");
+    if (permission_mode == PERM_BYPASS)
+        printf("\033[33m[Permissions: bypass — all tool actions auto-approved, no prompts]\033[0m\n");
     fflush(stdout);
     if (!native_tools) basi_set_tools(NULL, 0);   /* don't advertise tools the model can't format */
 
