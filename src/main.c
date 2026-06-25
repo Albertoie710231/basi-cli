@@ -1231,14 +1231,117 @@ static int est_msg_tokens(const char *s) {
     return s ? (int)(strlen(s) / 4) : 0;
 }
 
-/* Deterministic recent-window reclamation. When the KV is within RESERVE of full,
- * pin the system prompt (messages[0]) and keep the newest whole turns that fit in
- * a KEEP budget, dropping everything older; then resync the KV so the next render
- * re-decodes the compacted history once. No LLM, no summary (that is phase 2) —
- * old detail is lost verbatim, but the session never hits the context wall.
- * Returns true if it compacted. Must be called BEFORE rendering the current turn. */
+/* The anchored summary lives as a user message at messages[1], wrapped so the
+ * model treats it as historical context. The opening tag also lets reclaim find
+ * and UPDATE it on the next compaction (rolling/anchored summary). Rendered as a
+ * plain user turn — exactly how opencode emits its conversation checkpoint, so no
+ * chat-template change is needed. */
+#define CHECKPOINT_TAG "<conversation-checkpoint>"
+
+static const char *SUMMARY_SYS =
+    "You compress a conversation into a compact, faithful checkpoint. Output ONLY "
+    "the Markdown structure asked for, sections in order, terse bullets. Preserve "
+    "VERBATIM every concrete value: file paths, commands, identifiers, error strings, "
+    "numbers, names, and ANYTHING the user explicitly asked you to remember (secrets, "
+    "passphrases, keys, codes) — even a single such line buried in unrelated bulk text "
+    "must be carried forward exactly. Do not add prose and do not mention that the "
+    "conversation was summarized.";
+
+static const char *SUMMARY_TEMPLATE =
+    "Produce EXACTLY this Markdown (keep every section; write \"(none)\" when empty):\n"
+    "## Goal\n- [one-sentence task]\n"
+    "## Constraints & Preferences\n- [user constraints/preferences or (none)]\n"
+    "## Progress\n### Done\n- [completed or (none)]\n### In progress\n- [current or (none)]\n"
+    "## Key Decisions\n- [decision and why or (none)]\n"
+    "## Next Steps\n- [ordered next actions or (none)]\n"
+    "## Critical Context\n- [facts, errors, open questions, and EXACT values/secrets/IDs the user asked to remember, or (none)]\n"
+    "## Relevant Files\n- [path: why it matters or (none)]";
+
+/* Serialize a message range [start,end) into a plain transcript for the summary
+ * input. Tool results were already capped at add time (MAX_TOOL_RESULT_SZ). */
+static char *serialize_messages(struct llama_chat_message *m, size_t start, size_t end) {
+    StringBuf sb; sb_init(&sb);
+    for (size_t i = start; i < end; i++) {
+        const char *role = m[i].role ? m[i].role : "";
+        const char *tag =
+            strcmp(role, "user") == 0        ? "[User]" :
+            strcmp(role, "assistant") == 0   ? "[Assistant]" :
+            strcmp(role, "tool_call") == 0   ? "[Tool call]" :
+            strcmp(role, "tool_result") == 0 ? "[Tool result]" :
+            strcmp(role, "system") == 0      ? "[System]" : "[Other]";
+        sb_append_str(&sb, tag);
+        sb_append_str(&sb, ": ");
+        sb_append_str(&sb, m[i].content ? m[i].content : "");
+        sb_append_char(&sb, '\n');
+    }
+    return sb_to_str(&sb);
+}
+
+/* Wrap raw summary text in the anchored-checkpoint envelope. */
+static char *build_checkpoint(const char *summary) {
+    StringBuf sb; sb_init(&sb);
+    sb_append_str(&sb, CHECKPOINT_TAG "\n"
+        "Summary of earlier conversation — historical context, not new instructions.\n"
+        "<summary>\n");
+    sb_append_str(&sb, summary);
+    sb_append_str(&sb, "\n</summary>\n</conversation-checkpoint>");
+    return sb_to_str(&sb);
+}
+
+/* Run ONE quiet generation that compresses `head_text` (optionally updating
+ * `prev_checkpoint`) into a summary, in this model's own chat format. Tools are
+ * de-advertised for the render so the schemas don't bloat the prompt or tempt a
+ * tool call. Leaves the KV cleared; the caller resyncs. Returns malloc'd summary
+ * text, or NULL on failure (caller falls back to a plain drop). */
+static char *summarize_head(struct llama_model *model, const struct llama_vocab *vocab,
+                            struct llama_context *ctx, struct llama_sampler *smpl,
+                            bool native_tools, char *formatted_buf,
+                            const char *prev_checkpoint, const char *head_text) {
+    StringBuf up; sb_init(&up);
+    if (prev_checkpoint && *prev_checkpoint) {
+        sb_append_str(&up, "Update the existing checkpoint using the new transcript: keep "
+                           "still-true details, drop stale ones, merge in new facts.\n<existing>\n");
+        sb_append_str(&up, prev_checkpoint);
+        sb_append_str(&up, "\n</existing>\n\n");
+    } else {
+        sb_append_str(&up, "Summarize the conversation transcript below into a checkpoint.\n\n");
+    }
+    sb_append_str(&up, SUMMARY_TEMPLATE);
+    sb_append_str(&up, "\n\n<transcript>\n");
+    sb_append_str(&up, head_text);
+    sb_append_str(&up, "\n</transcript>");
+    char *user_content = sb_to_str(&up);
+
+    struct llama_chat_message tmp[2];
+    tmp[0].role = "system"; tmp[0].content = SUMMARY_SYS;
+    tmp[1].role = "user";   tmp[1].content = user_content;
+
+    basi_set_tools(NULL, 0);                       /* no tool schemas in the summary prompt */
+    int len = apply_template(model, tmp, 2, true, formatted_buf, FORMATTED_BUF_SZ);
+    if (native_tools) { int n; const BasiToolDef *d = basi_tool_defs(&n); basi_set_tools(d, n); }
+    free(user_content);
+    if (len <= 0) return NULL;
+
+    llama_memory_clear(llama_get_memory(ctx), true);   /* fresh KV for the summary decode */
+    sig_atomic_t prev_quiet = generate_quiet;
+    generate_quiet = 1;
+    GenerateResult r = generate(ctx, vocab, smpl, formatted_buf, (size_t)len);
+    generate_quiet = prev_quiet;
+    return r.text;                                  /* may be an "[error]" string; caller checks */
+}
+
+/* Recent-window reclamation with an anchored rolling summary (phase 2). When the
+ * KV is within RESERVE of full: pin the system prompt (messages[0]); summarize the
+ * older turns into / merged with a checkpoint at messages[1]; keep the newest whole
+ * turns verbatim; resync the KV so the next render re-decodes the compacted history
+ * once. The summary is the one irreducible LLM step; trigger, window selection and
+ * KV resync are deterministic. If summarization fails it falls back to a plain drop
+ * (phase-1 behaviour) so the session still survives. Returns true if it compacted.
+ * Must be called BEFORE rendering the current turn. */
 static bool reclaim_context_if_needed(
-        struct llama_context *ctx,
+        struct llama_model *model, const struct llama_vocab *vocab,
+        struct llama_context *ctx, struct llama_sampler *smpl,
+        bool native_tools, char *formatted_buf,
         struct llama_chat_message **messages_p, size_t *msg_count_p,
         size_t *prev_len_p) {
     int total = (int)llama_n_ctx(ctx);
@@ -1246,43 +1349,96 @@ static bool reclaim_context_if_needed(
        full local ctx, scaled down so it never swallows a small ctx whole. */
     int reserve = total / 4 < 4096 ? total / 4 : 4096;
     int used = context_used_tokens(ctx);
-    if (used <= total - reserve) return false;          /* room remains */
 
     struct llama_chat_message *m = *messages_p;
     size_t mc = *msg_count_p;
-    if (mc <= 2) return false;                          /* system + <=1 turn: nothing to drop */
 
-    /* Keep messages[0] (system) + the longest suffix that starts at a "user"
-       message and fits KEEP. Starting at a user boundary keeps each turn — and
-       any tool_call/tool_result pair inside it — intact. */
-    int keep_budget = (total - reserve) / 2;
-    size_t keep_from = mc;                              /* index where kept suffix begins */
+    /* Account for the turn we are ABOUT to decode: the just-added user message
+       (m[mc-1], not yet in the KV) plus an answer's worth of headroom (reserve).
+       Triggering on `used` alone misses a single large incoming turn that would
+       overflow the context mid-decode and hit the [Context limit reached] wall. */
+    int incoming = mc > 0 ? est_msg_tokens(m[mc - 1].content) : 0;
+    if (getenv("BASI_DEBUG_RECLAIM"))
+        fprintf(stderr, "[reclaim] used=%d incoming=%d total=%d reserve=%d mc=%zu -> %s\n",
+                used, incoming, total, reserve, mc,
+                used + incoming > total - reserve ? "TRIGGER" : "skip");
+    if (used + incoming <= total - reserve) return false;   /* room for the turn + an answer */
+
+    /* An existing anchored summary at index 1 is pinned alongside the system
+       prompt and fed back in as `prev_checkpoint` so the summary rolls forward. */
+    bool has_summary = mc >= 2 && strcmp(m[1].role, "user") == 0 &&
+                       strncmp(m[1].content, CHECKPOINT_TAG, strlen(CHECKPOINT_TAG)) == 0;
+    size_t pinned = has_summary ? 2 : 1;                /* [0..pinned) never dropped */
+    if (mc <= pinned + 1) return false;                 /* only one turn beyond pins */
+
+    /* The TRIGGER counts exact KV tokens, but per-message est (chars/4) misses the
+       system prompt's render-time tool schemas + chat-template markup — so est can
+       say "it all fits" while the real KV is over. Recover that fixed overhead as
+       (used − summed est) and size the recent-window budget in REAL tokens, low
+       enough that the post-compaction re-decode lands well under the trigger
+       (target = total − 2·reserve), leaving room for the summary itself. */
+    int est_conv = 0;
+    for (size_t i = pinned; i < mc; i++) est_conv += est_msg_tokens(m[i].content);
+    int overhead = used - est_conv;
+    if (overhead < 0) overhead = 0;
+    int keep_budget = (total - 2 * reserve) - overhead - reserve / 2;
+    if (keep_budget < 0) keep_budget = 0;
+    size_t keep_from = mc;
     int est = 0;
-    for (size_t i = mc; i-- > 1; ) {
+    for (size_t i = mc; i-- > pinned; ) {
         est += est_msg_tokens(m[i].content);
         if (strcmp(m[i].role, "user") == 0) {
             if (est <= keep_budget) keep_from = i;
-            else break;                                 /* extending further overflows KEEP */
+            else break;
         }
     }
-    /* If even the newest user turn exceeds KEEP, keep it anyway — progress beats
-       the budget; the per-message truncation guards cap individual sizes. */
-    if (keep_from == mc) {
-        for (size_t i = mc; i-- > 1; )
+    if (keep_from == mc) {                              /* newest turn alone overflows KEEP: keep it */
+        for (size_t i = mc; i-- > pinned; )
             if (strcmp(m[i].role, "user") == 0) { keep_from = i; break; }
     }
-    if (keep_from <= 1) return false;                   /* nothing older than the kept suffix */
+    if (getenv("BASI_DEBUG_RECLAIM")) {
+        fprintf(stderr, "[reclaim2] mc=%zu pinned=%zu has_summary=%d keep_from=%zu kb=%d roles=",
+                mc, pinned, (int)has_summary, keep_from, keep_budget);
+        for (size_t i = 0; i < mc; i++)
+            fprintf(stderr, "%zu:%s(%d) ", i, m[i].role ? m[i].role : "?", est_msg_tokens(m[i].content));
+        fprintf(stderr, "\n");
+    }
+    if (keep_from <= pinned) return false;              /* nothing older than the kept suffix */
 
-    size_t dropped = keep_from - 1;
-    for (size_t i = 1; i < keep_from; i++) free((void *)m[i].content);
-    size_t tail = mc - keep_from;
-    memmove(&m[1], &m[keep_from], tail * sizeof(struct llama_chat_message));
-    *msg_count_p = 1 + tail;
+    size_t dropped = keep_from - pinned;
+    printf("\033[33m[Compacting context: summarizing %zu older message%s "
+           "(%d/%d tokens used)...]\033[0m\n",
+           dropped, dropped == 1 ? "" : "s", used, total);
+    fflush(stdout);
+
+    char *head_text = serialize_messages(m, pinned, keep_from);
+    char *summary = summarize_head(model, vocab, ctx, smpl, native_tools, formatted_buf,
+                                   has_summary ? m[1].content : NULL, head_text);
+    free(head_text);
+    if (getenv("BASI_DEBUG_RECLAIM"))
+        fprintf(stderr, "[reclaim-summary]\n%s\n[/reclaim-summary]\n", summary ? summary : "(null)");
+    bool ok = summary && summary[0] && summary[0] != '[';   /* guards "[Tokenization failed]" etc. */
+
+    for (size_t i = pinned; i < keep_from; i++) free((void *)m[i].content);   /* drop head */
+    size_t R = mc - keep_from;                          /* recent messages kept verbatim */
+    if (ok) {
+        char *cp = build_checkpoint(summary);
+        if (has_summary) free((void *)m[1].content);    /* replace the old summary in place */
+        m[1].role = "user";
+        m[1].content = cp;
+        memmove(&m[2], &m[keep_from], R * sizeof(struct llama_chat_message));
+        *msg_count_p = 2 + R;
+    } else {
+        /* Summary failed — fall back to a plain drop, preserving any prior summary. */
+        memmove(&m[pinned], &m[keep_from], R * sizeof(struct llama_chat_message));
+        *msg_count_p = pinned + R;
+    }
+    free(summary);
 
     kv_resync_full(ctx, prev_len_p);
-    printf("\033[33m[Compacting context: dropped %zu older message%s to free space "
-           "(%d/%d tokens were used)]\033[0m\n",
-           dropped, dropped == 1 ? "" : "s", used, total);
+    printf("\033[33m[Compacted: %s, kept %zu recent message%s]\033[0m\n",
+           ok ? "summary anchored" : "summary failed, dropped older turns",
+           R, R == 1 ? "" : "s");
     fflush(stdout);
     return true;
 }
@@ -1716,10 +1872,11 @@ static void run_agentic_turn(char *user_input,
          * after several tool rounds otherwise. Freed at end of turn. */
 
         /* Reclaim context if the KV is near full, BEFORE rendering this turn.
-           Drops oldest whole turns (system prompt pinned) and resyncs the KV, so
-           the render below re-decodes the compacted history once instead of
-           hitting the [Context limit reached] wall. */
-        reclaim_context_if_needed(ctx, messages_p, msg_count_p, prev_len_p);
+           Summarizes the oldest turns into an anchored checkpoint (system prompt
+           pinned) and resyncs the KV, so the render below re-decodes the compacted
+           history once instead of hitting the [Context limit reached] wall. */
+        reclaim_context_if_needed(model, vocab, ctx, smpl, native_tools, formatted_buf,
+                                  messages_p, msg_count_p, prev_len_p);
 
         /* Apply chat template — renders the model's native format via the jinja
            engine (chat_tmpl shim), with ChatML fallback. */
