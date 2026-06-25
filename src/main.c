@@ -2207,12 +2207,37 @@ static void run_agentic_turn(char *user_input,
         char *prompt = formatted_buf + prev_len;
         size_t prompt_len = (size_t)new_len - prev_len;
 
-        /* Tool execution loop */
+        /* Tool execution loop. The per-turn cap defaults to 5 but is overridable
+           via BASI_MAX_TOOL_ITERS for long agentic sessions (e.g. iterate
+           edit→test→fix many times within one growing context). */
         int tool_iterations = 0;
-        const int max_tool_iterations = 5;
+        int max_tool_iterations = 5;
+        {
+            const char *mi = getenv("BASI_MAX_TOOL_ITERS");
+            if (mi) { int v = atoi(mi); if (v > 0 && v <= 200) max_tool_iterations = v; }
+        }
 
         while (tool_iterations < max_tool_iterations) {
             tool_iterations++;
+
+            /* Reclaim INSIDE the tool loop too. A long agentic turn is one user
+               turn with many tool calls, each appending a result — with the
+               reclaim check only before the loop, that history accumulates with
+               no compaction until the KV overflows mid-session (the [Context
+               limit reached] wall, after which a small model often degenerates).
+               On compaction the KV is cleared and prev_len reset, so re-render the
+               full compacted history instead of the now-invalid delta. Skip the
+               first iteration: the pre-loop reclaim + retrieve injection already
+               set up `prompt` for it. */
+            if (tool_iterations > 1 &&
+                reclaim_context_if_needed(model, vocab, ctx, smpl, native_tools,
+                                          formatted_buf, messages_p, msg_count_p, prev_len_p)) {
+                int rl = apply_template(model, messages, msg_count, true,
+                                        formatted_buf, FORMATTED_BUF_SZ);
+                if (rl < 0) { printf("Error: Failed to apply chat template\n"); fflush(stdout); break; }
+                prompt = formatted_buf;
+                prompt_len = (size_t)rl;
+            }
 
             generation_interrupted = 0;
             setup_sigint_handler();
@@ -2591,6 +2616,17 @@ int main(int argc, char **argv) {
 
     /* Create sampler chain */
     struct llama_sampler *smpl = llama_sampler_chain_init(llama_sampler_chain_default_params());
+    /* Repetition penalty — damps the degenerate repeat-loop collapse seen in long
+       agentic sessions (a small model emits a malformed token, then spirals into
+       "XXXX…" until it overruns the context). Added FIRST so it shapes the logits
+       before min_p/temp. Mild by default (1.1 over the last 256 tokens, no
+       freq/presence component); tune with BASI_REPEAT_PENALTY (1.0 disables). */
+    float repeat_pen = 1.1f;
+    {
+        const char *rp = getenv("BASI_REPEAT_PENALTY");
+        if (rp) { float v = (float)atof(rp); if (v >= 1.0f && v <= 2.0f) repeat_pen = v; }
+    }
+    llama_sampler_chain_add(smpl, llama_sampler_init_penalties(256, repeat_pen, 0.0f, 0.0f));
     llama_sampler_chain_add(smpl, llama_sampler_init_min_p(0.05f, 1));
     llama_sampler_chain_add(smpl, llama_sampler_init_temp(temp_override >= 0 ? temp_override : 0.4f));
     llama_sampler_chain_add(smpl, llama_sampler_init_dist(cli_seed));
