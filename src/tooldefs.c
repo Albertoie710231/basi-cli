@@ -30,7 +30,7 @@ static const BasiToolDef TOOLS[] = {
       OBJ(STR("file", "Path to the file"), "[\"file\"]") },
     { "bash", "Run a shell command via 'bash -c'. Requires user approval. Use for builds, tests, git, or anything the other tools do not cover.",
       OBJ(STR("command", "The shell command to run"), "[\"command\"]") },
-    { "edit", "Create or modify a file. Read it first. To change text, give the exact current text in 'search' and the new text in 'replace'. To create a new file, leave 'search' empty and put the full content in 'replace'.",
+    { "edit", "Create or modify a file. Read it first. To change part of a file, give the exact current text in 'search' and the new text in 'replace'. To create a NEW file, or to overwrite an existing file wholesale (e.g. fill in a stub), leave 'search' empty and put the full file content in 'replace'.",
       OBJ(STR("file", "Relative path to the file") "," STR("search", "Exact current text to replace (verbatim); empty to create a new file") ","
           STR("replace", "The replacement text"), "[\"file\",\"replace\"]") },
     { "scaffold", "Materialize a code template into a destination directory. Requires user approval. Use 'scaffold list' (name=list) to see templates.",

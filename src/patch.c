@@ -30,8 +30,9 @@
  *   =======
  *   <replacement text>
  *   >>>>>>> REPLACE
- * Multiple blocks may follow, applied in order. An empty SEARCH block creates
- * a new file from the REPLACE text. */
+ * Multiple blocks may follow, applied in order. An empty SEARCH block writes the
+ * whole file from the REPLACE text — creating it if new, or overwriting it if it
+ * already exists (read-before-edit still applies to existing files). */
 
 /* A file must be read this session before it can be edited, unless it is
  * larger than the read tool would ever surface (~2000 tokens), in which case
@@ -438,14 +439,13 @@ char *execute_edit(const char *args) {
         const char *find = p->blocks[i].find;
         const char *repl = p->blocks[i].repl;
         if (!find[0]) {
-            /* create-file block: only valid when the buffer is still empty */
-            if (cur.len != 0) {
-                sb_free(&cur);
-                char *e = malloc(256);
-                snprintf(e, 256, "edit: block %d — an empty SEARCH only creates a NEW file; '%s' already has content.", i + 1, path);
-                free_parsed_edit(p);
-                return e;
-            }
+            /* Empty SEARCH = write the WHOLE file: create it if new, or overwrite
+               it wholesale if it already exists. The read-before-edit gate above
+               already required an existing file to have been viewed this session,
+               so this is a deliberate "rewrite this file" (a write capability),
+               not a blind clobber — it lets a model replace a stub without having
+               to quote the stub's exact current contents. */
+            sb_clear(&cur);
             sb_append_str(&cur, repl);
             if (cur.len && cur.data[cur.len - 1] != '\n') sb_append_char(&cur, '\n');
             created = true;
