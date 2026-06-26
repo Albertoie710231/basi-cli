@@ -191,6 +191,29 @@ GenerateResult generate(
        to detect there. */
     const bool stdin_is_tty = isatty(STDIN_FILENO);
 
+    /* Forced-open thinking: some templates (Qwen3.x) inject the opening think tag
+       into the generation PROMPT, so the model emits only the thinking CONTENT
+       and then the closing tag — the open tag never appears in the output. Left
+       alone the state machine stays NORMAL and the reasoning LEAKS as visible
+       text (and isn't stripped from the stored turn). If the rendered prompt ends
+       with the think-open tag (modulo trailing whitespace), start INSIDE the
+       thinking block, exactly as if we'd just matched the open tag. */
+    if (think_open_len > 0) {
+        size_t pl = prompt_len;
+        while (pl > 0 && (prompt[pl-1] == '\n' || prompt[pl-1] == '\r' ||
+                          prompt[pl-1] == ' '  || prompt[pl-1] == '\t')) pl--;
+        if (pl >= think_open_len &&
+            memcmp(prompt + pl - think_open_len, think_open, think_open_len) == 0) {
+            state = STATE_THINKING;
+            if (generate_keep_think) sb_append_str(&response, think_open);
+            if (!generate_quiet) {
+                if (show_thinking) { printf("\033[90m[thinking] "); fflush(stdout); }
+                else { draw_thinking_box(spinner_frame); last_spinner = time_now(); }
+            }
+            thinking_box_shown = true;
+        }
+    }
+
     /* Generation loop */
     while (1) {
         /* Check context space */
