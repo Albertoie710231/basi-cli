@@ -198,6 +198,7 @@ GenerateResult generate(
        text (and isn't stripped from the stored turn). If the rendered prompt ends
        with the think-open tag (modulo trailing whitespace), start INSIDE the
        thinking block, exactly as if we'd just matched the open tag. */
+    bool forced_open_think = false;
     if (think_open_len > 0) {
         size_t pl = prompt_len;
         while (pl > 0 && (prompt[pl-1] == '\n' || prompt[pl-1] == '\r' ||
@@ -206,11 +207,10 @@ GenerateResult generate(
             memcmp(prompt + pl - think_open_len, think_open, think_open_len) == 0) {
             state = STATE_THINKING;
             if (generate_keep_think) sb_append_str(&response, think_open);
-            if (!generate_quiet) {
-                if (show_thinking) { printf("\033[90m[thinking] "); fflush(stdout); }
-                else { draw_thinking_box(spinner_frame); last_spinner = time_now(); }
-            }
-            thinking_box_shown = true;
+            /* Reveal the box AFTER prefill (in the is_prompt_phase block below),
+               not here — drawing it before the loop would freeze the spinner on
+               frame 0 for the entire prompt decode (which blocks the loop). */
+            forced_open_think = true;
         }
     }
 
@@ -237,6 +237,16 @@ GenerateResult generate(
             res.prompt_time_s = time_now() - timer_start;
             timer_start = time_now();
             is_prompt_phase = false;
+            /* Prefill is done — now reveal a forced-open thinking box (deferred
+               from before the loop) so its spinner animates from the first
+               generated token instead of sitting frozen through the prompt
+               decode. The first token is already suppressed because state was
+               set to STATE_THINKING up front. */
+            if (forced_open_think && !thinking_box_shown && !generate_quiet) {
+                if (show_thinking) { printf("\033[90m[thinking] "); fflush(stdout); }
+                else { draw_thinking_box(spinner_frame); last_spinner = time_now(); }
+                thinking_box_shown = true;
+            }
         }
 
         /* Tick the pinned status bar so its ctx meter climbs live as the KV
