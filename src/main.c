@@ -2214,6 +2214,19 @@ static void run_agentic_turn(char *user_input,
             return;
         }
 
+        /* Delta-prompt invariant guard. The KV holds the prefix up to prev_len
+           and we feed only formatted_buf+prev_len, trusting the render to grow
+           monotonically. Some templates DON'T — notably thinking models (Qwen3.x)
+           that restructure prior turns — so this render can come out SHORTER than
+           prev_len, underflowing prompt_len to a huge size_t and crashing tokenize.
+           When that happens the cached prefix is invalid anyway: drop the KV and
+           decode the whole freshly-rendered prompt. */
+        if (prev_len > (size_t)new_len) {
+            if (getenv("BASI_DEBUG_RECLAIM"))
+                fprintf(stderr, "[delta] non-monotonic render: prev_len=%zu > new_len=%d -> resync\n",
+                        prev_len, new_len);
+            kv_resync_full(ctx, prev_len_p);
+        }
         char *prompt = formatted_buf + prev_len;
         size_t prompt_len = (size_t)new_len - prev_len;
 
@@ -2397,6 +2410,13 @@ static void run_agentic_turn(char *user_input,
                 }
                 int prev = apply_template(
                     model, messages, msg_count - 1, false, NULL, 0);
+                /* Same non-monotonic-render guard as the turn-start delta: if the
+                   all-but-last render is longer than the full one, the delta would
+                   underflow — resync the KV and feed the whole prompt instead. */
+                if (prev < 0 || prev > next_len) {
+                    kv_resync_full(ctx, prev_len_p);
+                    prev = 0;
+                }
                 prompt = formatted_buf + prev;
                 prompt_len = (size_t)next_len - (size_t)prev;
 

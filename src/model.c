@@ -109,6 +109,14 @@ GenerateResult generate(
     llama_memory_t memory = llama_get_memory(ctx);
     bool is_first = (llama_memory_seq_pos_max(memory, 0) == -1);
 
+    /* Defensive backstop: an underflowed delta (prev_len > render) yields a huge
+       prompt_len whose (int) cast crashes llama_tokenize with std::length_error.
+       Callers guard the delta, but never let a bogus length abort the process. */
+    if (prompt_len == 0 || prompt_len > (size_t)(64 * 1024 * 1024)) {
+        res.text = strdup("[Invalid prompt length]");
+        return res;
+    }
+
     /* Tokenize */
     int n_prompt_tokens = -llama_tokenize(vocab, prompt, (int)prompt_len,
                                            NULL, 0, is_first, true);
