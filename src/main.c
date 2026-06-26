@@ -2221,10 +2221,22 @@ static void run_agentic_turn(char *user_input,
            prev_len, underflowing prompt_len to a huge size_t and crashing tokenize.
            When that happens the cached prefix is invalid anyway: drop the KV and
            decode the whole freshly-rendered prompt. */
-        if (prev_len > (size_t)new_len) {
+        /* Resync the KV when a cross-turn delta can't be trusted:
+           (a) prev_len > new_len — a non-monotonic render underflows prompt_len
+               and crashes tokenize.
+           (b) thinking model — BASI strips <think>...</think> from the stored
+               assistant turn, but the KV decoded it. So the KV holds MORE tokens
+               than the re-rendered (stripped) history, and a delta feeds the new
+               turn at the wrong KV position: the model loses the conversation and
+               answers a stale turn. Re-decode the clean full history instead.
+               (Costs a full prefill per turn for thinking models — correct over
+               fast; a future optimization could surgically drop the think tokens
+               from the KV instead.) */
+        bool delta_unsafe = (prev_len > (size_t)new_len) || basi_thinking_tags(NULL, NULL);
+        if (delta_unsafe) {
             if (getenv("BASI_DEBUG_RECLAIM"))
-                fprintf(stderr, "[delta] non-monotonic render: prev_len=%zu > new_len=%d -> resync\n",
-                        prev_len, new_len);
+                fprintf(stderr, "[delta] resync (prev_len=%zu new_len=%d thinking=%d)\n",
+                        prev_len, new_len, basi_thinking_tags(NULL, NULL));
             kv_resync_full(ctx, prev_len_p);
         }
         char *prompt = formatted_buf + prev_len;
