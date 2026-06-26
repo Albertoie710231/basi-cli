@@ -1128,6 +1128,10 @@ static void build_system_prompt(char *buf, size_t sz, bool native_tools,
             "\n\n<env>\n"
             "You are powered by a locally-run model loaded from: %s\n"
             "Working directory: %s\n"
+            "Every tool (bash, read, edit, grep, …) ALREADY runs in this working "
+            "directory. Use paths relative to it (e.g. `foo.c`, not an absolute "
+            "path) and do NOT `cd` to another directory — you are already where "
+            "you need to be.\n"
             "Platform: %s %s\n"
             "Is a git repo: %s\n"
             "</env>\n",
@@ -2213,11 +2217,12 @@ static void run_agentic_turn(char *user_input,
         char *prompt = formatted_buf + prev_len;
         size_t prompt_len = (size_t)new_len - prev_len;
 
-        /* Tool execution loop. The per-turn cap defaults to 5 but is overridable
-           via BASI_MAX_TOOL_ITERS for long agentic sessions (e.g. iterate
-           edit→test→fix many times within one growing context). */
+        /* Tool execution loop. The per-turn cap defaults to 15 — multi-step work
+           (read→read→edit→edit→build→fix→rebuild) easily exceeds the old default
+           of 5, which made the loop give up on multi-file tasks before doing any
+           real work. Overridable via BASI_MAX_TOOL_ITERS. */
         int tool_iterations = 0;
-        int max_tool_iterations = 5;
+        int max_tool_iterations = 15;
         {
             const char *mi = getenv("BASI_MAX_TOOL_ITERS");
             if (mi) { int v = atoi(mi); if (v > 0 && v <= 200) max_tool_iterations = v; }
