@@ -39,7 +39,14 @@
 
 /* MAX_TOKENS, CONTEXT_SIZE → globals.h */
 #define MAX_FILE_TOKENS     2000
-#define MAX_TOOL_RESULT_SZ  16000  /* max chars in a tool result (~4000 tokens) */
+#define MAX_TOOL_RESULT_SZ  16000  /* legacy hard ceiling (kept for reference) */
+/* Tool-result truncation: keep the HEAD and the TAIL, drop the middle. Test
+ * runners put first failures at the top and the pass/fail summary at the bottom,
+ * so a head-only cut throws away the most useful line. Line-aware + a byte
+ * ceiling (~2000 tokens) so one tool result can't dominate the context window. */
+#define TOOL_RESULT_MAX_BYTES   8000
+#define TOOL_RESULT_HEAD_LINES  150
+#define TOOL_RESULT_TAIL_LINES  100
 #define MAX_HISTORY         100
 #define FORMATTED_BUF_SZ   (CONTEXT_SIZE * 5)
 
@@ -635,6 +642,61 @@ static char *read_small_file(const char *filepath) {
     fclose(f);
     read_tracker_mark(filepath);
     return content;
+}
+
+/* Truncate an oversized tool result keeping the HEAD and the TAIL — the middle
+ * of long output is usually noise, while test runners put the first failures at
+ * the top and the pass/fail summary at the bottom. Line-aware (keeps at most
+ * head_lines + tail_lines lines) with a hard byte ceiling. Edits in place (the
+ * result is always shorter). Returns bytes dropped (0 = left unchanged). */
+static size_t truncate_tool_result(char *s, int head_lines, int tail_lines,
+                                   size_t max_bytes) {
+    size_t len = strlen(s);
+    size_t nlines = 1;
+    for (size_t i = 0; i < len; i++) if (s[i] == '\n') nlines++;
+    if (len <= max_bytes && nlines <= (size_t)(head_lines + tail_lines))
+        return 0;                                  /* already within limits */
+
+    /* head_end = offset just past the head_lines-th newline */
+    size_t head_end = 0;
+    int hl = 0;
+    for (size_t i = 0; i < len && hl < head_lines; i++)
+        if (s[i] == '\n') { hl++; head_end = i + 1; }
+    if (head_end == 0) head_end = len;             /* no newline in head span */
+
+    /* tail_start = offset where the last tail_lines lines begin */
+    size_t tail_start = len;
+    int tl = 0;
+    for (size_t i = len; i-- > 0; )
+        if (s[i] == '\n') { if (++tl > tail_lines) { tail_start = i + 1; break; } }
+
+    /* enforce the byte ceiling: split the budget between head and tail */
+    size_t half = max_bytes / 2;
+    if (head_end > half) head_end = half;
+    if (len - tail_start > half) tail_start = len - half;
+    if (tail_start <= head_end) return 0;          /* nothing left to drop */
+
+    size_t dropped_bytes = tail_start - head_end;
+    int dropped_lines = 0;
+    for (size_t i = head_end; i < tail_start; i++) if (s[i] == '\n') dropped_lines++;
+
+    char marker[96];
+    int mlen = snprintf(marker, sizeof marker,
+        "\n[... %d lines / %zu chars truncated (head+tail kept) ...]\n",
+        dropped_lines, dropped_bytes);
+    if (mlen < 0) return 0;
+
+    size_t tail_len = len - tail_start;
+    size_t newlen = head_end + (size_t)mlen + tail_len;
+    char *tmp = malloc(newlen + 1);
+    if (!tmp) return 0;                             /* OOM: leave original intact */
+    memcpy(tmp, s, head_end);
+    memcpy(tmp + head_end, marker, (size_t)mlen);
+    memcpy(tmp + head_end + (size_t)mlen, s + tail_start, tail_len);
+    tmp[newlen] = '\0';
+    memcpy(s, tmp, newlen + 1);
+    free(tmp);
+    return dropped_bytes;
 }
 
 /* Append one argument to a shell-command buffer, single-quote escaped so that
@@ -2392,13 +2454,15 @@ static void run_agentic_turn(char *user_input,
                 free(unknown_tool);
                 if (ncalls) basi_free_tool_calls(ncalls, n_ncalls);
 
-                /* Truncate tool result if too large */
+                /* Truncate tool result if too large — line-aware, head+tail. */
                 size_t tr_len = strlen(tool_result);
-                if (tr_len > MAX_TOOL_RESULT_SZ) {
-                    printf("\033[90m[Truncated: %zu → %d chars]\033[0m\n",
-                           tr_len, MAX_TOOL_RESULT_SZ);
-                    strcpy(tool_result + MAX_TOOL_RESULT_SZ - 40,
-                           "\n\n[... content truncated ...]");
+                size_t dropped = truncate_tool_result(tool_result,
+                        TOOL_RESULT_HEAD_LINES, TOOL_RESULT_TAIL_LINES,
+                        TOOL_RESULT_MAX_BYTES);
+                if (dropped) {
+                    printf("\033[90m[Truncated tool result: %zu → %zu chars "
+                           "(head+tail, %zu dropped)]\033[0m\n",
+                           tr_len, strlen(tool_result), dropped);
                 }
 
                 llama_memory_t mem = llama_get_memory(ctx);
