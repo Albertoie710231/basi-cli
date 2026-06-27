@@ -321,9 +321,20 @@ void session_load_into(
         (*messages)[*msg_count].content = contents[i];
         (*msg_count)++;
         loaded++;
+
+        /* Re-render the turn so the human sees their prior conversation on
+           resume. The model already has it in context; this is purely the
+           scrollback. Match the live look: green "> " for the user turn,
+           the assistant's reply plain. */
+        if (strcmp(role_lit, "user") == 0)
+            printf("\033[32m> \033[0m%s\n", contents[i]);
+        else
+            printf("%s\n", contents[i]);
+
         free(roles[i]);
         contents[i] = NULL;
     }
+    if (loaded > 0) printf("\n");
 
     for (int i = 0; i < start; i++) {
         free(roles[i]);
