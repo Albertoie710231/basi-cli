@@ -241,11 +241,18 @@ static bool enable_raw_mode(void) {
     raw.c_cc[VTIME] = 0;
     if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) < 0) return false;
     raw_mode_enabled = true;
+    /* Enable bracketed paste: the terminal now wraps pasted text in
+       ESC[200~ ... ESC[201~, so the line editor can tell a typed Enter
+       (submit) from a newline inside a paste (keep as content). */
+    printf("\033[?2004h");
+    fflush(stdout);
     return true;
 }
 
 static void disable_raw_mode(void) {
     if (raw_mode_enabled) {
+        printf("\033[?2004l");   /* disable bracketed paste */
+        fflush(stdout);
         tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig_termios);
         raw_mode_enabled = false;
     }
@@ -280,6 +287,7 @@ static char *read_line(const char *prompt) {
     sb_init(&line);
     size_t cursor = 0;
     int hist_idx = history_count;
+    bool paste_mode = false;   /* true between ESC[200~ and ESC[201~ */
 
     StringBuf saved;
     sb_init(&saved);
@@ -299,6 +307,14 @@ static char *read_line(const char *prompt) {
         }
 
         if (ch == '\n' || ch == '\r') {
+            if (paste_mode) {
+                /* Newline inside a paste is content, not a submit. */
+                sb_ensure(&line, 1);
+                line.data[line.len++] = '\n';
+                cursor = line.len;
+                putchar('\n');
+                continue;
+            }
             printf("\n");
             fflush(stdout);
             break;
@@ -307,6 +323,18 @@ static char *read_line(const char *prompt) {
             unsigned char seq[2];
             if (read(STDIN_FILENO, seq, 2) < 2) continue;
             if (seq[0] == '[') {
+                if (seq[1] == '2') {
+                    /* Bracketed paste markers: ESC[200~ (start) / ESC[201~
+                       (end). Both begin "ESC[2"; read the 3 trailing bytes
+                       to tell them apart. (Delete is ESC[3~, handled below.) */
+                    unsigned char rest[3];
+                    if (read(STDIN_FILENO, rest, 3) == 3 &&
+                        rest[0] == '0' && rest[2] == '~') {
+                        if (rest[1] == '0')      paste_mode = true;
+                        else if (rest[1] == '1') { paste_mode = false; fflush(stdout); }
+                    }
+                    continue;
+                }
                 switch (seq[1]) {
                 case 'A': /* Up - history prev */
                     if (history_count > 0 && hist_idx > 0) {
@@ -385,6 +413,15 @@ static char *read_line(const char *prompt) {
                 default:
                     break;
                 }
+            }
+        } else if (paste_mode) {
+            /* Inside a paste: take bytes literally (printable + tab),
+               appended at the end. Drop other control bytes. */
+            if (ch == '\t' || ch >= 32) {
+                sb_ensure(&line, 1);
+                line.data[line.len++] = ch;
+                cursor = line.len;
+                putchar(ch);
             }
         } else if (ch == 127 || ch == 8) {
             /* Backspace */
