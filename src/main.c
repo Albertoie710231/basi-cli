@@ -73,7 +73,7 @@ static const char *SYSTEM_PROMPT_FMT =
     "  Use this when the user asks 'what is X', 'signature of X', or 'show me the definition of X'.\n"
     "\n"
     "SHELL TOOL:\n"
-    "- bash <command> : Run an arbitrary shell command via 'bash -c'. ALWAYS requires user approval before execution; the user may deny. Use for builds (make, cargo, npm), tests, git operations, or anything not covered by the other tools. Prefer specific commands; avoid destructive operations (rm -rf, package installs) without explaining first. Output combines stdout and stderr.\n"
+    "- bash <command> : Run an arbitrary shell command via 'bash -c'. ALWAYS requires user approval before execution; the user may deny. Use for builds (make, cargo, npm), tests, git operations, or anything not covered by the other tools. Prefer specific commands; avoid destructive operations (rm -rf, package installs) without explaining first. Output combines stdout and stderr. Commands are killed after a timeout (default 120s); keep them bounded — if a test or program run is killed, your code is probably too slow or looping, so optimize it.\n"
     "  Examples: <tool>bash make</tool>  <tool>bash git status</tool>  <tool>bash ls -la src/</tool>\n"
     "\n"
     "EDIT TOOL:\n"
@@ -854,8 +854,30 @@ static char *execute_tool(const char *command) {
                 else sb_append_char(&wrapped, *c);
             }
             sb_append_str(&wrapped, "' 2>&1");
-            char *result = run_command(sb_to_str(&wrapped), 512 * 1024);
+            int bash_tmo = 120;            /* seconds; override via env, cap 600 */
+            const char *tenv = getenv("BASI_BASH_TIMEOUT");
+            if (tenv) { int v = atoi(tenv); if (v > 0) bash_tmo = v; }
+            if (bash_tmo > 600) bash_tmo = 600;
+            int timed_out = 0;
+            char *result = run_command_timeout(sb_to_str(&wrapped), 512 * 1024,
+                                               bash_tmo, &timed_out);
             sb_free(&wrapped);
+            if (timed_out) {
+                printf("\033[31m[bash: timed out after %ds — process group killed]\033[0m\n",
+                       bash_tmo);
+                fflush(stdout);
+                StringBuf m;
+                sb_init(&m);
+                if (result) { sb_append_str(&m, result); free(result); }
+                char note[320];
+                snprintf(note, sizeof note,
+                    "\n\n[bash: command timed out after %ds and was killed. If it is "
+                    "genuinely long-running, split or simplify it. If it is a test or "
+                    "program run, your code is likely too slow (e.g. exponential) or "
+                    "stuck in a loop — find the inefficiency and optimize it.]", bash_tmo);
+                sb_append_str(&m, note);
+                return sb_to_str(&m);
+            }
             return result;
         }
     }

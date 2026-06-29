@@ -36,6 +36,10 @@ char  *run_command(const char *cmd, size_t max_output);  /* malloc'd, caller fre
  * via *exit_code (if non-NULL): WEXITSTATUS on normal exit, -signal if killed,
  * -1 otherwise. malloc'd output, caller frees. */
 char  *run_command_status(const char *cmd, size_t max_output, int *exit_code);
+/* Like run_command, but kills the child's whole process group after timeout_s
+ * (SIGTERM then SIGKILL). Sets *timed_out=1 iff the deadline was hit. */
+char  *run_command_timeout(const char *cmd, size_t max_output, int timeout_s,
+                           int *timed_out);
 char  *read_file_all(const char *path, size_t *out_len); /* whole file → malloc'd buf (NUL-terminated); NULL on error; sets *out_len (excl. NUL) */
 int    mkdir_p(const char *path);                         /* recursive mkdir, idempotent */
 size_t count_lines(FILE *f);                              /* leaves f rewound */

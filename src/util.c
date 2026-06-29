@@ -5,6 +5,10 @@
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <errno.h>
+#include <unistd.h>
+#include <signal.h>
+#include <poll.h>
+#include <dirent.h>
 
 #include "util.h"
 
@@ -149,6 +153,147 @@ char *run_command_status(const char *cmd, size_t max_output, int *exit_code) {
 
 char *run_command(const char *cmd, size_t max_output) {
     return run_command_status(cmd, max_output, NULL);
+}
+
+/* Read ppid (field 4) from /proc/<pid>/stat — robust to a comm with spaces or
+ * parens by scanning past the last ')'. Returns -1 on failure. */
+static pid_t read_ppid(pid_t pid) {
+    char path[64];
+    snprintf(path, sizeof path, "/proc/%d/stat", (int)pid);
+    FILE *f = fopen(path, "r");
+    if (!f) return -1;
+    char line[1024];
+    char *got = fgets(line, sizeof line, f);
+    fclose(f);
+    if (!got) return -1;
+    char *rp = strrchr(line, ')');
+    if (!rp) return -1;
+    char st; int ppid = -1;
+    if (sscanf(rp + 1, " %c %d", &st, &ppid) < 2) return -1;
+    return (pid_t)ppid;
+}
+
+/* Collect all descendant PIDs of `root` (excluding root) by scanning /proc and
+ * following PPID links. Call BEFORE killing anything, while the tree is intact —
+ * this catches children a shell put in their OWN process group via `cmd &`, which
+ * a single killpg() would miss. Returns the count written to out[] (up to cap). */
+static int collect_descendants(pid_t root, pid_t *out, int cap) {
+    static pid_t pids[8192], ppids[8192];
+    static char  isdesc[8192];
+    int n = 0;
+    DIR *d = opendir("/proc");
+    if (!d) return 0;
+    struct dirent *e;
+    while ((e = readdir(d)) && n < 8192) {
+        int allnum = (e->d_name[0] != '\0');
+        for (const char *c = e->d_name; *c; c++) if (*c < '0' || *c > '9') { allnum = 0; break; }
+        if (!allnum) continue;
+        pid_t p = (pid_t)atoi(e->d_name);
+        pid_t pp = read_ppid(p);
+        if (pp < 0) continue;
+        pids[n] = p; ppids[n] = pp; isdesc[n] = 0; n++;
+    }
+    closedir(d);
+    /* iterate to a fixed point: a node is a descendant if its parent is root or
+     * an already-marked descendant */
+    int changed = 1;
+    while (changed) {
+        changed = 0;
+        for (int i = 0; i < n; i++) {
+            if (isdesc[i]) continue;
+            int mark = (ppids[i] == root);
+            if (!mark)
+                for (int j = 0; j < n; j++)
+                    if (isdesc[j] && pids[j] == ppids[i]) { mark = 1; break; }
+            if (mark) { isdesc[i] = 1; changed = 1; }
+        }
+    }
+    int count = 0;
+    for (int i = 0; i < n && count < cap; i++) if (isdesc[i]) out[count++] = pids[i];
+    return count;
+}
+
+/* Run a shell command with a wall-clock timeout. The child runs in its own
+ * process group; on expiry the WHOLE group is killed (SIGTERM, then SIGKILL
+ * after a short grace) so a runaway descendant (e.g. a hung test runner or an
+ * exponential solution) can't outlive the call. Output is captured up to
+ * max_output bytes (the rest is drained so the child never blocks on a full
+ * pipe). Sets *timed_out=1 iff the deadline was hit. Caller frees. */
+char *run_command_timeout(const char *cmd, size_t max_output, int timeout_s,
+                          int *timed_out) {
+    if (timed_out) *timed_out = 0;
+    if (timeout_s <= 0) timeout_s = 120;
+
+    int pfd[2];
+    if (pipe(pfd) != 0) return strdup("Error: pipe failed");
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(pfd[0]); close(pfd[1]);
+        return strdup("Error: fork failed");
+    }
+    if (pid == 0) {
+        /* child: own process group, stdout+stderr -> pipe, exec the shell */
+        setpgid(0, 0);
+        close(pfd[0]);
+        dup2(pfd[1], STDOUT_FILENO);
+        dup2(pfd[1], STDERR_FILENO);
+        close(pfd[1]);
+        execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
+        _exit(127);
+    }
+
+    /* parent */
+    close(pfd[1]);
+    setpgid(pid, pid);                       /* race-safe; ignore errors */
+
+    StringBuf sb; sb_init(&sb);
+    char buf[4096];
+    time_t deadline = time(NULL) + timeout_s;
+    int hit_timeout = 0;
+
+    for (;;) {
+        long remaining = (long)deadline - (long)time(NULL);
+        if (remaining <= 0) { hit_timeout = 1; break; }
+        struct pollfd p = { pfd[0], POLLIN, 0 };
+        int pr = poll(&p, 1, remaining > 1 ? 1000 : (int)(remaining * 1000));
+        if (pr < 0) { if (errno == EINTR) continue; break; }
+        if (pr == 0) continue;               /* idle; re-check the deadline */
+        ssize_t n = read(pfd[0], buf, sizeof buf);
+        if (n <= 0) break;                   /* EOF: child finished */
+        if (sb.len < max_output) {
+            size_t take = (size_t)n;
+            if (sb.len + take > max_output) take = max_output - sb.len;
+            sb_append(&sb, buf, take);
+        }
+        /* output beyond max_output is read and discarded above the cap */
+    }
+    close(pfd[0]);
+
+    if (hit_timeout) {
+        if (timed_out) *timed_out = 1;
+        pid_t pgid = pid;                     /* child is its own group leader */
+        /* snapshot the descendant tree BEFORE killing (so `cmd &` children that
+         * escaped into their own process group are still reachable by PID) */
+        pid_t desc[1024];
+        int nd = collect_descendants(pid, desc, 1024);
+        kill(-pgid, SIGTERM);
+        for (int i = 0; i < nd; i++) kill(desc[i], SIGTERM);
+        int reaped = 0;
+        for (int i = 0; i < 30; i++) {        /* up to ~3s grace for SIGTERM */
+            if (waitpid(pid, NULL, WNOHANG) == pid) { reaped = 1; break; }
+            struct timespec ts = { 0, 100L * 1000 * 1000 };
+            nanosleep(&ts, NULL);
+        }
+        kill(-pgid, SIGKILL);                 /* sweep in-group stragglers */
+        for (int i = 0; i < nd; i++) kill(desc[i], SIGKILL);  /* and out-of-group ones */
+        if (!reaped) waitpid(pid, NULL, 0);
+    } else {
+        waitpid(pid, NULL, 0);
+    }
+
+    if (sb.len == 0) { sb_free(&sb); return strdup(""); }
+    return sb_to_str(&sb);
 }
 
 /* ── Read a whole file into a malloc'd, NUL-terminated buffer ───────── */
