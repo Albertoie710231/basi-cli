@@ -85,6 +85,12 @@ extern volatile sig_atomic_t generate_keep_think;
  * instead of the JSON. Display-only; does not affect parsing or the model. */
 extern volatile sig_atomic_t generate_native_tools;
 
+/* When set, generate() renders the live answer stream as markdown (headings,
+ * bold/italic, code, lists, quotes, rules, links → ANSI) instead of printing
+ * raw text. Interactive TTY only; off for -p/piped output so it stays
+ * plain/parseable, and off in generate_quiet. Display-only. */
+extern volatile sig_atomic_t generate_markdown;
+
 /* y/n/a approval prompt for risky tools.
  * Returns: 0 = deny, 1 = allow once, 2 = always (caller sets flag). */
 int request_approval(const char *tool_label, const char *cmd);

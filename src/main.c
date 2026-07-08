@@ -186,6 +186,7 @@ volatile sig_atomic_t show_thinking = 0;
 volatile sig_atomic_t generate_quiet = 0;
 volatile sig_atomic_t generate_keep_think = 0;
 volatile sig_atomic_t generate_native_tools = 0;
+volatile sig_atomic_t generate_markdown = 0;
 
 /* Tool-call grammar sampler (phase 2b): built once when native tools are active,
    inserted into the sampler chain, and reset before each generation (it is lazy
@@ -1126,6 +1127,67 @@ static char *execute_tool_native(const char *name, const char *args_json) {
 
 
 
+/* ── Persistent default model ──────────────────────────────────────────
+ * The last model chosen via the picker or /model is remembered here, so BASI
+ * drops straight into chat on every later launch instead of re-prompting.
+ * Resolution order at launch: -m (explicit) > this default > $BASI_MODEL >
+ * first-run picker. Best-effort: any I/O failure just falls through. */
+static void default_model_dir(char *out, size_t n) {
+    const char *xdg  = getenv("XDG_CONFIG_HOME");
+    const char *home = getenv("HOME");
+    if (xdg && *xdg)        snprintf(out, n, "%s/basi-cli", xdg);
+    else if (home && *home) snprintf(out, n, "%s/.config/basi-cli", home);
+    else                    snprintf(out, n, ".basi");
+}
+
+static void save_default_model(const char *path, int ngl, int ctx) {
+    if (!path || !*path) return;
+    char dir[512]; default_model_dir(dir, sizeof dir);
+    if (mkdir(dir, 0755) != 0 && errno == ENOENT) {
+        char *slash = strrchr(dir, '/');   /* create the parent (~/.config) too */
+        if (slash) { *slash = '\0'; mkdir(dir, 0755); *slash = '/'; mkdir(dir, 0755); }
+    }
+    char file[600]; snprintf(file, sizeof file, "%s/default-model", dir);
+    FILE *f = fopen(file, "w");
+    if (!f) return;
+    fprintf(f, "%s\n", path);
+    if (ngl >= 0) fprintf(f, "ngl=%d\n", ngl);
+    if (ctx >  0) fprintf(f, "ctx=%d\n", ctx);
+    fclose(f);
+}
+
+/* Load the saved default into path_out (+ optional ngl/ctx). Returns true only
+ * if a model was recorded AND still exists on disk (a deleted model falls
+ * through to the next resolution step rather than failing the launch). */
+static bool load_default_model(char *path_out, size_t n, int *ngl, int *ctx) {
+    char dir[512]; default_model_dir(dir, sizeof dir);
+    char file[600]; snprintf(file, sizeof file, "%s/default-model", dir);
+    FILE *f = fopen(file, "r");
+    if (!f) return false;
+    path_out[0] = '\0';
+    char line[1100];
+    while (fgets(line, sizeof line, f)) {
+        size_t l = strlen(line);
+        while (l && (line[l-1] == '\n' || line[l-1] == '\r')) line[--l] = '\0';
+        if (!line[0]) continue;
+        if (strncmp(line, "ngl=", 4) == 0)      { if (ngl) *ngl = atoi(line + 4); }
+        else if (strncmp(line, "ctx=", 4) == 0) { if (ctx) *ctx = atoi(line + 4); }
+        else if (!path_out[0])                   snprintf(path_out, n, "%s", line);
+    }
+    fclose(f);
+    if (!path_out[0]) return false;
+    return access(path_out, R_OK) == 0;
+}
+
+/* Does a default-model config file exist at all (valid or not)? Used to decide
+ * whether to auto-seed it from the first model loaded — we seed only when none
+ * exists, so a one-off -m/$BASI_MODEL never clobbers a default the user set. */
+static bool default_model_file_exists(void) {
+    char dir[512]; default_model_dir(dir, sizeof dir);
+    char file[600]; snprintf(file, sizeof file, "%s/default-model", dir);
+    return access(file, F_OK) == 0;
+}
+
 /* ── CLI argument parsing ──────────────────────────────────────────── */
 
 typedef struct {
@@ -1140,6 +1202,8 @@ typedef struct {
     float       cli_temp;           /* -t/--temp: sampling temp (<0 = default) */
     uint32_t    cli_seed;           /* --seed: RNG seed for sampling */
     bool        bypass;             /* --yolo/--bypass: auto-approve all tool actions */
+    const char *resume_path;        /* --resume: reload this session file, skip picker */
+    bool        pick;               /* --pick: force the model picker (used by /model) */
     bool        want_exit;          /* -h/--help: caller should return exit_code */
     int         exit_code;
 } Cli;
@@ -1149,8 +1213,8 @@ static Cli parse_args(int argc, char **argv) {
         .model_path = NULL, .n_gpu_layers = 99, .ngl_set = false,
         .deepsearch_q = NULL, .prompt = NULL, .no_tools = false,
         .system_override = NULL, .cli_ctx = 0, .cli_temp = -1.0f,
-        .cli_seed = LLAMA_DEFAULT_SEED, .bypass = false,
-        .want_exit = false, .exit_code = 0,
+        .cli_seed = LLAMA_DEFAULT_SEED, .bypass = false, .resume_path = NULL,
+        .pick = false, .want_exit = false, .exit_code = 0,
     };
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-m") == 0 && i + 1 < argc) {
@@ -1179,6 +1243,10 @@ static Cli parse_args(int argc, char **argv) {
             c.no_tools = true;
         } else if (strcmp(argv[i], "--yolo") == 0 || strcmp(argv[i], "--bypass") == 0) {
             c.bypass = true;
+        } else if (strcmp(argv[i], "--resume") == 0 && i + 1 < argc) {
+            c.resume_path = argv[++i];
+        } else if (strcmp(argv[i], "--pick") == 0) {
+            c.pick = true;
         } else if ((strcmp(argv[i], "-s") == 0 || strcmp(argv[i], "--system") == 0)
                    && i + 1 < argc) {
             c.system_override = argv[++i];
@@ -1206,10 +1274,15 @@ static Cli parse_args(int argc, char **argv) {
                    "                  approval prompt is auto-denied otherwise). Dangerous: only on\n"
                    "                  code/dirs you trust.\n"
                    "  --deepsearch    Run multi-round deep research (web + KB) non-interactively, then exit\n"
+                   "  --resume <file> Reload a session file and skip the picker (used by /model)\n"
                    "  -d              Debug mode (verbose tool output)\n"
                    "  -h              Show this help\n\n"
+                   "Model selection:\n"
+                   "  With no -m, BASI uses the saved default (set by the first-run picker or\n"
+                   "  the in-chat /model command), then $BASI_MODEL, then the picker. So after\n"
+                   "  you pick once, later launches go straight to chat; /model switches later.\n\n"
                    "Environment:\n"
-                   "  BASI_MODEL             Default model path if -m not specified\n"
+                   "  BASI_MODEL             Fallback model path if -m and no saved default\n"
                    "  BASI_DEEPSEARCH_ROUNDS Max deep-research rounds (default 5)\n"
                    "  BASI_DEEPSEARCH_CTX    Deep-research context size (default 32768; lower for\n"
                    "                         interactive /deepsearch on a single GPU)\n\n");
@@ -1607,6 +1680,382 @@ static void derive_model_tag(const char *path, char *out, size_t n) {
         if (*p >= 'A' && *p <= 'Z') *p += 32;
 }
 
+/* ── Tool-activity display ─────────────────────────────────────────────
+ * Render each tool call as a colour-graded bullet + tool name + its key
+ * argument (the file/command/query — which the old flat "[Executing: read]"
+ * never showed), with the outcome folded in as a dim indented sub-line.
+ * Everything is display-only chrome; it never touches what the model sees. */
+
+/* Display columns of a UTF-8 string: count bytes that aren't continuation
+ * bytes (0x80–0xBF). Correct for the box-drawing glyphs and "·" used here,
+ * which are multi-byte but one column wide. */
+static size_t disp_width(const char *s) {
+    size_t w = 0;
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++)
+        if ((*p & 0xC0) != 0x80) w++;
+    return w;
+}
+
+/* Collapse whitespace runs to single spaces (trimming ends) and ellipsize to
+ * `maxw` display columns, in place and UTF-8-safe. Turns a multi-line shell
+ * command or a long path into one tidy argument fragment. */
+static void tidy_arg(char *s, int maxw) {
+    if (!s) return;
+    char *w = s;
+    bool prev_sp = false, started = false;
+    for (char *r = s; *r; r++) {
+        unsigned char c = (unsigned char)*r;
+        if (c == '\n' || c == '\t' || c == '\r' || c == ' ') {
+            if (!started || prev_sp) continue;   /* trim leading, collapse runs */
+            *w++ = ' '; prev_sp = true;
+        } else {
+            *w++ = (char)c; prev_sp = false; started = true;
+        }
+    }
+    while (w > s && w[-1] == ' ') w--;            /* trim trailing */
+    *w = '\0';
+    if (maxw <= 1) return;
+    size_t cols = 0; char *p = s;
+    while (*p) {
+        if (((unsigned char)*p & 0xC0) != 0x80) {
+            if ((int)cols >= maxw - 1) break;     /* leave a column for "…" */
+            cols++;
+        }
+        p++;
+    }
+    if (*p) strcpy(p, "\xe2\x80\xa6");            /* … at the UTF-8 boundary */
+}
+
+/* Display-only extractor: copy the value of top-level string key "key" out of a
+ * JSON argument blob into `out` (light unescaping). Not a general parser — just
+ * enough to pull a path/command/query for the activity line. */
+static bool json_str_field(const char *json, const char *key, char *out, size_t n) {
+    if (!json || !key || n == 0) return false;
+    char pat[64];
+    int pl = snprintf(pat, sizeof pat, "\"%s\"", key);
+    if (pl < 0 || (size_t)pl >= sizeof pat) return false;
+    const char *p = strstr(json, pat);
+    if (!p) return false;
+    p += pl;
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+    if (*p != ':') return false;
+    p++;
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+    if (*p != '"') return false;                  /* only string values */
+    p++;
+    size_t o = 0;
+    while (*p && *p != '"' && o + 1 < n) {
+        if (*p == '\\' && p[1]) {
+            p++;
+            char c = *p;
+            if (c == 'n') c = '\n'; else if (c == 't') c = '\t';
+            else if (c == 'r') c = '\r';
+            out[o++] = c;
+        } else {
+            out[o++] = *p;
+        }
+        p++;
+    }
+    out[o] = '\0';
+    return o > 0;
+}
+
+/* 256-colour bullet by tool category: blue = inspect, green = mutate,
+ * amber = shell, teal = network, grey = other. */
+static const char *tool_bullet_color(const char *tool) {
+    if (!tool) return "\033[38;5;245m";
+    if (!strcmp(tool,"read")||!strcmp(tool,"list")||!strcmp(tool,"ls")||
+        !strcmp(tool,"grep")||!strcmp(tool,"search")||!strcmp(tool,"glob")||
+        !strcmp(tool,"tree")||!strcmp(tool,"cat")||!strcmp(tool,"find"))
+        return "\033[38;5;110m";
+    if (!strcmp(tool,"edit")||!strcmp(tool,"write")||!strcmp(tool,"scaffold")||
+        !strcmp(tool,"patch")||!strcmp(tool,"apply_patch")||!strcmp(tool,"plan_write"))
+        return "\033[38;5;71m";
+    if (!strcmp(tool,"bash")||!strcmp(tool,"shell")||!strcmp(tool,"run"))
+        return "\033[38;5;179m";
+    if (!strcmp(tool,"web")||!strcmp(tool,"web_search")||!strcmp(tool,"web_fetch")||
+        !strcmp(tool,"deepsearch")||!strcmp(tool,"fetch")||!strcmp(tool,"search_web"))
+        return "\033[38;5;108m";
+    return "\033[38;5;245m";
+}
+
+/* Pull the single most relevant argument for `tool` from its JSON args. */
+static void tool_display_arg(const char *tool, const char *args, char *out, size_t n) {
+    out[0] = '\0';
+    if (!args) return;
+    const char *pref = "path";
+    if (tool) {
+        if (!strcmp(tool,"bash")||!strcmp(tool,"shell")||!strcmp(tool,"run")) pref = "command";
+        else if (!strcmp(tool,"grep")||!strcmp(tool,"search")) pref = "pattern";
+        else if (!strcmp(tool,"web")||!strcmp(tool,"web_search")||!strcmp(tool,"deepsearch")) pref = "query";
+        else if (!strcmp(tool,"web_fetch")||!strcmp(tool,"fetch")) pref = "url";
+    }
+    if (json_str_field(args, pref, out, n) && out[0]) return;
+    static const char *keys[] = {"path","file_path","file","command","cmd",
+                                 "pattern","query","q","url","name","slug",NULL};
+    for (int i = 0; keys[i]; i++)
+        if (json_str_field(args, keys[i], out, n) && out[0]) return;
+}
+
+/* One-line summary of a tool result; returns true when it reads as an error
+ * (so the caller can colour the sub-line red). */
+static bool tool_result_summary(const char *result, char *out, size_t n) {
+    if (!result || !*result) { snprintf(out, n, "(no output)"); return false; }
+    bool err = (result[0] == 'E' || result[0] == 'e') &&
+               strncmp(result + 1, "rror", 4) == 0;
+    size_t first_len = strcspn(result, "\n");
+    size_t lines = 0;
+    for (const char *p = result; *p; p++) if (*p == '\n') lines++;
+    if (result[strlen(result) - 1] != '\n') lines++;
+    if (err || lines <= 1) {                      /* show the (first) line itself */
+        size_t m = first_len < n - 1 ? first_len : n - 1;
+        memcpy(out, result, m); out[m] = '\0';
+        tidy_arg(out, 60);
+        if (!err && !out[0]) snprintf(out, n, "ok");
+        return err;
+    }
+    snprintf(out, n, "%zu lines", lines);
+    return false;
+}
+
+/* Activity header: "● tool  arg" with a category-coloured bullet. Printed
+ * immediately (before the tool runs) so a slow local model still shows life. */
+static void print_tool_activity(const char *tool, const char *args) {
+    char arg[256];
+    tool_display_arg(tool, args, arg, sizeof arg);
+    tidy_arg(arg, 60);
+    printf("%s\xe2\x97\x8f\033[0m \033[38;5;252m%s\033[0m",
+           tool_bullet_color(tool), tool ? tool : "?");
+    if (arg[0]) printf("  \033[38;5;245m%s\033[0m", arg);
+    printf("\n");
+    fflush(stdout);
+}
+
+/* Same, for the legacy path where the call is a "tool args…" shell string:
+ * first token is the tool (for the bullet colour), the rest is the argument. */
+static void print_tool_activity_raw(const char *cmd) {
+    if (!cmd) return;
+    char tool[32]; size_t i = 0;
+    while (cmd[i] && cmd[i] != ' ' && i + 1 < sizeof tool) { tool[i] = cmd[i]; i++; }
+    tool[i] = '\0';
+    const char *arg = cmd + i;
+    while (*arg == ' ') arg++;
+    char abuf[256];
+    snprintf(abuf, sizeof abuf, "%s", arg);
+    tidy_arg(abuf, 60);
+    printf("%s\xe2\x97\x8f\033[0m \033[38;5;252m%s\033[0m",
+           tool_bullet_color(tool), tool[0] ? tool : "?");
+    if (abuf[0]) printf("  \033[38;5;245m%s\033[0m", abuf);
+    printf("\n");
+    fflush(stdout);
+}
+
+/* Result sub-line: "    └ <summary>" — dim by default, red on error, with a
+ * "· trimmed Nk" note when the result was truncated before the model saw it. */
+static void print_tool_result_line(const char *result, size_t dropped) {
+    char summary[160];
+    bool err = tool_result_summary(result, summary, sizeof summary);
+    if (dropped) {
+        size_t l = strlen(summary);
+        char cbuf[24];
+        if (dropped >= 1000) snprintf(cbuf, sizeof cbuf, "%zuk", (dropped + 500) / 1000);
+        else                 snprintf(cbuf, sizeof cbuf, "%zu", dropped);
+        snprintf(summary + l, sizeof summary - l, " \xc2\xb7 trimmed %s", cbuf);
+    }
+    printf("    \033[38;5;240m\xe2\x94\x94 \033[0m%s%s\033[0m\n",
+           err ? "\033[38;5;167m" : "\033[38;5;240m", summary);
+    fflush(stdout);
+}
+
+/* ── Startup banner ────────────────────────────────────────────────────
+ * A compact rounded info box printed once the model + context are live, so it
+ * can show the ACTUAL loaded context (post-OOM-retry) and GPU layer count.
+ * Interactive TTY only — the load path already gates this off pipes/-p. */
+static void banner_print_row(size_t inner, const char *text) {
+    size_t k = 0; while (text[k] && text[k] != ' ') k++;   /* first token = label */
+    size_t cw = 2 + disp_width(text);                      /* 2-space indent */
+    size_t pad = inner > cw ? inner - cw : 0;
+    printf("\033[38;5;240m\xe2\x94\x82\033[0m  "
+           "\033[38;5;245m%.*s\033[38;5;110m%s",
+           (int)k, text, text + k);
+    for (size_t i = 0; i < pad; i++) putchar(' ');
+    printf("\033[0m\033[38;5;240m\xe2\x94\x82\033[0m\n");
+}
+
+static void print_startup_banner(const char *model_path, int n_ctx, int n_gpu) {
+    char model_tag[32];
+    derive_model_tag(model_path, model_tag, sizeof model_tag);
+    if (!model_tag[0]) snprintf(model_tag, sizeof model_tag, "(model)");
+
+    char cwd[512];
+    if (!getcwd(cwd, sizeof cwd)) snprintf(cwd, sizeof cwd, "?");
+    const char *home = getenv("HOME");
+    char cwddisp[520];
+    size_t hl = home ? strlen(home) : 0;
+    if (hl && strncmp(cwd, home, hl) == 0 && (cwd[hl] == '/' || cwd[hl] == '\0'))
+        snprintf(cwddisp, sizeof cwddisp, "~%s", cwd + hl);
+    else
+        snprintf(cwddisp, sizeof cwddisp, "%s", cwd);
+    tidy_arg(cwddisp, 60);
+
+    char row_model[80], row_ctx[80], row_cwd[540];
+    snprintf(row_model, sizeof row_model, "model   %s", model_tag);
+    snprintf(row_ctx,   sizeof row_ctx,   "ctx     %d tokens    gpu   %d layers", n_ctx, n_gpu);
+    snprintf(row_cwd,   sizeof row_cwd,   "cwd     %s", cwddisp);
+
+    const char *title = "BASI \xc2\xb7 local coding agent";
+    size_t rows_w = disp_width(row_model);
+    if (disp_width(row_ctx) > rows_w) rows_w = disp_width(row_ctx);
+    if (disp_width(row_cwd) > rows_w) rows_w = disp_width(row_cwd);
+    size_t inner = rows_w + 2;                      /* 2-space left indent */
+    if (inner < disp_width(title) + 4) inner = disp_width(title) + 4;
+    if (inner < 34) inner = 34;
+    if (inner > 76) inner = 76;
+
+    /* top border: ╭─ TITLE ──…──╮ */
+    printf("\n\033[38;5;240m\xe2\x95\xad\xe2\x94\x80 \033[38;5;110m%s "
+           "\033[38;5;240m", title);
+    /* sequence between the corners so far: "─"(1) + " "(1) + title + " "(1) */
+    size_t used = disp_width(title) + 3;
+    for (size_t i = used; i < inner; i++) printf("\xe2\x94\x80");
+    printf("\xe2\x95\xae\033[0m\n");
+
+    banner_print_row(inner, row_model);
+    banner_print_row(inner, row_ctx);
+    banner_print_row(inner, row_cwd);
+
+    /* bottom border */
+    printf("\033[38;5;240m\xe2\x95\xb0");
+    for (size_t i = 0; i < inner; i++) printf("\xe2\x94\x80");
+    printf("\xe2\x95\xaf\033[0m\n\n");
+    fflush(stdout);
+}
+
+/* ── /model: switch the active model ───────────────────────────────────
+ * Resolves the request (no arg → picker TUI; a readable .gguf path → that file;
+ * else a case-insensitive substring over the scanned models), records it as the
+ * new default, and switches by RE-EXECING the process. Re-exec is the robust
+ * path: it rebuilds the whole model → context → sampler → tool-grammar →
+ * template stack through the normal startup instead of a fragile in-place
+ * teardown, and gives correct fresh-KV semantics. The live conversation rides
+ * across via --resume, so the chat continues under the new model with no menus.
+ * Returns (REPL continues) on cancel / no-match / same model / exec failure;
+ * on success execv never returns. */
+static bool ci_contains(const char *hay, const char *needle) {
+    if (!needle || !*needle) return true;
+    size_t nl = strlen(needle);
+    for (const char *h = hay; *h; h++) {
+        size_t i = 0;
+        while (i < nl && h[i]) {
+            char a = h[i], b = needle[i];
+            if (a >= 'A' && a <= 'Z') a += 32;
+            if (b >= 'A' && b <= 'Z') b += 32;
+            if (a != b) break;
+            i++;
+        }
+        if (i == nl) return true;
+    }
+    return false;
+}
+
+static void try_model_switch(const char *arg, char **argv, int argc,
+                             const char *cur_model, int cur_ngl,
+                             const char *session_path,
+                             struct llama_context *ctx) {
+    char *new_path = NULL;              /* set for a named / substring switch */
+    int   new_ngl  = cur_ngl;
+    bool  use_picker = false;
+
+    if (!arg || !*arg) {
+        use_picker = true;              /* defer the picker to the fresh child */
+    } else if (access(arg, R_OK) == 0 && strstr(arg, ".gguf")) {
+        new_path = strdup(arg);         /* direct path */
+    } else {                            /* substring over scanned models */
+        char **models = NULL;
+        int n = basi_list_models(&models);
+        int match = -1, matches = 0;
+        for (int i = 0; i < n; i++) {
+            const char *base = strrchr(models[i], '/');
+            if (ci_contains(base ? base + 1 : models[i], arg)) { matches++; match = i; }
+        }
+        if (matches == 1) {
+            new_path = strdup(models[match]);
+        } else if (matches == 0) {
+            printf("\033[31m[/model: no model matches '%s']\033[0m\n", arg);
+        } else {
+            printf("\033[33m[/model: '%s' matches %d models — be more specific:]\033[0m\n",
+                   arg, matches);
+            for (int i = 0; i < n; i++) {
+                const char *base = strrchr(models[i], '/');
+                base = base ? base + 1 : models[i];
+                if (ci_contains(base, arg)) printf("    %s\n", base);
+            }
+        }
+        for (int i = 0; i < n; i++) free(models[i]);
+        free(models);
+        if (!new_path) { fflush(stdout); return; }   /* no switch; statusbar intact */
+    }
+
+    /* Named switch: skip if it already resolves to the running model. */
+    if (new_path) {
+        char rp_new[PATH_MAX], rp_cur[PATH_MAX];
+        const char *a = realpath(new_path, rp_new) ? rp_new : new_path;
+        const char *b = (cur_model && realpath(cur_model, rp_cur)) ? rp_cur : cur_model;
+        if (b && strcmp(a, b) == 0) {
+            const char *base = strrchr(new_path, '/');
+            printf("\033[90m[Already using %s]\033[0m\n", base ? base + 1 : new_path);
+            free(new_path); fflush(stdout);
+            return;
+        }
+        save_default_model(new_path, new_ngl, 0);    /* persist as new default */
+    }
+
+    /* Hand off via re-exec. Replacing this process image releases the current
+       model's VRAM, so the child — whether it shows the picker (--pick) or loads
+       a named model — sees the WHOLE GPU free, not a GPU still holding this
+       model. The conversation rides across via --resume. */
+    statusbar_disable();
+    disable_raw_mode();
+    printf("\033[?25h");                /* show cursor for the clean re-launch */
+
+    char **nv = calloc((size_t)argc + 8, sizeof(char *));
+    int k = 0;
+    nv[k++] = argv[0];
+    for (int i = 1; i < argc; i++) {
+        const char *a = argv[i];
+        if (!strcmp(a, "--pick")) continue;                 /* valueless; may re-add */
+        if (!strcmp(a,"-m") || !strcmp(a,"-ngl") || !strcmp(a,"--ngl") ||
+            !strcmp(a,"-c") || !strcmp(a,"--ctx") || !strcmp(a,"--resume") ||
+            !strcmp(a,"-p") || !strcmp(a,"--prompt") || !strcmp(a,"--print") ||
+            !strcmp(a,"--deepsearch") || !strcmp(a,"-ds")) { i++; continue; }  /* + value */
+        nv[k++] = (char *)a;
+    }
+    char nglbuf[16];
+    if (use_picker) {
+        nv[k++] = "--pick";
+        printf("\033[38;5;240m\xe2\x97\x8f opening model picker \xe2\x80\xa6\033[0m\n");
+    } else {
+        snprintf(nglbuf, sizeof nglbuf, "%d", new_ngl);
+        nv[k++] = "-m";   nv[k++] = new_path;
+        nv[k++] = "-ngl"; nv[k++] = nglbuf;
+        const char *base = strrchr(new_path, '/');
+        printf("\033[38;5;240m\xe2\x97\x8f switching model \xe2\x86\x92 %s \xe2\x80\xa6\033[0m\n",
+               base ? base + 1 : new_path);
+    }
+    if (session_path) { nv[k++] = "--resume"; nv[k++] = (char *)session_path; }
+    nv[k] = NULL;
+    fflush(stdout);
+
+    execv("/proc/self/exe", nv);        /* Linux: re-run this binary */
+    execv(argv[0], nv);                 /* fallback */
+
+    perror("/model: exec");             /* only reached if exec failed */
+    free(nv);
+    free(new_path);
+    { char tag[32]; derive_model_tag(cur_model, tag, sizeof tag); statusbar_enable(ctx, tag); }
+    fflush(stdout);
+}
+
 /* ── Context reclamation (recent-window compaction) ────────────────────
  * Resync after any mutation of the message history. The delta-prompt scheme
  * feeds only formatted_buf+prev_len each turn, trusting the KV cache to hold the
@@ -1887,7 +2336,7 @@ static void handle_slash_command(char *user_input,
                     "  /premortem            (drafting only) enter premortem — model rewrites the plan with a ## Pre-mortem section\n"
                     "  /deepsearch <question>\n"
                     "                        multi-round deep research (web + knowledge base), synthesized + cited\n"
-                    "  /model                switch model (requires restart)\n"
+                    "  /model [name]         switch model (no arg: picker; name: match; keeps your chat)\n"
                     "\n"
                     "Subcommands (run before model load):\n"
                     "  basi-cli docs add <file.md> [--shelf=notes|pinned|docs]\n"
@@ -2069,12 +2518,8 @@ static void handle_slash_command(char *user_input,
                 free(user_input);
                 return;
             }
-            if (strcmp(user_input, "/model") == 0) {
-                printf("\033[90m[Model switching is not yet implemented — exit (Ctrl-D) and restart BASI to pick a different model.]\033[0m\n");
-                fflush(stdout);
-                free(user_input);
-                return;
-            }
+            /* /model is intercepted in the REPL loop (it re-execs), so it never
+               reaches here. */
             if (strncmp(user_input, "/deepsearch", 11) == 0 &&
                 (user_input[11] == '\0' || user_input[11] == ' ')) {
                 const char *q = user_input + 11;
@@ -2363,12 +2808,14 @@ static void run_agentic_turn(char *user_input,
         char *prompt = formatted_buf + prev_len;
         size_t prompt_len = (size_t)new_len - prev_len;
 
-        /* Tool execution loop. The per-turn cap defaults to 15 — multi-step work
-           (read→read→edit→edit→build→fix→rebuild) easily exceeds the old default
-           of 5, which made the loop give up on multi-file tasks before doing any
-           real work. Overridable via BASI_MAX_TOOL_ITERS. */
+        /* Tool execution loop. The per-turn cap defaults to 40 — multi-step work
+           on a large/unfamiliar repo (navigate→grep→read→edit→test→fix) needs many
+           calls just to locate the file before it can edit; the old 15 starved
+           real SWE-bench-scale tasks (the loop hit the cap mid-exploration, never
+           editing). Overridable via BASI_MAX_TOOL_ITERS. */
         int tool_iterations = 0;
-        int max_tool_iterations = 15;
+        int consec_parse_fail = 0;     /* consecutive unparseable tool-call outputs */
+        int max_tool_iterations = 40;
         {
             const char *mi = getenv("BASI_MAX_TOOL_ITERS");
             if (mi) { int v = atoi(mi); if (v > 0 && v <= 200) max_tool_iterations = v; }
@@ -2435,8 +2882,7 @@ static void run_agentic_turn(char *user_input,
                 n_ncalls = basi_parse_tool_calls(result.text, &ncalls);
                 if (n_ncalls > 0) {        /* one tool per turn for now (2a) */
                     const char *nm = ncalls[0].name ? ncalls[0].name : "?";
-                    printf("\033[90m[Executing: %s]\033[0m\n", nm);
-                    fflush(stdout);
+                    print_tool_activity(nm, ncalls[0].arguments);
                     /* Structured dispatch: parsed JSON args go straight to the
                        handlers, never round-tripped through a shell string. */
                     tool_result = execute_tool_native(ncalls[0].name, ncalls[0].arguments);
@@ -2461,31 +2907,27 @@ static void run_agentic_turn(char *user_input,
             }
 
             if (have_call) {
+                consec_parse_fail = 0;         /* parseable call — reset the retry counter */
                 if (cmd_str) {                 /* legacy path: build → execute */
-                    printf("\033[90m[Executing: %s]\033[0m\n", cmd_str);
-                    fflush(stdout);
+                    print_tool_activity_raw(cmd_str);
                     tool_result = execute_tool(cmd_str);
                     free(cmd_str);
                 } else if (!tool_result) {     /* native path hit an unknown tool */
                     tool_result = malloc(256);
                     snprintf(tool_result, 256,
                         "Error: unknown tool '%s' — it is not one of the available functions.", unknown_tool);
-                    printf("\033[90m[Unknown tool: %s]\033[0m\n", unknown_tool ? unknown_tool : "?");
-                    fflush(stdout);
+                    /* activity header already shown; the red result sub-line reports it */
                 }
                 free(unknown_tool);
                 if (ncalls) basi_free_tool_calls(ncalls, n_ncalls);
 
-                /* Truncate tool result if too large — line-aware, head+tail. */
-                size_t tr_len = strlen(tool_result);
+                /* Truncate tool result if too large — line-aware, head+tail.
+                   The dim "└ <summary>" sub-line reports the outcome (and any
+                   trim) directly under the activity header. */
                 size_t dropped = truncate_tool_result(tool_result,
                         TOOL_RESULT_HEAD_LINES, TOOL_RESULT_TAIL_LINES,
                         TOOL_RESULT_MAX_BYTES);
-                if (dropped) {
-                    printf("\033[90m[Truncated tool result: %zu → %zu chars "
-                           "(head+tail, %zu dropped)]\033[0m\n",
-                           tr_len, strlen(tool_result), dropped);
-                }
+                print_tool_result_line(tool_result, dropped);
 
                 llama_memory_t mem = llama_get_memory(ctx);
                 int used = llama_memory_seq_pos_max(mem, 0) + 1;
@@ -2559,7 +3001,40 @@ static void run_agentic_turn(char *user_input,
                 fflush(stdout);
             } else {
                 if (ncalls) basi_free_tool_calls(ncalls, n_ncalls);
-                /* No tool call — done */
+                /* Distinguish a genuine final answer from a MALFORMED tool call
+                   (tool-format degeneration, e.g. <function=read>…</parameter></parameter>
+                   that common_chat_peg_parse rejects). If the output shows a tool-call
+                   attempt, don't end the turn — nudge the model to re-emit a valid call
+                   and keep looping. Bounded by a small consecutive-failure cap so a
+                   persistently-degenerate model still terminates. */
+                int looks_like_call = native_tools && result.text &&
+                    (strstr(result.text, "<tool_call>") ||
+                     strstr(result.text, "<function=") ||
+                     strstr(result.text, "<tool>"));
+                if (looks_like_call && ++consec_parse_fail <= 3 &&
+                    tool_iterations < max_tool_iterations) {
+                    printf("\033[33m[Tool call unparseable — re-emit requested (%d/3)]\033[0m\n",
+                           consec_parse_fail);
+                    fflush(stdout);
+                    ADD_MESSAGE("assistant", result.text);
+                    ADD_MESSAGE("user",
+                        "Your last message looked like a tool call but could not be parsed "
+                        "(malformed syntax / mismatched tags). Re-emit exactly ONE tool call in "
+                        "the correct format with properly matched tags, or give your final answer "
+                        "if the task is complete.");
+                    free(result.text);
+                    int nl = apply_template(model, messages, msg_count, true,
+                                            formatted_buf, FORMATTED_BUF_SZ);
+                    if (nl < 0) { printf("Error: Failed to apply chat template\n"); break; }
+                    int pv = apply_template(model, messages, msg_count - 1, false, NULL, 0);
+                    if (pv < 0 || pv > nl) { kv_resync_full(ctx, prev_len_p); pv = 0; }
+                    prompt = formatted_buf + pv;
+                    prompt_len = (size_t)nl - (size_t)pv;
+                    printf("\n");
+                    fflush(stdout);
+                    continue;
+                }
+                /* genuine final answer (or gave up after repeated parse failures) */
                 ADD_MESSAGE("assistant", result.text);
                 free(result.text);
                 break;
@@ -2630,6 +3105,7 @@ int main(int argc, char **argv) {
     int         cli_ctx              = cli.cli_ctx;
     float       cli_temp             = cli.cli_temp;
     uint32_t    cli_seed             = cli.cli_seed;
+    const char *resume_path          = cli.resume_path;
 
     /* --yolo/--bypass: auto-approve every tool action. Without it, a
      * non-interactive -p run that triggers an approval prompt reads EOF on
@@ -2673,13 +3149,42 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    if (!model_path) {
-        model_path = getenv("BASI_MODEL");
-    }
-    /* No model specified — show interactive picker with settings */
+    /* Model resolution order (interactive): -m (this invocation) > saved
+       default (set by the picker / /model) > $BASI_MODEL > first-run picker.
+       The saved default is what drops later launches straight into chat and
+       what lets a /model choice persist. */
     static char picked_model[1024];
+    static char default_model[1024];
     int ctx_override = 0;
     float temp_override = -1;
+    bool loaded_from_default = false;   /* model came from the saved-default file */
+    /* --pick (from /model): force the picker BEFORE any model is loaded, so its
+       VRAM probe / auto-fit see the whole GPU free (the previous model was
+       released when /model re-execed into this fresh process). A cancel falls
+       through to the saved default below — i.e. reloads the same model. */
+    if (cli.pick && !oneshot && !model_path) {
+        LaunchConfig cfg = pick_model();
+        if (cfg.model_path) {
+            strncpy(picked_model, cfg.model_path, sizeof(picked_model) - 1);
+            picked_model[sizeof(picked_model) - 1] = '\0';
+            free(cfg.model_path);
+            model_path = picked_model;
+            if (!ngl_set) n_gpu_layers = cfg.gpu_layers;
+            ctx_override  = cfg.ctx_size;
+            temp_override = cfg.temperature;
+            save_default_model(model_path, n_gpu_layers, cfg.ctx_size);
+        }
+    }
+    if (!model_path) {
+        int d_ngl = -1, d_ctx = 0;
+        if (load_default_model(default_model, sizeof default_model, &d_ngl, &d_ctx)) {
+            model_path = default_model;
+            loaded_from_default = true;
+            if (!ngl_set && d_ngl >= 0) n_gpu_layers = d_ngl;
+            if (d_ctx > 0) ctx_override = d_ctx;
+        }
+    }
+    if (!model_path) model_path = getenv("BASI_MODEL");
     if (!model_path && oneshot) {
         fprintf(stderr,
             "Error: non-interactive mode (--deepsearch / -p) needs a model — "
@@ -2699,11 +3204,22 @@ int main(int argc, char **argv) {
         if (!ngl_set) n_gpu_layers = cfg.gpu_layers;
         ctx_override = cfg.ctx_size;
         temp_override = cfg.temperature;
+        /* An explicit pick always (re)writes the default — including repairing a
+           stale file that pointed at a since-deleted model. */
+        save_default_model(model_path, n_gpu_layers, cfg.ctx_size);
     }
 
     /* Explicit CLI knobs win over picker / built-in defaults. */
     if (cli_ctx  > 0)   ctx_override  = cli_ctx;
     if (cli_temp >= 0)  temp_override = cli_temp;
+
+    /* Persist the model actually being loaded as the default, so the NEXT launch
+       drops straight into chat instead of the picker. Covers the picker pick,
+       -m, and $BASI_MODEL uniformly. Seed only when no default file exists yet,
+       so a one-off `-m other.gguf` never overwrites a default the user chose (via
+       the picker or /model); those paths write the file explicitly elsewhere. */
+    if (!oneshot && model_path && !loaded_from_default && !default_model_file_exists())
+        save_default_model(model_path, n_gpu_layers, ctx_override);
 
     /* Warm up the local SearXNG (web_search backend) while the model loads.
      * --no-tools never touches the web, so don't spin SearXNG up for it. */
@@ -2807,7 +3323,8 @@ int main(int argc, char **argv) {
     } while (0)
 
     if (!no_tools && !oneshot_prompt) {
-        printf("Model loaded. Type your message (empty line to quit).\n\n");
+        print_startup_banner(model_path, (int)llama_n_ctx(ctx), n_gpu_layers);
+        printf("\033[38;5;245mType your message, or /help. Empty line to quit.\033[0m\n\n");
         fflush(stdout);
     }
 
@@ -2869,6 +3386,15 @@ int main(int argc, char **argv) {
     basi_set_tools(tool_defs, tool_n);
     int native_tools = basi_tools_active(model);
     generate_native_tools = native_tools;   /* hide raw tool-call markup from the live stream */
+    /* Render the answer stream as markdown, but only for the interactive REPL on
+       a real terminal — -p/one-shot and piped output stay raw and parseable.
+       Disable with BASI_MARKDOWN=0. */
+    {
+        const char *mdenv = getenv("BASI_MARKDOWN");
+        generate_markdown = !oneshot_prompt && !oneshot_deepsearch_q &&
+                            isatty(STDOUT_FILENO) &&
+                            !(mdenv && strcmp(mdenv, "0") == 0);
+    }
     printf("\033[90m[Tool mode: %s]\033[0m\n", native_tools ? "native (function-calling)" : "legacy (<tool> tags)");
     if (permission_mode == PERM_BYPASS)
         printf("\033[33m[Permissions: bypass — all tool actions auto-approved, no prompts]\033[0m\n");
@@ -2910,27 +3436,42 @@ int main(int argc, char **argv) {
         goto cleanup;
     }
 
-    /* Session picker (interactive only): list previous sessions, or start new */
+    /* Session selection (interactive only). --resume <file> (used by /model to
+       carry the conversation across a model switch) reloads that file and
+       skips the picker; otherwise list previous sessions or start new.
+       session_path is retained so /model can re-exec with --resume. */
+    char *session_path = NULL;
     if (!oneshot) {
-        char *sess_dir = session_dir_path();
-        if (sess_dir) {
-            char *load_path = session_picker(sess_dir);
-            if (load_path) {
-                session_load_into(load_path, &messages, &msg_count, &msg_cap,
-                                  (int)ctx_params.n_ctx);
-                session_fp = fopen(load_path, "a");
-                printf("\033[90m[Session: %s]\033[0m\n\n", load_path);
-                free(load_path);
-            } else {
-                char *new_path = NULL;
-                session_fp = session_open_new(sess_dir, &new_path);
-                if (new_path) {
-                    printf("\033[90m[New session: %s]\033[0m\n\n", new_path);
-                    free(new_path);
-                }
-            }
+        if (resume_path) {
+            session_load_into(resume_path, &messages, &msg_count, &msg_cap,
+                              (int)ctx_params.n_ctx);
+            session_fp = fopen(resume_path, "a");
+            session_path = strdup(resume_path);
+            printf("\033[90m[Resumed session: %s]\033[0m\n\n", resume_path);
             fflush(stdout);
-            free(sess_dir);
+        } else {
+            char *sess_dir = session_dir_path();
+            if (sess_dir) {
+                char *load_path = session_picker(sess_dir);
+                if (load_path) {
+                    session_load_into(load_path, &messages, &msg_count, &msg_cap,
+                                      (int)ctx_params.n_ctx);
+                    session_fp = fopen(load_path, "a");
+                    session_path = strdup(load_path);
+                    printf("\033[90m[Session: %s]\033[0m\n\n", load_path);
+                    free(load_path);
+                } else {
+                    char *new_path = NULL;
+                    session_fp = session_open_new(sess_dir, &new_path);
+                    if (new_path) {
+                        printf("\033[90m[New session: %s]\033[0m\n\n", new_path);
+                        session_path = strdup(new_path);
+                        free(new_path);
+                    }
+                }
+                fflush(stdout);
+                free(sess_dir);
+            }
         }
     }
 
@@ -2965,6 +3506,18 @@ int main(int argc, char **argv) {
 
         /* Slash commands intercept (no model call) */
         if (user_input[0] == '/') {
+            /* /model switches the active model. Handled here (not in
+               handle_slash_command) because it re-execs and needs argv/argc,
+               the session path, and the live ctx for teardown. */
+            if (!oneshot_prompt && strncmp(user_input, "/model", 6) == 0 &&
+                (user_input[6] == '\0' || user_input[6] == ' ')) {
+                const char *marg = user_input + 6;
+                while (*marg == ' ') marg++;
+                try_model_switch(marg, argv, argc, model_path, n_gpu_layers,
+                                 session_path, ctx);
+                free(user_input);
+                continue;
+            }
             handle_slash_command(user_input, model, vocab, ctx,
                                  &messages, &msg_count, &msg_cap, session_fp,
                                  &prev_len, session_prompt_tokens, session_gen_tokens);

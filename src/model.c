@@ -19,6 +19,7 @@
 #include "model.h"
 #include "hwinfo.h"
 #include "chat_tmpl.h"
+#include "md.h"
 
 void model_init(void) {
     extern void log_callback(enum ggml_log_level level, const char *text, void *user_data);
@@ -104,6 +105,12 @@ GenerateResult generate(
     GenerateResult res = { NULL, 0, 0, 0.0, 0.0 };
     StringBuf response;
     sb_init(&response);
+
+    /* Live markdown rendering of the answer stream (interactive TTY only). When
+       on, visible answer text is routed through md_feed() instead of raw
+       printf; md_end() closes it at the end / before tool markup. */
+    const bool md = generate_markdown && !generate_quiet;
+    if (md) md_begin();
 
     /* Check if first generation */
     llama_memory_t memory = llama_get_memory(ctx);
@@ -221,6 +228,7 @@ GenerateResult generate(
         uint32_t n_ctx_used = (uint32_t)(llama_memory_seq_pos_max(memory, 0) + 1);
         if (n_ctx_used + (uint32_t)batch.n_tokens > n_ctx) {
             if (thinking_box_shown) { if (!generate_quiet) { if (show_thinking) { printf("\033[0m\n"); } else { clear_thinking_box(); } } thinking_box_shown = false; }
+            if (md) md_end();
             if (!generate_quiet) printf("\n[Context limit reached]\n");
             fflush(stdout);
             break;
@@ -228,6 +236,7 @@ GenerateResult generate(
 
         if (llama_decode(ctx, batch) != 0) {
             if (thinking_box_shown) { if (!generate_quiet) { if (show_thinking) { printf("\033[0m\n"); } else { clear_thinking_box(); } } thinking_box_shown = false; }
+            if (md) md_end();
             if (!generate_quiet) printf("\n[Decode error]\n");
             fflush(stdout);
             break;
@@ -264,6 +273,7 @@ GenerateResult generate(
         if (generation_interrupted) {
             res.gen_time_s = time_now() - timer_start;
             if (thinking_box_shown) { if (!generate_quiet) { if (show_thinking) { printf("\033[0m\n"); } else { clear_thinking_box(); } } thinking_box_shown = false; }
+            if (md) md_end();
             if (!generate_quiet) printf("\n\033[90m[interrupted]\033[0m");
             fflush(stdout);
             break;
@@ -312,8 +322,9 @@ GenerateResult generate(
                 if (ch == '<') {
                     /* Flush text before '<' */
                     if ((size_t)idx > piece_start) {
-                        if (!generate_quiet) {
-                            printf("\033[33m");
+                        if (md) md_feed(buf + piece_start, idx - piece_start);
+                        else if (!generate_quiet) {
+                            printf("\033[0m");
                             fwrite(buf + piece_start, 1, idx - piece_start, stdout);
                             fflush(stdout);
                         }
@@ -356,13 +367,15 @@ GenerateResult generate(
                        but stop displaying it — the [Executing:] line is shown
                        after the call is parsed. */
                     sb_append(&response, tag_buf, tag_len);
+                    if (md) md_end();   /* close the answer before the hidden tool markup */
                     state = STATE_SUPPRESS;
                     tag_len = 0;
                     piece_start = idx + 1;
                 } else if (!alive) {
                     /* Matched no opener — flush the buffer as normal text. */
-                    if (!generate_quiet) {
-                        printf("\033[33m");
+                    if (md) md_feed(tag_buf, tag_len);
+                    else if (!generate_quiet) {
+                        printf("\033[0m");
                         fwrite(tag_buf, 1, tag_len, stdout);
                         fflush(stdout);
                     }
@@ -468,8 +481,9 @@ GenerateResult generate(
             }
 
             if (output_end > 0) {
-                if (!generate_quiet) {
-                    printf("\033[33m");
+                if (md) md_feed((const char *)combined, output_end);
+                else if (!generate_quiet) {
+                    printf("\033[0m");
                     fwrite(combined, 1, output_end, stdout);
                     fflush(stdout);
                 }
@@ -504,13 +518,15 @@ GenerateResult generate(
 
     /* Flush remaining UTF-8 */
     if (utf8_len > 0) {
-        if (!generate_quiet) {
-            printf("\033[33m");
+        if (md) md_feed((const char *)utf8_buf, utf8_len);
+        else if (!generate_quiet) {
+            printf("\033[0m");
             fwrite(utf8_buf, 1, utf8_len, stdout);
         }
         sb_append(&response, (const char *)utf8_buf, utf8_len);
     }
 
+    if (md) md_end();   /* render any trailing partial line + close open spans */
     if (!generate_quiet) printf("\033[0m\n");
     fflush(stdout);
 
@@ -938,6 +954,25 @@ static void scan_gguf_recursive(const char *root, char ***list, int *count, int 
     closedir(dir);
 }
 
+/* Public: scan the model search dirs and return every .gguf path found
+ * (malloc'd array of malloc'd strings). Caller frees each entry then the array.
+ * Returns the count (0 with *out=NULL if none). Used by /model to resolve a
+ * substring like "qwen3.6" to a concrete path without the full picker TUI. */
+int basi_list_models(char ***out) {
+    static char cache_dir[512];
+    const char *home = getenv("HOME");
+    if (home) {
+        snprintf(cache_dir, sizeof(cache_dir), "%s/.cache/huggingface/hub", home);
+        model_search_dirs[0] = cache_dir;
+    }
+    char **models = NULL;
+    int count = 0, cap = 0;
+    for (int d = 0; d < MODEL_DIRS_MAX && model_search_dirs[d]; d++)
+        scan_gguf_recursive(model_search_dirs[d], &models, &count, &cap);
+    *out = models;
+    return count;
+}
+
 /* Settings values for ←/→ adjustment.
  * GPU_LAYER_AUTO (-1) means: auto-fit to available VRAM each render.
  * Manual values step by 1 in [0, model's n_layers]. */
@@ -1047,6 +1082,25 @@ static int auto_fit_layers(double file_size_mb, GGUFArch arch,
     return 0;
 }
 
+/* VRAM freed by a just-exited model (e.g. after a /model re-exec) can lag in the
+ * driver's live budget for a few hundred ms. Sample the probe until the free
+ * figure stops climbing (or a short timeout), so the picker's VRAM math reflects
+ * the fully-offloaded GPU rather than a mid-teardown snapshot. Cheap when nothing
+ * is changing: the first two reads already agree and it returns after one tick. */
+static HwInfo hw_probe_settled(void) {
+    HwInfo prev = hw_probe();
+    if (!prev.has_gpu || !prev.vram_budget_known) return prev;
+    for (int i = 0; i < 16; i++) {                 /* up to ~2.4s */
+        usleep(150000);
+        HwInfo cur = hw_probe();
+        if (!cur.vram_budget_known) return cur;
+        long long climbed = (long long)cur.vram_avail_mb - (long long)prev.vram_avail_mb;
+        prev = cur;
+        if (climbed <= 32) break;                  /* free stopped rising → settled */
+    }
+    return prev;
+}
+
 /*
  * Scan directories for .gguf files, show interactive menu with settings.
  * Returns filled LaunchConfig, or model_path=NULL on cancel.
@@ -1096,8 +1150,9 @@ LaunchConfig pick_model(void) {
         model_size_mb[i] = file_size_mb(models[i]);
     }
 
-    /* Hardware probe (single-shot) */
-    HwInfo hw = hw_probe();
+    /* Hardware probe. Wait for VRAM to settle first (a model offloaded by the
+       /model re-exec may still be clearing), then let 'r' re-probe on demand. */
+    HwInfo hw = hw_probe_settled();
 
     /* Menu state */
     enum { SECTION_MODEL, SECTION_GPU, SECTION_CTX, SECTION_TEMP, SECTION_LAUNCH, SECTION_COUNT };
@@ -1247,7 +1302,7 @@ LaunchConfig pick_model(void) {
             printf("    \033[90m[ LAUNCH ]\033[0m\n");
         }
 
-        printf("\n\033[90m↑/↓ navigate  ←/→ adjust  Enter select/launch  q quit\033[0m\n");
+        printf("\n\033[90m↑/↓ navigate  ←/→ adjust  r refresh VRAM  Enter select/launch  q quit\033[0m\n");
         fflush(stdout);
 
         /* Read key */
@@ -1255,6 +1310,11 @@ LaunchConfig pick_model(void) {
         if (read(STDIN_FILENO, &ch, 1) != 1) break;
 
         if (ch == 'q' || ch == 'Q' || ch == 3) break;
+
+        if (ch == 'r' || ch == 'R') {          /* re-probe live VRAM on demand */
+            hw = hw_probe_settled();
+            continue;
+        }
 
         if (ch == '\n' || ch == '\r') {
             if (section == SECTION_LAUNCH || section == SECTION_MODEL) {

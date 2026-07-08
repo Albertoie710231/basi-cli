@@ -13,6 +13,8 @@
 
 #include "util.h"
 #include "session.h"
+#include "globals.h"
+#include "md.h"
 
 /* ── Session persistence ───────────────────────────────────────────── */
 
@@ -324,12 +326,19 @@ void session_load_into(
 
         /* Re-render the turn so the human sees their prior conversation on
            resume. The model already has it in context; this is purely the
-           scrollback. Match the live look: green "> " for the user turn,
-           the assistant's reply plain. */
-        if (strcmp(role_lit, "user") == 0)
+           scrollback. Match the live look: green "> " for the user turn, and
+           the assistant's reply through the same markdown renderer the live
+           stream uses (when active) so reloaded chats look identical. */
+        if (strcmp(role_lit, "user") == 0) {
             printf("\033[32m> \033[0m%s\n", contents[i]);
-        else
+        } else if (generate_markdown) {
+            md_begin();
+            md_feed(contents[i], strlen(contents[i]));
+            md_end();
+            printf("\n");
+        } else {
             printf("%s\n", contents[i]);
+        }
 
         free(roles[i]);
         contents[i] = NULL;

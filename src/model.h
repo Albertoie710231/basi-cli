@@ -17,6 +17,11 @@ typedef struct {
 
 LaunchConfig pick_model(void);
 
+/* Scan the model search dirs for .gguf files. Fills *out with a malloc'd array
+ * of malloc'd path strings (caller frees each, then the array) and returns the
+ * count. Used by the /model command to resolve a name substring to a path. */
+int basi_list_models(char ***out);
+
 /* ── Chat template wrapper (handles non-Jinja fallback) ────────────── */
 /* Renders the conversation using the model's own chat template (jinja engine,
    via the chat_tmpl shim), falling back to llama_chat_apply_template + ChatML
