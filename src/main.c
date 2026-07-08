@@ -36,6 +36,8 @@
 #include "deepsearch.h"
 #include "chat_tmpl.h"
 #include "tooldefs.h"
+#include "cookbook.h"
+#include "slashmenu.h"
 
 /* MAX_TOKENS, CONTEXT_SIZE → globals.h */
 #define MAX_FILE_TOKENS     2000
@@ -268,6 +270,41 @@ static void disable_raw_mode(void) {
 
 /* ── Line editor ───────────────────────────────────────────────────── */
 
+/* Recompute + repaint the slash-command dropdown for the current buffer.
+ * Defined after the status-bar geometry it reads; forward-declared here. */
+static void editor_menu_update(FILE *out, const char *buf, size_t len, size_t cursor,
+                               int promptw, bool suppress, SlashMenuState *menu,
+                               int *midx, int *mn, int *msel);
+
+/* Replace the command token at the head of `line` with the highlighted menu
+ * command (plus a trailing space when it takes arguments), close the dropdown,
+ * and repaint the input line. Used by Tab and by Enter-on-a-partial-command. */
+static void editor_complete(StringBuf *line, size_t *cursor, const char *prompt,
+                            int promptw, SlashMenuState *menu, const int *midx,
+                            int msel, bool *suppress) {
+    const SlashCmd *tbl = slashmenu_table(NULL);
+    const SlashCmd *c = &tbl[midx[msel]];
+    size_t te = 0;
+    while (te < line->len && line->data[te] != ' ') te++;   /* end of command token */
+
+    StringBuf nb; sb_init(&nb);
+    sb_append_str(&nb, c->name);
+    if (c->takes_arg) sb_append_char(&nb, ' ');
+    size_t newcur = nb.len;
+    if (te < line->len) sb_append(&nb, line->data + te, line->len - te);
+    sb_clear(line);
+    sb_append(line, nb.data, nb.len);
+    sb_free(&nb);
+
+    *cursor = newcur;
+    *suppress = true;
+    slashmenu_close(stdout, menu, promptw, (int)*cursor);
+    printf("\r\033[2K%s", prompt);                  /* redraw the input line */
+    fwrite(line->data, 1, line->len, stdout);
+    if (*cursor < line->len) printf("\033[%zuD", line->len - *cursor);
+    fflush(stdout);
+}
+
 /* Returns malloc'd string, or NULL on EOF. Empty string on Ctrl-C. */
 static char *read_line(const char *prompt) {
     /* Piped / scripted input (stdin not a TTY): the interactive char-by-char
@@ -300,11 +337,18 @@ static char *read_line(const char *prompt) {
     StringBuf saved;
     sb_init(&saved);
 
+    /* slash-command dropdown state */
+    SlashMenuState menu = {0};
+    int  menu_idx[32], menu_n = 0, menu_sel = 0;
+    bool menu_suppress = false;
+    int  promptw = slashmenu_visible_width(prompt);
+
     while (1) {
         unsigned char ch;
-        ssize_t n = read(STDIN_FILENO, &ch, 1);
+        ssize_t n = slashmenu_read_byte(&ch);
         if (n <= 0) {
             /* EOF */
+            if (menu.open) slashmenu_close(stdout, &menu, promptw, (int)cursor);
             if (line.len == 0) {
                 sb_free(&line);
                 sb_free(&saved);
@@ -323,6 +367,21 @@ static char *read_line(const char *prompt) {
                 putchar('\n');
                 continue;
             }
+            /* When the dropdown is up with a partial command highlighted, Enter
+               completes it instead of submitting; a fully-typed command (exact
+               match) submits straight away. */
+            if (menu.open && menu_n > 0) {
+                const SlashCmd *tbl = slashmenu_table(NULL);
+                const char *name = tbl[menu_idx[menu_sel]].name;
+                size_t te = 0; while (te < line.len && line.data[te] != ' ') te++;
+                bool exact = (te == strlen(name) && strncmp(line.data, name, te) == 0);
+                if (!exact) {
+                    editor_complete(&line, &cursor, prompt, promptw,
+                                    &menu, menu_idx, menu_sel, &menu_suppress);
+                    continue;
+                }
+            }
+            if (menu.open) slashmenu_close(stdout, &menu, promptw, (int)cursor);
             printf("\n");
             fflush(stdout);
             break;
@@ -344,7 +403,8 @@ static char *read_line(const char *prompt) {
                     continue;
                 }
                 switch (seq[1]) {
-                case 'A': /* Up - history prev */
+                case 'A': /* Up - menu selection, else history prev */
+                    if (menu.open) { if (menu_sel > 0) menu_sel--; break; }
                     if (history_count > 0 && hist_idx > 0) {
                         if (hist_idx == history_count) {
                             sb_clear(&saved);
@@ -360,7 +420,8 @@ static char *read_line(const char *prompt) {
                         fflush(stdout);
                     }
                     break;
-                case 'B': /* Down - history next */
+                case 'B': /* Down - menu selection, else history next */
+                    if (menu.open) { if (menu_sel < menu_n - 1) menu_sel++; break; }
                     if (hist_idx < history_count) {
                         hist_idx++;
                         if (cursor > 0) printf("\033[%zuD", cursor);
@@ -407,6 +468,7 @@ static char *read_line(const char *prompt) {
                 case '3': { /* Delete key: [3~ */
                     unsigned char tilde;
                     read(STDIN_FILENO, &tilde, 1);
+                    menu_suppress = false;   /* editing re-enables the dropdown */
                     if (cursor < line.len) {
                         memmove(line.data + cursor, line.data + cursor + 1,
                                 line.len - cursor - 1);
@@ -433,6 +495,7 @@ static char *read_line(const char *prompt) {
             }
         } else if (ch == 127 || ch == 8) {
             /* Backspace */
+            menu_suppress = false;       /* editing re-enables the dropdown */
             if (cursor > 0) {
                 cursor--;
                 memmove(line.data + cursor, line.data + cursor + 1,
@@ -445,6 +508,7 @@ static char *read_line(const char *prompt) {
             }
         } else if (ch == 3) {
             /* Ctrl-C */
+            if (menu.open) slashmenu_close(stdout, &menu, promptw, (int)cursor);
             printf("^C\n");
             fflush(stdout);
             sb_free(&line);
@@ -454,13 +518,20 @@ static char *read_line(const char *prompt) {
         } else if (ch == 4) {
             /* Ctrl-D */
             if (line.len == 0) {
+                if (menu.open) slashmenu_close(stdout, &menu, promptw, (int)cursor);
                 sb_free(&line);
                 sb_free(&saved);
                 if (raw) disable_raw_mode();
                 return NULL;
             }
+        } else if (ch == '\t') {
+            /* Tab completes the highlighted dropdown command. */
+            if (menu.open)
+                editor_complete(&line, &cursor, prompt, promptw,
+                                &menu, menu_idx, menu_sel, &menu_suppress);
         } else if (ch >= 32) {
             /* Printable */
+            menu_suppress = false;       /* editing re-enables the dropdown */
             sb_ensure(&line, 1);
             if (cursor < line.len) {
                 memmove(line.data + cursor + 1, line.data + cursor,
@@ -480,8 +551,15 @@ static char *read_line(const char *prompt) {
                 fflush(stdout);
             }
         }
+
+        /* After any edit/navigation, refresh the slash-command dropdown. Skipped
+           mid-paste (a CPR round-trip would race the incoming paste bytes). */
+        if (!paste_mode)
+            editor_menu_update(stdout, line.data, line.len, cursor, promptw,
+                               menu_suppress, &menu, menu_idx, &menu_n, &menu_sel);
     }
 
+    if (menu.open) slashmenu_close(stdout, &menu, promptw, (int)cursor);
     if (raw) disable_raw_mode();
 
     /* null-terminate and return */
@@ -1200,6 +1278,8 @@ typedef struct {
     const char *system_override;    /* -s/--system: system prompt for --no-tools */
     int         cli_ctx;            /* -c/--ctx: context size (0 = default) */
     float       cli_temp;           /* -t/--temp: sampling temp (<0 = default) */
+    int         cli_top_k;          /* --top-k: 0 = disabled */
+    float       cli_top_p;          /* --top-p: 1.0 = disabled */
     uint32_t    cli_seed;           /* --seed: RNG seed for sampling */
     bool        bypass;             /* --yolo/--bypass: auto-approve all tool actions */
     const char *resume_path;        /* --resume: reload this session file, skip picker */
@@ -1213,6 +1293,7 @@ static Cli parse_args(int argc, char **argv) {
         .model_path = NULL, .n_gpu_layers = 99, .ngl_set = false,
         .deepsearch_q = NULL, .prompt = NULL, .no_tools = false,
         .system_override = NULL, .cli_ctx = 0, .cli_temp = -1.0f,
+        .cli_top_k = 0, .cli_top_p = 1.0f,
         .cli_seed = LLAMA_DEFAULT_SEED, .bypass = false, .resume_path = NULL,
         .pick = false, .want_exit = false, .exit_code = 0,
     };
@@ -1229,6 +1310,11 @@ static Cli parse_args(int argc, char **argv) {
         } else if ((strcmp(argv[i], "-t") == 0 || strcmp(argv[i], "--temp") == 0)
                    && i + 1 < argc) {
             c.cli_temp = (float)atof(argv[++i]);
+        } else if ((strcmp(argv[i], "-k") == 0 || strcmp(argv[i], "--top-k") == 0)
+                   && i + 1 < argc) {
+            c.cli_top_k = atoi(argv[++i]);          /* 0 = disabled */
+        } else if (strcmp(argv[i], "--top-p") == 0 && i + 1 < argc) {
+            c.cli_top_p = (float)atof(argv[++i]);   /* 1.0 = disabled */
         } else if (strcmp(argv[i], "--seed") == 0 && i + 1 < argc) {
             c.cli_seed = (uint32_t)strtoul(argv[++i], NULL, 10);
         } else if (strcmp(argv[i], "-d") == 0 || strcmp(argv[i], "--debug") == 0) {
@@ -1262,6 +1348,8 @@ static Cli parse_args(int argc, char **argv) {
                    "                  Use 0 to run entirely on CPU.\n"
                    "  -c, --ctx       Context size in tokens (default: 32768)\n"
                    "  -t, --temp      Sampling temperature (default: 0.4; 0 = greedy)\n"
+                   "  -k, --top-k     Top-k sampling (default: 0 = disabled). Also BASI_TOP_K.\n"
+                   "  --top-p         Top-p / nucleus sampling (default: 1.0 = disabled). Also BASI_TOP_P.\n"
                    "  --seed          RNG seed for sampling (default: random). Fix it for\n"
                    "                  reproducible output.\n"
                    "  -p, --prompt    Run a single prompt non-interactively (with tools), then exit\n"
@@ -1651,6 +1739,38 @@ void statusbar_tick(void) {
     static unsigned n = 0;
     if ((++n & 7u) != 0u) return;
     statusbar_draw();
+}
+
+/* Recompute the slash-command dropdown for the current buffer and repaint it
+ * below the input line (or close it). Placed here because it reads the status
+ * bar's geometry (g_bar) to keep the menu above the reserved bottom row. */
+static void editor_menu_update(FILE *out, const char *buf, size_t len, size_t cursor,
+                               int promptw, bool suppress, SlashMenuState *menu,
+                               int *midx, int *mn, int *msel) {
+    size_t plen = 0;
+    if (suppress || !slashmenu_active(buf, len, cursor, &plen)) {
+        if (menu->open) slashmenu_close(out, menu, promptw, (int)cursor);
+        return;
+    }
+    *mn = slashmenu_filter(buf + 1, plen, midx, 32);
+    if (*mn == 0) {
+        if (menu->open) slashmenu_close(out, menu, promptw, (int)cursor);
+        return;
+    }
+    if (*msel >= *mn) *msel = *mn - 1;
+    if (*msel < 0)    *msel = 0;
+
+    int row = slashmenu_cpr_row();
+    if (row < 1) return;                 /* terminal without CPR: skip the menu */
+
+    struct winsize ws;
+    int rows = 24, cols = 80;
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_row > 0) {
+        rows = ws.ws_row; cols = ws.ws_col;
+    }
+    int region_bottom = g_bar.active ? rows - 1 : rows;
+    slashmenu_draw(out, menu, row, region_bottom, cols, midx, *mn, *msel,
+                   promptw, (int)cursor);
 }
 
 /* Derive a short, lower-case model tag from the GGUF path: basename, drop the
@@ -2337,6 +2457,7 @@ static void handle_slash_command(char *user_input,
                     "  /deepsearch <question>\n"
                     "                        multi-round deep research (web + knowledge base), synthesized + cited\n"
                     "  /model [name]         switch model (no arg: picker; name: match; keeps your chat)\n"
+                    "  /cookbook [sub]       download & manage models (list | search | get <repo> | rm)\n"
                     "\n"
                     "Subcommands (run before model load):\n"
                     "  basi-cli docs add <file.md> [--shelf=notes|pinned|docs]\n"
@@ -2514,6 +2635,22 @@ static void handle_slash_command(char *user_input,
                 statusbar_resume();
                 if (rc != 0) printf("\033[31m[Editor exited with status %d]\033[0m\n", rc);
                 else printf("\033[90m[%s edited]\033[0m\n", fullpath);
+                fflush(stdout);
+                free(user_input);
+                return;
+            }
+            if (strncmp(user_input, "/cookbook", 9) == 0 &&
+                (user_input[9] == '\0' || user_input[9] == ' ')) {
+                const char *arg = user_input + 9;
+                while (*arg == ' ') arg++;
+                /* get/rm stream a progress bar and read a confirmation, so hand
+                   the terminal back to cooked mode (mirror /edit's shell-out). */
+                bool was_raw = raw_mode_enabled;
+                statusbar_suspend();
+                if (was_raw) disable_raw_mode();
+                cookbook_command(arg);
+                if (was_raw) enable_raw_mode();
+                statusbar_resume();
                 fflush(stdout);
                 free(user_input);
                 return;
@@ -3105,6 +3242,13 @@ int main(int argc, char **argv) {
     int         cli_ctx              = cli.cli_ctx;
     float       cli_temp             = cli.cli_temp;
     uint32_t    cli_seed             = cli.cli_seed;
+    /* top-k / top-p: CLI wins, else BASI_TOP_K / BASI_TOP_P env, else disabled
+       (0 / 1.0). Some models — e.g. Qwythos-9B — recommend top_k 20 + top_p 0.95
+       and warn that disabling the tail (or very low temp) triggers repeat loops. */
+    int   top_k = cli.cli_top_k;
+    float top_p = cli.cli_top_p;
+    { const char *e = getenv("BASI_TOP_K"); if (e && cli.cli_top_k == 0) top_k = atoi(e); }
+    { const char *e = getenv("BASI_TOP_P"); if (e && cli.cli_top_p == 1.0f) top_p = (float)atof(e); }
     const char *resume_path          = cli.resume_path;
 
     /* --yolo/--bypass: auto-approve every tool action. Without it, a
@@ -3317,6 +3461,8 @@ int main(int argc, char **argv) {
        below, AFTER the tool-call grammar (when native tools are active) so the
        grammar masks invalid tokens before min_p/temp narrow the set. */
     #define SAMPLER_TAIL() do { \
+        if (top_k > 0)    llama_sampler_chain_add(smpl, llama_sampler_init_top_k(top_k)); \
+        if (top_p < 1.0f) llama_sampler_chain_add(smpl, llama_sampler_init_top_p(top_p, 1)); \
         llama_sampler_chain_add(smpl, llama_sampler_init_min_p(0.05f, 1)); \
         llama_sampler_chain_add(smpl, llama_sampler_init_temp(temp_override >= 0 ? temp_override : 0.4f)); \
         llama_sampler_chain_add(smpl, llama_sampler_init_dist(cli_seed)); \
