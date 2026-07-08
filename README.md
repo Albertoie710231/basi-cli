@@ -11,6 +11,10 @@ dispatch, ranking, guards, and parsing are plain C — the model just decides an
 
 > Personal research project. The build defaults point at the author's paths — override them (below).
 
+Type `/` for an autocomplete dropdown of every slash command:
+
+![slash-command dropdown](docs/slash-dropdown.png)
+
 ## Features
 
 - **Agentic tool loop** — the model requests tools with `<tool>…</tool>`; results feed back as
@@ -24,11 +28,17 @@ dispatch, ranking, guards, and parsing are plain C — the model just decides an
 - **Knowledge base** — `docs_*` tools over a local `.basi/knowledge/` corpus, including semantic
   vector search backed by a GGUF embedding model.
 - **Code context** — `code_context` surfaces C symbol info via a clangd LSP.
-- **Editing & scaffolding** — `apply_patch` (structured diffs) and `scaffold` (templates), gated by
-  an approval prompt.
+- **Editing & scaffolding** — `edit` (SEARCH/REPLACE blocks with fuzzy matching) and `scaffold`
+  (templates), gated by an approval prompt.
 - **Planning pillar** — an A3 / spike / pre-mortem plan workflow with phase-gated tools.
 - **Native chat templates** — each model is driven in its *own* chat format via llama.cpp's jinja
   engine (Qwen, Gemma, DeepSeek, custom merges…), not a one-size-fits-all fallback.
+- **Model cookbook** (`/cookbook`) — discover, download, and manage local GGUF models without
+  leaving the REPL. Lists cached models, searches trending HuggingFace GGUF repos filtered to what
+  fits your VRAM, and pulls them with `curl` straight into `~/models` (no Python / `hf` dependency);
+  `/model` then switches to them.
+- **Polished REPL** — a live status bar (context meter, active model, permission mode),
+  live-rendered markdown, and a slash-command autocomplete dropdown (type `/`).
 
 ## Requirements
 
@@ -37,8 +47,9 @@ dispatch, ranking, guards, and parsing are plain C — the model just decides an
   `-lllama-common` (the same shared common lib `llama-cli` uses). The Makefile assumes a Vulkan build
   (`build_vulkan/`, `-lvulkan`) — adjust `LLAMA_BUILD` and the backend lib for your setup.
 - A model in **GGUF** format. Instruct models follow the tool format most reliably.
-- Optional runtime tools: `curl`, `w3m`, `pdftotext` (poppler), `unzip`, and a local **SearXNG**
-  instance with the JSON format enabled (for `web_search`).
+- Optional runtime tools: `curl` (web fetch + `/cookbook` model downloads), `w3m`, `pdftotext`
+  (poppler), `unzip`, and a local **SearXNG** instance with the JSON format enabled (for
+  `web_search`).
 
 ## Build
 
@@ -72,6 +83,22 @@ clean to capture in a pipe or use as a local teacher for data generation. It use
 "helpful assistant" system prompt by default; override it with `-s "<system>"`, or pass `-s ""`
 for a pure completion of the prompt alone.
 
+### Managing models
+
+`/cookbook` downloads and manages GGUF models from inside the session — no separate tooling:
+
+```sh
+/cookbook                                # cached models + starter picks
+/cookbook search qwen                    # trending GGUF that fits your VRAM
+/cookbook get unsloth/Qwen3.5-9B-GGUF    # download into ~/models (resumable)
+/cookbook rm qwen3.5                      # delete a cached model
+```
+
+Downloads resolve against the HuggingFace API and stream in with `curl`, so there's no Python or
+`hf` dependency. After a `get`, `/model <name>` switches to the freshly pulled model.
+
+![cookbook search](docs/cookbook-search.png)
+
 ### Model & sampling flags
 
 These apply to every mode (interactive, `-p`, `--no-tools`, `--deepsearch`):
@@ -86,8 +113,9 @@ These apply to every mode (interactive, `-p`, `--no-tools`, `--deepsearch`):
 Explicit flags win over the model picker's chosen values. Example — reproducible CPU-only
 completion: `./basi-cli -m model.gguf -ngl 0 --seed 42 -p "..." --no-tools`.
 
-Interactive slash commands include `/help`, `/deepsearch <q>`, `/plan`, `/permissions`, `/clear`,
-`/cost`, `/model`.
+Interactive slash commands: `/help`, `/model`, `/cookbook`, `/deepsearch <q>`, `/plan`,
+`/premortem`, `/permissions`, `/memory`, `/note`, `/edit`, `/save`, `/clear`, `/cost`. Type `/`
+for an autocomplete dropdown (↑/↓ to pick, Tab to complete).
 
 ### Environment
 
