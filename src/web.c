@@ -481,8 +481,13 @@ void web_ensure_searxng(void) {
 
     const char *home_env = getenv("SEARXNG_HOME");
     char home[512];
-    snprintf(home, sizeof(home), "%s",
-             (home_env && home_env[0]) ? home_env : "/home/alberto/Documentos/searxng");
+    if (home_env && home_env[0]) {
+        snprintf(home, sizeof(home), "%s", home_env);
+    } else {
+        const char *h = getenv("HOME");
+        if (!h || !h[0]) return;                 /* no home dir — nowhere to look */
+        snprintf(home, sizeof(home), "%s/searxng", h);
+    }
     if (strchr(home, '\'')) return;
 
     char py[600];

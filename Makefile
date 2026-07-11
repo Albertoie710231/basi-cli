@@ -5,9 +5,11 @@ CFLAGS = -Wall -Wextra -O2
 # static helpers; that's upstream, not our code.
 CXXFLAGS = -std=c++17 -Wall -Wextra -O2 -Wno-unused-function
 
-# Point these at your llama.cpp checkout + build dir, e.g.:
-#   make LLAMA_DIR=/path/to/llama.cpp LLAMA_BUILD=/path/to/llama.cpp/build
-LLAMA_DIR ?= /home/alberto/llama.cpp
+# Point these at your llama.cpp checkout + build dir. Defaults assume a clone at
+# $HOME/llama.cpp built with the Vulkan backend (build_vulkan) — Vulkan runs on
+# any NVIDIA/AMD/Intel GPU. Override for a different location or backend, e.g.:
+#   make LLAMA_DIR=/path/to/llama.cpp LLAMA_BUILD=/path/to/llama.cpp/build_cuda
+LLAMA_DIR ?= $(HOME)/llama.cpp
 LLAMA_BUILD ?= $(LLAMA_DIR)/build_vulkan
 
 INCLUDES = -I$(LLAMA_DIR)/include -I$(LLAMA_DIR)/ggml/include -Isrc

@@ -627,11 +627,24 @@ int apply_template(
 
 #define MODEL_DIRS_MAX 4
 static const char *model_search_dirs[] = {
-    NULL, /* filled at runtime: ~/.cache/llama.cpp */
-    "/home/alberto/models",
+    NULL, /* [0] filled at runtime: ~/.cache/huggingface/hub */
+    NULL, /* [1] filled at runtime: $HOME/models (where /cookbook downloads) */
     ".",
     NULL
 };
+
+/* Resolve the two $HOME-relative search dirs at runtime: [0] the HF hub cache,
+ * [1] the ~/models dir /cookbook downloads into. No-op if $HOME is unset. */
+static void init_model_search_dirs(void) {
+    static char cache_dir[512];
+    static char models_dir[512];
+    const char *home = getenv("HOME");
+    if (!home) return;
+    snprintf(cache_dir,  sizeof(cache_dir),  "%s/.cache/huggingface/hub", home);
+    snprintf(models_dir, sizeof(models_dir), "%s/models", home);
+    model_search_dirs[0] = cache_dir;
+    model_search_dirs[1] = models_dir;
+}
 
 /* GGUF arch metadata used to size offload + KV cache. */
 typedef struct {
@@ -959,12 +972,7 @@ static void scan_gguf_recursive(const char *root, char ***list, int *count, int 
  * Returns the count (0 with *out=NULL if none). Used by /model to resolve a
  * substring like "qwen3.6" to a concrete path without the full picker TUI. */
 int basi_list_models(char ***out) {
-    static char cache_dir[512];
-    const char *home = getenv("HOME");
-    if (home) {
-        snprintf(cache_dir, sizeof(cache_dir), "%s/.cache/huggingface/hub", home);
-        model_search_dirs[0] = cache_dir;
-    }
+    init_model_search_dirs();
     char **models = NULL;
     int count = 0, cap = 0;
     for (int d = 0; d < MODEL_DIRS_MAX && model_search_dirs[d]; d++)
@@ -1109,12 +1117,7 @@ LaunchConfig pick_model(void) {
     LaunchConfig cfg = { NULL, 99, CONTEXT_SIZE, 0.4f };
 
     /* Build search dirs */
-    static char cache_dir[512];
-    const char *home = getenv("HOME");
-    if (home) {
-        snprintf(cache_dir, sizeof(cache_dir), "%s/.cache/huggingface/hub", home);
-        model_search_dirs[0] = cache_dir;
-    }
+    init_model_search_dirs();
 
     /* Collect .gguf files (recursive: HF hub nests files under models--ORG--NAME/snapshots/HASH/) */
     char **models = NULL;
