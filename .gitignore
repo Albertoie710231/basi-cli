@@ -3,6 +3,10 @@ zig-out/
 basi-cli
 *.o
 
+# per-project vector-store sidecars (embeddings + reuse-gate symbol index)
+.basi/.symbols.bin
+.basi/knowledge/.embeddings.bin
+
 # generated clangd artifact (contains absolute local paths)
 compile_commands.json
 # stray screenshots

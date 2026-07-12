@@ -221,6 +221,14 @@ GenerateResult generate(
         }
     }
 
+    /* Optional hard cap on generated tokens (env BASI_MAX_TOKENS; 0/unset =
+       unlimited, preserving default behavior). Without it, a model that never
+       emits end-of-turn generates until the context fills — this bounds
+       non-interactive and benchmark runs. */
+    long gen_cap = 0;
+    { const char *e = getenv("BASI_MAX_TOKENS"); if (e && *e) gen_cap = atol(e); }
+    long n_generated = 0;
+
     /* Generation loop */
     while (1) {
         /* Check context space */
@@ -267,6 +275,14 @@ GenerateResult generate(
         if (llama_vocab_is_eog(vocab, new_token)) {
             res.gen_time_s = time_now() - timer_start;
             if (thinking_box_shown) { if (!generate_quiet) { if (show_thinking) { printf("\033[0m\n"); } else { clear_thinking_box(); } } thinking_box_shown = false; }
+            break;
+        }
+
+        if (gen_cap > 0 && ++n_generated >= gen_cap) {
+            res.gen_time_s = time_now() - timer_start;
+            if (thinking_box_shown) { if (!generate_quiet) { if (show_thinking) { printf("\033[0m\n"); } else { clear_thinking_box(); } } thinking_box_shown = false; }
+            if (md) md_end();
+            if (!generate_quiet) { printf("\n[max tokens reached]\n"); fflush(stdout); }
             break;
         }
 

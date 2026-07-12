@@ -10,6 +10,7 @@
 #include "util.h"
 #include "globals.h"
 #include "patch.h"
+#include "reuse.h"
 
 /* ── edit: SEARCH/REPLACE block tool ──────────────────────────────────
  * The model expresses a change as old-text -> new-text, never a diff. We
@@ -401,6 +402,17 @@ char *execute_edit(const char *args) {
             snprintf(e, 256, "edit: block %d — SEARCH and REPLACE are identical; nothing to change.", i + 1);
             free_parsed_edit(p);
             return e;
+        }
+    }
+
+    /* Reuse gate (opt-in via BASI_REUSE_GATE): before an edit ADDS a new
+     * top-level function, pause if a near-duplicate already exists elsewhere in
+     * the tree. Warn-once per function name — a re-issue applies. No-op when the
+     * gate is off or no embedder is present, so editing never depends on it. */
+    if (reuse_gate_enabled()) {
+        for (int i = 0; i < p->n_blocks; i++) {
+            char *warn = reuse_gate_check(path, p->blocks[i].repl, p->blocks[i].find);
+            if (warn) { free_parsed_edit(p); return warn; }
         }
     }
 
