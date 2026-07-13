@@ -854,6 +854,142 @@ static char *str_replace_once(const char *hay, const char *needle, const char *r
     return sb_to_str(&sb);
 }
 
+/* ── Stage-2 semantic verification: LLVM IR equivalence ─────────────────
+ * A token match says two functions LOOK alike; only the compiler can say they
+ * ARE equivalent. `clang -O2` SSA form erases variable names (renamed clones →
+ * identical IR) but preserves constants (SO_SNDTIMEO != SO_RCVTIMEO → different
+ * IR), so an IR-equal check refuses behaviourally-distinct twins that structure
+ * alone can't tell apart. Sound: IR-equal ⇒ safe to substitute; any difference
+ * (or a failure to compile) ⇒ refuse. */
+
+/* Extract the `define …@name(…){ … }` block and normalize: strip comments,
+ * metadata (!…) and attribute-group refs (#N), drop linkage/param noise,
+ * canonicalize the function's own name to @SELF, collapse whitespace. clang's
+ * canonical SSA numbering already makes equivalent functions share register
+ * numbers, so no renaming is needed. Returns malloc'd or NULL. */
+static char *ir_extract_normalize(const char *ir, const char *name) {
+    char nd[256];
+    int ndl = snprintf(nd, sizeof(nd), "@%s(", name);   /* nd = "@name(" ; "@name" = ndl-1 chars */
+    if (ndl <= 2 || ndl >= (int)sizeof(nd)) return NULL;
+
+    const char *def = NULL, *p = ir;
+    while ((p = strstr(p, "define ")) != NULL) {
+        if (p == ir || p[-1] == '\n') {
+            const char *brace = strchr(p, '{');
+            const char *hit = strstr(p, nd);
+            if (brace && hit && hit < brace) { def = p; break; }
+        }
+        p += 7;
+    }
+    if (!def) return NULL;
+    const char *end = strstr(def, "\n}");
+    if (!end) return NULL;
+    const char *stop = end + 2;
+
+    StringBuf out; sb_init(&out);
+    const char *line = def;
+    while (line < stop) {
+        const char *le = memchr(line, '\n', (size_t)(stop - line));
+        if (!le) le = stop;
+        const char *semi = memchr(line, ';', (size_t)(le - line));
+        const char *lend = semi ? semi : le;
+        StringBuf lb; sb_init(&lb); bool first = true;
+        const char *q = line;
+        while (q < lend) {
+            while (q < lend && isspace((unsigned char)*q)) q++;
+            if (q >= lend) break;
+            const char *ts = q;
+            while (q < lend && !isspace((unsigned char)*q)) q++;
+            size_t tl = (size_t)(q - ts);
+            if (ts[0] == '!' || ts[0] == '#') continue;
+            if ((tl == 9  && !memcmp(ts, "dso_local", 9)) ||
+                (tl == 18 && !memcmp(ts, "local_unnamed_addr", 18)) ||
+                (tl == 7  && !memcmp(ts, "noundef", 7)) ||
+                (tl == 3  && !memcmp(ts, "nsw", 3)) ||
+                (tl == 3  && !memcmp(ts, "nuw", 3))) continue;
+            if (!first) sb_append_char(&lb, ' ');
+            first = false;
+            for (size_t i = 0; i < tl; ) {
+                if (ts[i] == '@' && i + (size_t)(ndl - 1) <= tl &&
+                    !memcmp(ts + i, nd, (size_t)(ndl - 1))) {
+                    sb_append_str(&lb, "@SELF");
+                    i += (size_t)(ndl - 1);
+                } else { sb_append_char(&lb, ts[i]); i++; }
+            }
+        }
+        char *ls = sb_to_str(&lb);
+        if (*ls) { sb_append_str(&out, ls); sb_append_char(&out, '\n'); }
+        free(ls);
+        line = (le < stop) ? le + 1 : stop;
+    }
+    return sb_to_str(&out);
+}
+
+static char *compile_ir(const char *cfile, const char *iflags) {
+    const char *cc = getenv("BASI_REUSE_CLANG");
+    if (!cc || !*cc) cc = "clang";
+    StringBuf cmd; sb_init(&cmd);
+    sb_append_str(&cmd, cc);
+    sb_append_str(&cmd, " -O2 -S -emit-llvm -Wno-everything ");
+    sb_append_str(&cmd, iflags);
+    sb_append_str(&cmd, " -o - ");
+    sb_append_str(&cmd, cfile);
+    sb_append_str(&cmd, " 2>/dev/null");
+    char *cmdstr = sb_to_str(&cmd);   /* null-terminated; owns the buffer */
+    char *ir = run_command_timeout(cmdstr, 8u * 1024 * 1024, 25, NULL);
+    free(cmdstr);
+    if (ir && !*ir) { free(ir); ir = NULL; }
+    return ir;
+}
+
+static void dir_of(const char *path, char *buf, size_t n) {
+    const char *slash = strrchr(path, '/');
+    if (!slash) { snprintf(buf, n, "."); return; }
+    size_t len = (size_t)(slash - path);
+    if (len == 0) { snprintf(buf, n, "/"); return; }
+    if (len >= n) len = n - 1;
+    memcpy(buf, path, len); buf[len] = '\0';
+}
+
+/* True iff the candidate function (as it stands in `cand_src`) compiles to IR
+ * byte-equal to the helper — i.e. they are genuinely equivalent, so replacing
+ * the candidate's body with a call to the helper is behaviour-preserving. */
+static bool ir_equivalent(const char *cand_src, const char *cand_name, const char *cand_path,
+                          const char *helper_file, const char *helper_name) {
+    if (kb_ensure_dirs() != 0) return false;
+    const char *tmp = ".basi/.reuse_cand.c";
+    FILE *f = fopen(tmp, "w");
+    if (!f) return false;
+    fwrite(cand_src, 1, strlen(cand_src), f);
+    fclose(f);
+
+    char hd[1024], cd[1024];
+    dir_of(helper_file, hd, sizeof(hd));
+    dir_of(cand_path, cd, sizeof(cd));
+    StringBuf iflags; sb_init(&iflags);
+    sb_append_str(&iflags, "-I. -I"); sb_append_str(&iflags, hd);
+    sb_append_str(&iflags, " -I");    sb_append_str(&iflags, cd);
+
+    char *ir_c = compile_ir(tmp, iflags.data);
+    char *ir_h = compile_ir(helper_file, iflags.data);
+    sb_free(&iflags);
+    unlink(tmp);
+
+    bool eq = false;
+    char *nc = NULL, *nh = NULL;
+    if (ir_c && ir_h) {
+        nc = ir_extract_normalize(ir_c, cand_name);
+        nh = ir_extract_normalize(ir_h, helper_name);
+        if (nc && nh) eq = (strcmp(nc, nh) == 0);
+    }
+    if (env_flag("BASI_REUSE_DEBUG") && (!ir_c || !ir_h))
+        fprintf(stderr, "ir-equiv: compile failed (cand=%d helper=%d) — cannot verify, refusing\n",
+                ir_c != NULL, ir_h != NULL);
+    free(nc); free(nh);
+    free(ir_c); free(ir_h);
+    return eq;
+}
+
 char *reuse_gate_autofix(const char *path, const char *replace, const char *search) {
     if (!reuse_gate_enabled() || !env_flag("BASI_REUSE_AUTOFIX")) return NULL;
     if (!replace || !*replace) return NULL;
@@ -885,6 +1021,18 @@ char *reuse_gate_autofix(const char *path, const char *replace, const char *sear
         /* Type-compatibility guard: same arity is not enough (two enum→name
          * mappers over different enums match on arity but not types). */
         if (!types_compatible(f->sig, g_store.e[mi].sig)) {
+            for (int i = 0; i < ca; i++) free(cparams[i]); continue;
+        }
+
+        /* Stage-2 semantic guard: structural + type match still can't tell a
+         * behavioural twin (anetRecvTimeout vs anetSendTimeout — same shape,
+         * one differing constant) from a true clone. Only substitute when the
+         * compiler certifies the two functions are IR-equivalent. Skippable via
+         * BASI_REUSE_NOVERIFY for A/B, but that reinstates the unsafe path. */
+        if (!env_flag("BASI_REUSE_NOVERIFY") &&
+            !ir_equivalent(replace, f->name, path, g_store.e[mi].file, g_store.e[mi].name)) {
+            if (dbg) fprintf(stderr, "reuse-autofix: `%s` not IR-equivalent to `%s` — refusing rewrite\n",
+                             f->name, g_store.e[mi].name);
             for (int i = 0; i < ca; i++) free(cparams[i]); continue;
         }
 
