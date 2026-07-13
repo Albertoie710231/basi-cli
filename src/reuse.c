@@ -54,8 +54,17 @@ int reuse_gate_enabled(void) { return env_flag("BASI_REUSE_GATE"); }
  * and a Stage-2 verify tier (compiler IR for compiled langs, parser AST for
  * dynamic ones). Adding a language = one entry here + its tool on PATH. */
 
-typedef enum { LANG_C = 0, LANG_CPP = 1, LANG_PY = 2, LANG_UNKNOWN = 255 } LangId;
+typedef enum { LANG_C = 0, LANG_CPP = 1, LANG_PY = 2, LANG_JS = 3, LANG_GO = 4,
+               LANG_UNKNOWN = 255 } LangId;
+/* Stage-2 verifier: NONE (detect-only, autofix refuses), compiler IR, or a
+ * language-specific AST equivalence check (the ast_verify function pointer). */
 typedef enum { VERIFY_NONE = 0, VERIFY_IR, VERIFY_AST } VerifyTier;
+
+/* An AST-equivalence verifier: 1 iff the two whole-function sources are
+ * semantically equivalent (renamed clone), 0 otherwise / on any failure. */
+typedef bool (*AstVerifyFn)(const char *cand_body, const char *helper_body);
+static bool py_ast_equivalent(const char *cand_body, const char *helper_body);
+static bool go_ast_equivalent(const char *cand_body, const char *helper_body);
 
 typedef struct {
     LangId       id;
@@ -65,18 +74,23 @@ typedef struct {
     const char  *line_comment; /* line-comment marker, or NULL */
     const char  *block_open;   /* block-comment open marker, or NULL */
     const char  *block_close;  /* block-comment close marker, or NULL */
-    VerifyTier   verify;
+    VerifyTier   verify;       /* how Stage-2 certifies equivalence for autofix */
+    AstVerifyFn  ast_verify;   /* used iff verify == VERIFY_AST; else NULL */
     bool         brace_lang;   /* true: C-style { … } bodies; false: Python */
+    const char  *import_fmt;   /* autofix reachability line; 2 %s = module,name */
 } LangBackend;
 
 /* ctags language/kind flags — one invocation handles every backend, ctags
  * auto-detects each file's language by extension and tags it accordingly. */
 #define CTAGS_ARGS "--output-format=json --fields=+neSl " \
-    "--languages=C,C++,Python --kinds-C=f --kinds-C++=f --kinds-Python=fm"
+    "--languages=C,C++,Python,JavaScript,Go " \
+    "--kinds-C=f --kinds-C++=f --kinds-Python=fm --kinds-JavaScript=fm --kinds-Go=f"
 
 static const char *C_EXTS[]   = { ".c", ".h", NULL };
 static const char *CPP_EXTS[] = { ".cpp", ".cc", ".cxx", ".hpp", ".hh", NULL };
 static const char *PY_EXTS[]  = { ".py", NULL };
+static const char *JS_EXTS[]  = { ".js", ".mjs", ".cjs", NULL };
+static const char *GO_EXTS[]  = { ".go", NULL };
 
 static const char *C_KW[] = {
     "auto","break","case","char","const","continue","default","do","double",
@@ -92,11 +106,26 @@ static const char *PY_KW[] = {
     "if","import","in","is","lambda","nonlocal","not","or","pass","raise","return",
     "try","while","with","yield","match","case", NULL,
 };
+static const char *JS_KW[] = {
+    "break","case","catch","class","const","continue","debugger","default",
+    "delete","do","else","export","extends","finally","for","function","if",
+    "import","in","instanceof","new","return","super","switch","this","throw",
+    "try","typeof","var","void","while","with","yield","let","static","async",
+    "await","of","true","false","null","undefined", NULL,
+};
+static const char *GO_KW[] = {
+    "break","case","chan","const","continue","default","defer","else",
+    "fallthrough","for","func","go","goto","if","import","interface","map",
+    "package","range","return","select","struct","switch","type","var",
+    "true","false","nil","iota", NULL,
+};
 
 static const LangBackend BACKENDS[] = {
-    { LANG_C,   "C",      C_EXTS,   C_KW,  "//", "/*", "*/", VERIFY_IR,  true  },
-    { LANG_CPP, "C++",    CPP_EXTS, C_KW,  "//", "/*", "*/", VERIFY_IR,  true  },
-    { LANG_PY,  "Python", PY_EXTS,  PY_KW, "#",  NULL, NULL, VERIFY_AST, false },
+    { LANG_C,   "C",          C_EXTS,   C_KW,  "//", "/*", "*/", VERIFY_IR,   NULL,               true,  NULL },
+    { LANG_CPP, "C++",        CPP_EXTS, C_KW,  "//", "/*", "*/", VERIFY_IR,   NULL,               true,  NULL },
+    { LANG_PY,  "Python",     PY_EXTS,  PY_KW, "#",  NULL, NULL, VERIFY_AST,  py_ast_equivalent,  false, "from %s import %s" },
+    { LANG_JS,  "JavaScript", JS_EXTS,  JS_KW, "//", "/*", "*/", VERIFY_NONE, NULL,               true,  NULL },
+    { LANG_GO,  "Go",         GO_EXTS,  GO_KW, "//", "/*", "*/", VERIFY_AST,  go_ast_equivalent,  true,  NULL },
 };
 #define N_BACKENDS (sizeof(BACKENDS) / sizeof(BACKENDS[0]))
 
@@ -184,6 +213,38 @@ static int j_int(const char *o, const char *k) {
     return atoi(q);
 }
 
+/* Offset just past the '}' that closes the first '{' at or after `from`,
+ * skipping braces inside strings, char literals and line/block comments. Used
+ * as a fallback body-extent for brace languages when ctags omits the `end`
+ * field (e.g. its JavaScript parser). Returns `flen` if unbalanced. */
+static size_t brace_extent(const char *src, size_t flen, size_t from) {
+    size_t i = from;
+    while (i < flen && src[i] != '{') i++;
+    if (i >= flen) return flen;
+    int depth = 0;
+    enum { CODE, STR, CH, LC, BC } st = CODE;
+    char q = 0;
+    for (; i < flen; i++) {
+        char c = src[i], d = (i + 1 < flen) ? src[i + 1] : '\0';
+        switch (st) {
+        case CODE:
+            if (c == '/' && d == '/') { st = LC; i++; }
+            else if (c == '/' && d == '*') { st = BC; i++; }
+            else if (c == '"' || c == '\'') { st = (c == '"') ? STR : CH; q = c; }
+            else if (c == '{') depth++;
+            else if (c == '}') { if (--depth == 0) return i + 1; }
+            break;
+        case STR: case CH:
+            if (c == '\\') i++;
+            else if (c == q) st = CODE;
+            break;
+        case LC: if (c == '\n') st = CODE; break;
+        case BC: if (c == '*' && d == '/') { st = CODE; i++; } break;
+        }
+    }
+    return flen;
+}
+
 static FuncDef *ctags_extract_file(const char *path, int *out_n) {
     *out_n = 0;
     size_t flen = 0;
@@ -214,9 +275,16 @@ static FuncDef *ctags_extract_file(const char *path, int *out_n) {
             char *lang = j_str(line, "language");
             char *tref = j_str(line, "typeref");
             if (name && ls > 0) {
-                if (le < ls) le = ls;
+                const LangBackend *be = backend_by_name(lang);
                 size_t a = line_offset(src, flen, ls);
-                size_t b = line_offset(src, flen, le + 1);
+                size_t b;
+                if (le >= ls) {
+                    b = line_offset(src, flen, le + 1);        /* ctags gave end */
+                } else if (be && be->brace_lang) {
+                    b = brace_extent(src, flen, a);            /* fallback (e.g. JS) */
+                } else {
+                    b = line_offset(src, flen, ls + 1);        /* single line */
+                }
                 /* Rebuild a C-style "<ret> name(params)" signature so the
                  * autofix param/type/void parsers keep working unchanged. For
                  * dynamic langs (no typeref) the return type is simply absent. */
@@ -228,7 +296,6 @@ static FuncDef *ctags_extract_file(const char *path, int *out_n) {
                 }
                 sb_append_str(&sb, name);
                 sb_append_str(&sb, sig ? sig : "()");
-                const LangBackend *be = backend_by_name(lang);
                 if (n >= cap) { cap = cap ? cap * 2 : 8; arr = realloc(arr, cap * sizeof(FuncDef)); }
                 arr[n].name = name; name = NULL;
                 arr[n].sig  = sb_to_str(&sb);
@@ -804,6 +871,40 @@ static int parse_params(const char *sig, char **out, int max) {
     return count;
 }
 
+/* Parse parameter NAMES from a Go signature "ret name(a, b int, c string)":
+ * the name is the LEADING identifier of each comma group (Go puts the type
+ * after the name, and shares a type across a group). Returns arity or -1. */
+static int parse_params_go(const char *sig, char **out, int max) {
+    const char *op = strchr(sig, '(');
+    const char *cp = op ? strrchr(sig, ')') : NULL;
+    if (!op || !cp || cp <= op) return -1;
+    int count = 0, depth = 0;
+    const char *start = op + 1;
+    for (const char *p = op + 1; p <= cp; p++) {
+        if (p < cp && (*p == '(' || *p == '[' || *p == '{')) depth++;
+        else if (p < cp && (*p == ')' || *p == ']' || *p == '}')) depth--;
+        if (p == cp || (*p == ',' && depth == 0)) {
+            const char *s = start;
+            while (s < p && isspace((unsigned char)*s)) s++;
+            const char *e = s;
+            while (e < p && (isalnum((unsigned char)*e) || *e == '_')) e++;
+            if (e > s) {
+                size_t len = (size_t)(e - s);
+                char *nm = malloc(len + 1); memcpy(nm, s, len); nm[len] = '\0';
+                if (count < max) out[count++] = nm; else free(nm);
+            }
+            start = p + 1;
+        }
+    }
+    return count;
+}
+
+/* Parameter names for the candidate/helper, dispatched by language. */
+static int params_for(const LangBackend *be, const char *sig, char **out, int max) {
+    return (be && be->id == LANG_GO) ? parse_params_go(sig, out, max)
+                                     : parse_params(sig, out, max);
+}
+
 /* Extract whitespace-stripped param TYPES (slice minus the trailing name and
  * any []). Returns arity (0 for void/empty); types malloc'd into out[]. */
 static int parse_param_types(const char *sig, char **out, int max) {
@@ -925,26 +1026,64 @@ static char *str_replace_once(const char *hay, const char *needle, const char *r
  * alone can't tell apart. Sound: IR-equal ⇒ safe to substitute; any difference
  * (or a failure to compile) ⇒ refuse. */
 
-/* Extract the `define …@name(…){ … }` block and normalize: strip comments,
+/* Extract the `define …@sym(…){ … }` block and normalize: strip comments,
  * metadata (!…) and attribute-group refs (#N), drop linkage/param noise,
  * canonicalize the function's own name to @SELF, collapse whitespace. clang's
  * canonical SSA numbering already makes equivalent functions share register
- * numbers, so no renaming is needed. Returns malloc'd or NULL. */
+ * numbers, so no renaming is needed. Returns malloc'd or NULL.
+ *
+ * The self-symbol is `@name` for C (verbatim) or the Itanium-mangled
+ * `@_Z…<len><name>…` for C++; both are canonicalized to @SELF so renamed
+ * clones compare equal regardless of mangling. */
 static char *ir_extract_normalize(const char *ir, const char *name) {
     char nd[256];
-    int ndl = snprintf(nd, sizeof(nd), "@%s(", name);   /* nd = "@name(" ; "@name" = ndl-1 chars */
+    int ndl = snprintf(nd, sizeof(nd), "@%s(", name);   /* "@name(" */
     if (ndl <= 2 || ndl >= (int)sizeof(nd)) return NULL;
 
+    char self_tok[256]; size_t self_len = 0;   /* the exact "@symbol" to blank */
     const char *def = NULL, *p = ir;
+
+    /* Pass 1: exact @name( — C, or C++ with extern "C". */
     while ((p = strstr(p, "define ")) != NULL) {
         if (p == ir || p[-1] == '\n') {
             const char *brace = strchr(p, '{');
             const char *hit = strstr(p, nd);
-            if (brace && hit && hit < brace) { def = p; break; }
+            if (brace && hit && hit < brace) {
+                def = p;
+                self_len = (size_t)snprintf(self_tok, sizeof(self_tok), "@%s", name);
+                break;
+            }
         }
         p += 7;
     }
-    if (!def) return NULL;
+    /* Pass 2: mangled symbol containing "<len>name" — C++ (name mangling). */
+    if (!def) {
+        char lp[128];
+        int lpl = snprintf(lp, sizeof(lp), "%zu%s", strlen(name), name);   /* "5clamp" */
+        if (lpl > 0 && lpl < (int)sizeof(lp)) {
+            p = ir;
+            while ((p = strstr(p, "define ")) != NULL) {
+                if (p == ir || p[-1] == '\n') {
+                    const char *brace = strchr(p, '{');
+                    const char *q = p;
+                    while (brace && q < brace &&
+                           (q = memchr(q, '@', (size_t)(brace - q))) != NULL) {
+                        const char *paren = strchr(q, '(');
+                        if (paren && paren < brace && (size_t)(paren - q) < sizeof(self_tok) &&
+                            memmem(q, (size_t)(paren - q), lp, (size_t)lpl)) {
+                            def = p; self_len = (size_t)(paren - q);
+                            memcpy(self_tok, q, self_len); self_tok[self_len] = '\0';
+                            break;
+                        }
+                        q++;
+                    }
+                    if (def) break;
+                }
+                p += 7;
+            }
+        }
+    }
+    if (!def || self_len == 0) return NULL;
     const char *end = strstr(def, "\n}");
     if (!end) return NULL;
     const char *stop = end + 2;
@@ -973,10 +1112,10 @@ static char *ir_extract_normalize(const char *ir, const char *name) {
             if (!first) sb_append_char(&lb, ' ');
             first = false;
             for (size_t i = 0; i < tl; ) {
-                if (ts[i] == '@' && i + (size_t)(ndl - 1) <= tl &&
-                    !memcmp(ts + i, nd, (size_t)(ndl - 1))) {
+                if (ts[i] == '@' && i + self_len <= tl &&
+                    !memcmp(ts + i, self_tok, self_len)) {
                     sb_append_str(&lb, "@SELF");
-                    i += (size_t)(ndl - 1);
+                    i += self_len;
                 } else { sb_append_char(&lb, ts[i]); i++; }
             }
         }
@@ -1106,7 +1245,12 @@ static char *cc_lookup_flags(const char *target) {
 static bool ir_equivalent(const char *cand_src, const char *cand_name, const char *cand_path,
                           const char *helper_file, const char *helper_name) {
     if (kb_ensure_dirs() != 0) return false;
-    const char *tmp = ".basi/.reuse_cand.c";
+    /* Candidate temp file must carry the language's extension so clang selects
+     * the matching frontend (C vs C++) — a C++ candidate written to a .c file
+     * would be miscompiled and its mangled name would never match the helper. */
+    const LangBackend *cbe = backend_by_id(lang_of_path(cand_path));
+    char tmp[64];
+    snprintf(tmp, sizeof(tmp), ".basi/.reuse_cand%s", cbe ? cbe->exts[0] : ".c");
     FILE *f = fopen(tmp, "w");
     if (!f) return false;
     fwrite(cand_src, 1, strlen(cand_src), f);
@@ -1200,6 +1344,123 @@ static bool py_ast_equivalent(const char *cand_body, const char *helper_body) {
     return eq;
 }
 
+/* ── Stage-2 semantic verification: Go AST equivalence ──────────────────
+ * The verifier for Go (whose gc toolchain emits no LLVM IR): parse both
+ * functions with go/parser, rename only their own parameters, and compare the
+ * go/printer-canonicalized source. Same soundness as the IR and Python paths —
+ * a renamed clone matches, a constant twin does not. Requires `go` on PATH;
+ * absent → the run fails → refuse (safe, detect-only). The helper program is
+ * written to a temp file and run with `go run`; the two function sources are
+ * passed as NON-.go arguments so `go run` treats them as argv, not sources. */
+#define GO_VERIFY_SRC \
+    "package main\n" \
+    "\n" \
+    "import (\n" \
+    "	\"bytes\"\n" \
+    "	\"fmt\"\n" \
+    "	\"go/ast\"\n" \
+    "	\"go/parser\"\n" \
+    "	\"go/printer\"\n" \
+    "	\"go/token\"\n" \
+    "	\"os\"\n" \
+    ")\n" \
+    "\n" \
+    "func norm(path string) string {\n" \
+    "	src, err := os.ReadFile(path)\n" \
+    "	if err != nil {\n" \
+    "		return \"\"\n" \
+    "	}\n" \
+    "	fset := token.NewFileSet()\n" \
+    "	f, err := parser.ParseFile(fset, \"\", \"package p\\n\"+string(src), 0)\n" \
+    "	if err != nil || len(f.Decls) == 0 {\n" \
+    "		return \"\"\n" \
+    "	}\n" \
+    "	fn, ok := f.Decls[0].(*ast.FuncDecl)\n" \
+    "	if !ok {\n" \
+    "		return \"\"\n" \
+    "	}\n" \
+    "	m := map[string]string{}\n" \
+    "	add := func(name string) {\n" \
+    "		if _, seen := m[name]; !seen && name != \"_\" {\n" \
+    "			m[name] = fmt.Sprintf(\"p%d\", len(m))\n" \
+    "		}\n" \
+    "	}\n" \
+    "	if fn.Recv != nil {\n" \
+    "		for _, fld := range fn.Recv.List {\n" \
+    "			for _, nm := range fld.Names {\n" \
+    "				add(nm.Name)\n" \
+    "			}\n" \
+    "		}\n" \
+    "	}\n" \
+    "	if fn.Type.Params != nil {\n" \
+    "		for _, fld := range fn.Type.Params.List {\n" \
+    "			for _, nm := range fld.Names {\n" \
+    "				add(nm.Name)\n" \
+    "			}\n" \
+    "		}\n" \
+    "	}\n" \
+    "	skip := map[*ast.Ident]bool{}\n" \
+    "	ast.Inspect(fn, func(n ast.Node) bool {\n" \
+    "		if s, ok := n.(*ast.SelectorExpr); ok {\n" \
+    "			skip[s.Sel] = true\n" \
+    "		}\n" \
+    "		return true\n" \
+    "	})\n" \
+    "	fn.Name.Name = \"F\"\n" \
+    "	ast.Inspect(fn, func(n ast.Node) bool {\n" \
+    "		if id, ok := n.(*ast.Ident); ok && !skip[id] {\n" \
+    "			if r, ok := m[id.Name]; ok {\n" \
+    "				id.Name = r\n" \
+    "			}\n" \
+    "		}\n" \
+    "		return true\n" \
+    "	})\n" \
+    "	var buf bytes.Buffer\n" \
+    "	printer.Fprint(&buf, fset, fn)\n" \
+    "	return buf.String()\n" \
+    "}\n" \
+    "\n" \
+    "func main() {\n" \
+    "	a := norm(os.Args[1])\n" \
+    "	b := norm(os.Args[2])\n" \
+    "	if a != \"\" && a == b {\n" \
+    "		fmt.Print(\"1\")\n" \
+    "	} else {\n" \
+    "		fmt.Print(\"0\")\n" \
+    "	}\n" \
+    "}\n"
+
+static bool go_ast_equivalent(const char *cand_body, const char *helper_body) {
+    if (kb_ensure_dirs() != 0) return false;
+    /* The `go` tool ignores source files whose names start with '.', so the
+     * verifier program must not be dot-prefixed (the .gosrc args are read as
+     * plain files, not compiled, so their names are unconstrained). */
+    const char *prog = ".basi/reuse_goverify.go";
+    const char *cf = ".basi/.reuse_cand.gosrc", *hf = ".basi/.reuse_help.gosrc";
+    FILE *p = fopen(prog, "w"); if (!p) return false;
+    fwrite(GO_VERIFY_SRC, 1, strlen(GO_VERIFY_SRC), p); fclose(p);
+    FILE *a = fopen(cf, "w"); if (!a) { unlink(prog); return false; }
+    fwrite(cand_body, 1, strlen(cand_body), a); fclose(a);
+    FILE *b = fopen(hf, "w"); if (!b) { unlink(prog); unlink(cf); return false; }
+    fwrite(helper_body, 1, strlen(helper_body), b); fclose(b);
+
+    const char *go = getenv("BASI_REUSE_GO");
+    if (!go || !*go) go = "go";
+    StringBuf cmd; sb_init(&cmd);
+    sb_append_str(&cmd, go);
+    sb_append_str(&cmd, " run ");
+    sb_append_str(&cmd, prog); sb_append_char(&cmd, ' ');
+    sb_append_str(&cmd, cf);   sb_append_char(&cmd, ' ');
+    sb_append_str(&cmd, hf);   sb_append_str(&cmd, " 2>/dev/null");
+    char *cmdstr = sb_to_str(&cmd);
+    char *out = run_command_timeout(cmdstr, 4096, 30, NULL);
+    free(cmdstr);
+    unlink(prog); unlink(cf); unlink(hf);
+    bool eq = out && out[0] == '1';
+    free(out);
+    return eq;
+}
+
 /* Dispatch Stage-2 verification by the candidate's language: compiled → LLVM IR
  * equivalence, dynamic → parser AST equivalence, otherwise refuse (we can only
  * auto-substitute what a tool can certify equivalent). */
@@ -1208,9 +1469,9 @@ static bool verify_equivalent(const LangBackend *be, const char *replace,
                               const SymEntry *helper) {
     if (be->verify == VERIFY_IR)
         return ir_equivalent(replace, cand->name, cand_path, helper->file, helper->name);
-    if (be->verify == VERIFY_AST)
-        return py_ast_equivalent(cand->body, helper->body);
-    return false;
+    if (be->verify == VERIFY_AST && be->ast_verify)
+        return be->ast_verify(cand->body, helper->body);
+    return false;   /* VERIFY_NONE or no verifier → cannot certify → refuse */
 }
 
 /* Is `s` a legal identifier (used to gate Python module-name injection)? */
@@ -1267,16 +1528,27 @@ static char *build_reuse_function(const FuncDef *f, const LangBackend *be,
     sb_append_char(&b, '(');
     for (int i = 0; i < ca; i++) { if (i) sb_append_str(&b, ", "); sb_append_str(&b, params[i]); }
     sb_append_char(&b, ')');
-    if (be->brace_lang) sb_append_str(&b, ";\n}");
-    else                sb_append_char(&b, '\n');
+    if (!be->brace_lang)          sb_append_char(&b, '\n');       /* Python */
+    else if (be->id == LANG_GO)   sb_append_str(&b, "\n}");       /* Go: no statement ; */
+    else                          sb_append_str(&b, ";\n}");      /* C / C++ */
     return sb_to_str(&b);
 }
 
+/* Directory portion of a path ("" for a bare filename). */
+static void path_dir(const char *p, char *buf, size_t n) {
+    const char *slash = strrchr(p, '/');
+    size_t len = slash ? (size_t)(slash - p) : 0;
+    if (len >= n) len = n - 1;
+    memcpy(buf, p, len); buf[len] = '\0';
+}
+
 /* Injected line that makes the helper reachable from the rewritten file, plus a
- * guard that the rewrite would actually resolve. Returns malloc'd import/include
- * text (caller frees) or NULL to refuse the rewrite. */
-static char *reachability_line(const LangBackend *be, const char *helper_file, const char *helper_name) {
-    if (be->brace_lang) {
+ * guard that the rewrite would actually resolve. Returns a malloc'd line to
+ * prepend (possibly ""), or NULL to refuse the rewrite. */
+static char *reachability_line(const LangBackend *be, const char *cand_path,
+                               const char *helper_file, const char *helper_name) {
+    if (be->verify == VERIFY_IR) {
+        /* C / C++: the helper must be declared in a sibling header. */
         char *hdr = header_for(helper_file);
         if (!hdr || !header_declares(hdr, helper_name)) { free(hdr); return NULL; }
         const char *slash = strrchr(hdr, '/');
@@ -1285,17 +1557,28 @@ static char *reachability_line(const LangBackend *be, const char *helper_file, c
         free(hdr);
         return strdup(inc);
     }
-    /* Python: import the helper from its module (file stem). */
-    const char *slash = strrchr(helper_file, '/');
-    const char *base = slash ? slash + 1 : helper_file;
-    const char *dot = strrchr(base, '.');
-    size_t stemlen = dot ? (size_t)(dot - base) : strlen(base);
-    char stem[128];
-    if (stemlen == 0 || stemlen >= sizeof(stem)) return NULL;
-    memcpy(stem, base, stemlen); stem[stemlen] = '\0';
-    if (!is_ident(stem)) return NULL;
-    char imp[300]; snprintf(imp, sizeof(imp), "from %s import %s", stem, helper_name);
-    return strdup(imp);
+    if (be->import_fmt) {
+        /* Python: import the helper from its module (file stem). */
+        const char *slash = strrchr(helper_file, '/');
+        const char *base = slash ? slash + 1 : helper_file;
+        const char *dot = strrchr(base, '.');
+        size_t stemlen = dot ? (size_t)(dot - base) : strlen(base);
+        char stem[128];
+        if (stemlen == 0 || stemlen >= sizeof(stem)) return NULL;
+        memcpy(stem, base, stemlen); stem[stemlen] = '\0';
+        if (!is_ident(stem)) return NULL;
+        char imp[300]; snprintf(imp, sizeof(imp), be->import_fmt, stem, helper_name);
+        return strdup(imp);
+    }
+    if (be->id == LANG_GO) {
+        /* Go: a same-package (same-directory) helper is visible with no import;
+         * a cross-package one would need an import path we cannot infer → refuse. */
+        char cd[1024], hd[1024];
+        path_dir(cand_path, cd, sizeof(cd));
+        path_dir(helper_file, hd, sizeof(hd));
+        return strcmp(cd, hd) == 0 ? strdup("") : NULL;
+    }
+    return NULL;   /* no reachability mechanism → refuse */
 }
 
 char *reuse_gate_autofix(const char *path, const char *replace, const char *search) {
@@ -1325,15 +1608,16 @@ char *reuse_gate_autofix(const char *path, const char *replace, const char *sear
         SymEntry *h = &g_store.e[mi];
 
         char *cparams[MAX_PARAMS], *hparams[MAX_PARAMS];
-        int ca = parse_params(f->sig, cparams, MAX_PARAMS);
-        int ha = parse_params(h->sig, hparams, MAX_PARAMS);
+        int ca = params_for(be, f->sig, cparams, MAX_PARAMS);
+        int ha = params_for(be, h->sig, hparams, MAX_PARAMS);
         for (int i = 0; i < ha; i++) free(hparams[i]);
         if (ca < 0 || ca != ha) { for (int i = 0; i < ca; i++) free(cparams[i]); continue; }
 
         /* Type-compatibility guard: same arity is not enough (two enum→name
          * mappers over different enums match on arity but not types). C-family
-         * only — dynamic langs have no static types to compare. */
-        if (be->brace_lang && !types_compatible(f->sig, h->sig)) {
+         * only (the type parser is C-syntax); other langs rely on the Stage-2
+         * verifier below, which is type-aware by construction. */
+        if (be->verify == VERIFY_IR && !types_compatible(f->sig, h->sig)) {
             for (int i = 0; i < ca; i++) free(cparams[i]);
             continue;
         }
@@ -1353,9 +1637,9 @@ char *reuse_gate_autofix(const char *path, const char *replace, const char *sear
         }
 
         /* Reachability guard: only rewrite if the injected call would resolve
-         * (C: helper's header declares it; Python: helper is an importable
-         * module). */
-        char *reach = reachability_line(be, h->file, h->name);
+         * (C/C++: helper's header declares it; Python: helper is an importable
+         * module; Go: helper is in the same package/directory). */
+        char *reach = reachability_line(be, path, h->file, h->name);
         if (!reach) { for (int i = 0; i < ca; i++) free(cparams[i]); continue; }
 
         char *reuse_fn = build_reuse_function(f, be, h->name, cparams, ca);
