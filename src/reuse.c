@@ -1840,11 +1840,15 @@ static bool ir_fn_changed(const char *oldf, const char *newf, const char *name, 
     return changed;
 }
 
-char *reuse_regress_check(const char *path, const char *old_src, const char *new_src) {
-    if (!reuse_regress_enabled() || !old_src || !new_src) return NULL;
+/* Names of existing functions whose behavior the edit CONFIDENTLY changed
+ * (compiler-IR / parser-AST verified). No warn-once, no formatting — the raw
+ * signal shared by the warn path and the test-confirm guard. malloc'd array of
+ * malloc'd names; caller frees each + the array; *out_n gets the count. */
+static char **regress_changed_functions(const char *path, const char *old_src,
+                                        const char *new_src, int *out_n) {
+    *out_n = 0;
     const LangBackend *be = backend_by_id(lang_of_path(path));
-    if (!be) return NULL;
-    if (be->verify == VERIFY_NONE) return NULL;                 /* no oracle (e.g. JS) */
+    if (!be || be->verify == VERIFY_NONE) return NULL;         /* no oracle (e.g. JS) */
     if (be->verify == VERIFY_AST && !be->ast_verify) return NULL;
     if (kb_ensure_dirs() != 0) return NULL;
 
@@ -1863,39 +1867,22 @@ char *reuse_regress_check(const char *path, const char *old_src, const char *new
     char *iflags = (be->verify == VERIFY_IR) ? regress_iflags(path) : NULL;
     bool dbg = env_flag("BASI_REUSE_DEBUG");
 
-    StringBuf msg; sb_init(&msg);
-    int hits = 0;
+    char **names = NULL; int cnt = 0;
     for (int i = 0; i < nn; i++) {
         FuncDef *o = NULL;
         for (int j = 0; j < no; j++)
             if (strcmp(fo[j].name, fn[i].name) == 0) { o = &fo[j]; break; }
         if (!o) continue;                                    /* newly added, not a regression */
         if (strcmp(o->body, fn[i].body) == 0) continue;      /* text unchanged */
-        if (warned_seen(fn[i].name)) continue;               /* warn-once → re-issue applies */
-
-        bool changed;
-        if (be->verify == VERIFY_IR) {
-            changed = ir_fn_changed(oldf, newf, fn[i].name, iflags);
-        } else {
-            /* AST: only a CONFIDENT change counts. The old-vs-old self-check
-             * confirms the verifier actually works for this language+function
-             * (tool present, source parses) before we trust a "different"
-             * verdict — so a missing verifier (e.g. no typescript installed)
-             * degrades to "don't flag", never a false alarm. */
-            changed = be->ast_verify(o->body, o->body)
-                   && !be->ast_verify(o->body, fn[i].body);
-        }
+        bool changed = (be->verify == VERIFY_IR)
+            ? ir_fn_changed(oldf, newf, fn[i].name, iflags)
+            /* AST: old-vs-old self-check confirms the verifier actually works
+             * for this lang+function before we trust a "different" verdict — a
+             * missing verifier degrades to "don't flag", never a false alarm. */
+            : (be->ast_verify(o->body, o->body) && !be->ast_verify(o->body, fn[i].body));
         if (!changed) continue;
-
-        if (hits == 0)
-            sb_append_str(&msg, "edit paused — behavior guard: this edit changes the behavior of code that already exists.\n");
-        char line[512];
-        snprintf(line, sizeof(line),
-            "  \xe2\x80\xa2 existing function `%s` behaves differently after this edit (compiler-verified)\n",
-            fn[i].name);
-        sb_append_str(&msg, line);
-        warned_add(fn[i].name);
-        hits++;
+        names = realloc(names, (size_t)(cnt + 1) * sizeof(char *));
+        names[cnt++] = strdup(fn[i].name);
         if (dbg) fprintf(stderr, "reuse-regress: `%s` behavior changed\n", fn[i].name);
     }
 
@@ -1903,13 +1890,157 @@ char *reuse_regress_check(const char *path, const char *old_src, const char *new
     for (int i = 0; i < nn; i++) funcdef_free(&fn[i]);
     free(fo); free(fn); free(iflags);
     unlink(oldf); unlink(newf);
+    *out_n = cnt;
+    return names;
+}
 
+char *reuse_regress_check(const char *path, const char *old_src, const char *new_src) {
+    if (!reuse_regress_enabled() || !old_src || !new_src) return NULL;
+    int n = 0;
+    char **names = regress_changed_functions(path, old_src, new_src, &n);
+    StringBuf msg; sb_init(&msg);
+    int hits = 0;
+    for (int i = 0; i < n; i++) {
+        if (!warned_seen(names[i])) {                        /* warn-once → re-issue applies */
+            if (hits == 0)
+                sb_append_str(&msg, "edit paused — behavior guard: this edit changes the behavior of code that already exists.\n");
+            char line[512];
+            snprintf(line, sizeof(line),
+                "  \xe2\x80\xa2 existing function `%s` behaves differently after this edit (compiler-verified)\n", names[i]);
+            sb_append_str(&msg, line);
+            warned_add(names[i]);
+            hits++;
+        }
+        free(names[i]);
+    }
+    free(names);
     if (hits == 0) { sb_free(&msg); return NULL; }
     sb_append_str(&msg,
         "\nIf these behavior changes are intended, re-issue this same edit — it will apply. "
         "If not (e.g. you consolidated shared logic and altered one existing caller), fix it so "
         "the existing behavior is preserved before re-issuing.\n");
     return sb_to_str(&msg);
+}
+
+/* ── Test-confirm layer ─────────────────────────────────────────────────
+ * The byte-IR/AST check over-flags: adding a switch case or a guard clause
+ * changes a function's IR without regressing any EXISTING input. The project's
+ * own tests are the oracle that tells the difference — new behavior for a new
+ * input keeps them green; a real regression turns a green test red. When a test
+ * command is available we CONFIRM a flag by running it, and only hard-block
+ * (reverting the file) when a previously-green suite goes red. */
+
+/* Resolve the test command: $BASI_REUSE_TEST_CMD, else a best-effort auto-
+ * detect (go test / make test). malloc'd, or NULL if none is available. */
+static char *reuse_test_command(void) {
+    const char *e = getenv("BASI_REUSE_TEST_CMD");
+    if (e && *e) return strdup(e);
+    struct stat st;
+    if (stat("go.mod", &st) == 0) return strdup("go test ./...");
+    for (int k = 0; k < 2; k++) {
+        size_t n = 0;
+        char *buf = read_file_all(k ? "makefile" : "Makefile", &n);
+        if (!buf) continue;
+        bool has = false;
+        const char *p = buf;
+        while ((p = strstr(p, "test:")) != NULL) {
+            if (p == buf || p[-1] == '\n') { has = true; break; }
+            p += 5;
+        }
+        free(buf);
+        if (has) return strdup("make test");
+    }
+    return NULL;
+}
+
+/* Run `cmd` under a timeout, capture combined output into *out (if non-NULL),
+ * return the exit code (0 = pass; non-zero incl. timeout = fail). */
+static int reuse_run_tests(const char *cmd, char **out) {
+    StringBuf c; sb_init(&c);
+    sb_append_str(&c, "timeout 180 ");
+    sb_append_str(&c, cmd);
+    sb_append_str(&c, " 2>&1");
+    char *full = sb_to_str(&c);
+    int ec = -1;
+    char *o = run_command_status(full, 64 * 1024, &ec);
+    free(full);
+    if (out) *out = o; else free(o);
+    return ec;
+}
+
+static int write_file_str(const char *path, const char *src) {
+    FILE *f = fopen(path, "w");
+    if (!f) return -1;
+    fwrite(src, 1, strlen(src), f);
+    return fclose(f) == 0 ? 0 : -1;
+}
+
+char *reuse_regress_guard(const char *path, const char *old_src, const char *new_src, int *wrote_new) {
+    if (wrote_new) *wrote_new = 0;
+    if (!reuse_regress_enabled() || !old_src || !new_src) return NULL;
+
+    int n = 0;
+    char **names = regress_changed_functions(path, old_src, new_src, &n);
+    if (n == 0) { free(names); return NULL; }
+
+    char *testcmd = reuse_test_command();
+    bool dbg = env_flag("BASI_REUSE_DEBUG");
+
+    /* No test oracle → fall back to the warn-once advisory (which re-derives
+     * the flags itself; free ours). */
+    if (!testcmd) {
+        for (int i = 0; i < n; i++) free(names[i]);
+        free(names);
+        return reuse_regress_check(path, old_src, new_src);
+    }
+
+    /* Build the "`a`, `b`" name list for messages. */
+    StringBuf nb; sb_init(&nb);
+    for (int i = 0; i < n; i++) { if (i) sb_append_str(&nb, ", "); sb_append_char(&nb, '`'); sb_append_str(&nb, names[i]); sb_append_char(&nb, '`'); }
+    char *namelist = sb_to_str(&nb);
+    for (int i = 0; i < n; i++) free(names[i]);
+    free(names);
+
+    /* Baseline: tests must be GREEN on the OLD code (still on disk) for a
+     * post-edit failure to be attributable to this edit. */
+    int base = reuse_run_tests(testcmd, NULL);
+    if (base != 0) {
+        if (dbg) fprintf(stderr, "reuse-regress: baseline `%s` failing (exit %d) — cannot confirm, warn only\n", testcmd, base);
+        free(namelist); free(testcmd);
+        return reuse_regress_check(path, old_src, new_src);   /* warn-once advisory */
+    }
+
+    if (write_file_str(path, new_src) != 0) {                 /* couldn't apply → let caller write */
+        free(namelist); free(testcmd);
+        return NULL;
+    }
+    char *tout = NULL;
+    int post = reuse_run_tests(testcmd, &tout);
+
+    char *result = NULL;
+    if (post != 0) {
+        write_file_str(path, old_src);                        /* revert */
+        StringBuf m; sb_init(&m);
+        sb_append_str(&m, "edit blocked — behavior guard: this edit regressed existing behavior (a passing test now fails).\n");
+        char line[700];
+        snprintf(line, sizeof(line),
+            "  \xe2\x80\xa2 changed existing function(s): %s\n  \xe2\x80\xa2 `%s` went from PASS to FAIL\n", namelist, testcmd);
+        sb_append_str(&m, line);
+        if (tout && *tout) {
+            sb_append_str(&m, "  --- test output (tail) ---\n");
+            size_t tl = strlen(tout);
+            sb_append_str(&m, tl > 1200 ? tout + tl - 1200 : tout);
+            if (m.len && m.data[m.len - 1] != '\n') sb_append_char(&m, '\n');
+        }
+        sb_append_str(&m, "The edit was reverted. Fix it so the existing tests pass, then re-issue.\n");
+        result = sb_to_str(&m);
+        if (dbg) fprintf(stderr, "reuse-regress: CONFIRMED regression (tests red) — reverted, blocking\n");
+    } else {
+        if (wrote_new) *wrote_new = 1;                        /* false positive: new stays, tests green */
+        if (dbg) fprintf(stderr, "reuse-regress: %s flagged but tests still pass — allowing\n", namelist);
+    }
+    free(tout); free(namelist); free(testcmd);
+    return result;
 }
 
 void reuse_shutdown(void) {

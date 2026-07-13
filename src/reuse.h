@@ -53,6 +53,18 @@ int reuse_regress_enabled(void);
  * writing the file. */
 char *reuse_regress_check(const char *path, const char *old_src, const char *new_src);
 
+/* Behavior-preservation guard with test confirmation. Like reuse_regress_check,
+ * but when a project test command is available (BASI_REUSE_TEST_CMD, else auto-
+ * detected) and the tests pass on the OLD code, it WRITES the new content, re-
+ * runs the tests, and only reports a regression — a hard block, reverting the
+ * file — when a previously-green suite goes red. A byte-IR false positive
+ * (e.g. an added switch case) leaves the new content written and returns NULL
+ * with *wrote_new=1. With no test command it falls back to the warn-once
+ * advisory. Returns a malloc'd model-facing message (caller returns it instead
+ * of writing) or NULL to proceed; sets *wrote_new=1 iff it already wrote NEW to
+ * `path` (so the caller must skip its own write). */
+char *reuse_regress_guard(const char *path, const char *old_src, const char *new_src, int *wrote_new);
+
 /* Free the in-process symbol store + warned-name set. Optional; process exit
  * reclaims everything. */
 void reuse_shutdown(void);

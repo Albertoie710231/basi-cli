@@ -481,16 +481,20 @@ char *execute_edit(const char *args) {
 
     /* Behavior-preservation guard (opt-in BASI_REUSE_REGRESS): before writing,
      * check whether this edit silently changed the behavior of a function that
-     * already existed. The old content is still on disk (we write below), so we
-     * re-read it and compare against the assembled new content. Warn-once per
-     * function name — a re-issue applies. No-op when disabled or the file is new. */
+     * already existed. The old content is still on disk, so we re-read it and
+     * compare against the assembled new content. When a project test command is
+     * available the flag is confirmed by running the tests (hard block + revert
+     * only on a green→red suite); otherwise it warns (warn-once). The guard may
+     * write the new content itself during confirmation — `reuse_wrote` then
+     * tells us to skip the normal write below. No-op if disabled or file is new. */
+    int reuse_wrote = 0;
     if (file_existed && reuse_regress_enabled()) {
         size_t olen = 0;
-        char *oldc = read_file_all(path, &olen);   /* disk still holds the pre-edit content */
+        char *oldc = read_file_all(path, &olen);
         if (oldc) {
             char *newc = malloc(cur.len + 1);
             memcpy(newc, cur.data, cur.len); newc[cur.len] = '\0';
-            char *rwarn = reuse_regress_check(path, oldc, newc);
+            char *rwarn = reuse_regress_guard(path, oldc, newc, &reuse_wrote);
             free(oldc); free(newc);
             if (rwarn) { sb_free(&cur); free_parsed_edit(p); return rwarn; }
         }
@@ -502,16 +506,18 @@ char *execute_edit(const char *args) {
         if (strcmp(dir, ".") != 0 && strcmp(dir, "/") != 0) mkdir_p(dir);
         free(pc);
     }
-    FILE *f = fopen(path, "w");
-    if (!f) {
-        char *e = malloc(512);
-        snprintf(e, 512, "edit: cannot write '%s' (%s)", path, strerror(errno));
-        sb_free(&cur);
-        free_parsed_edit(p);
-        return e;
+    if (!reuse_wrote) {                    /* the guard may have already written it */
+        FILE *f = fopen(path, "w");
+        if (!f) {
+            char *e = malloc(512);
+            snprintf(e, 512, "edit: cannot write '%s' (%s)", path, strerror(errno));
+            sb_free(&cur);
+            free_parsed_edit(p);
+            return e;
+        }
+        if (cur.len) fwrite(cur.data, 1, cur.len, f);
+        fclose(f);
     }
-    if (cur.len) fwrite(cur.data, 1, cur.len, f);
-    fclose(f);
 
     char *result = malloc(320);
     int rn = snprintf(result, 320, "%s %s (%d block%s applied)",
