@@ -409,8 +409,13 @@ char *execute_edit(const char *args) {
      * top-level function, pause if a near-duplicate already exists elsewhere in
      * the tree. Warn-once per function name — a re-issue applies. No-op when the
      * gate is off or no embedder is present, so editing never depends on it. */
+    int autofixed = 0;
     if (reuse_gate_enabled()) {
         for (int i = 0; i < p->n_blocks; i++) {
+            /* First try the deterministic rewrite (output-side injection); if it
+             * fires, the reusing edit is applied instead of the duplicate. */
+            char *fixed = reuse_gate_autofix(path, p->blocks[i].repl, p->blocks[i].find);
+            if (fixed) { free(p->blocks[i].repl); p->blocks[i].repl = fixed; autofixed++; continue; }
             char *warn = reuse_gate_check(path, p->blocks[i].repl, p->blocks[i].find);
             if (warn) { free_parsed_edit(p); return warn; }
         }
@@ -491,10 +496,14 @@ char *execute_edit(const char *args) {
     if (cur.len) fwrite(cur.data, 1, cur.len, f);
     fclose(f);
 
-    char *result = malloc(256);
-    snprintf(result, 256, "%s %s (%d block%s applied)",
+    char *result = malloc(320);
+    int rn = snprintf(result, 320, "%s %s (%d block%s applied)",
         (created && !file_existed) ? "Created" : "Edited",
         path, p->n_blocks, p->n_blocks == 1 ? "" : "s");
+    if (autofixed > 0 && rn > 0 && rn < 320)
+        snprintf(result + rn, 320 - rn,
+            " [reuse-gate rewrote %d function%s to call existing code]",
+            autofixed, autofixed == 1 ? "" : "s");
     sb_free(&cur);
     free_parsed_edit(p);
     return result;

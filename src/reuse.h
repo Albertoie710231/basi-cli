@@ -23,8 +23,21 @@
 char *reuse_gate_check(const char *path, const char *replace, const char *search);
 
 /* True if BASI_REUSE_GATE is enabled. Cheap; lets the edit path skip all reuse
- * work (extraction, embedding) when the gate is off. */
+ * work (extraction, matching) when the gate is off. */
 int reuse_gate_enabled(void);
+
+/* Deterministic reuse rewrite (output-side injection). If BASI_REUSE_AUTOFIX is
+ * on and `replace` adds a new function that is a high-confidence, exact-arity
+ * structural duplicate of an existing one, return a rewritten `replace` whose
+ * body calls the existing function instead of re-implementing it. Returns NULL
+ * if nothing was auto-fixed (caller then falls back to reuse_gate_check). The
+ * caller owns the returned string and should apply the edit with it. */
+char *reuse_gate_autofix(const char *path, const char *replace, const char *search);
+
+/* Token clone similarity between two C/C++ function bodies (0..1), the
+ * deterministic primitive the gate ranks candidates on. Exposed for evaluation
+ * and for a future detect/report use. */
+double reuse_similarity(const char *body_a, const char *body_b);
 
 /* Free the in-process symbol store + warned-name set. Optional; process exit
  * reclaims everything. */
