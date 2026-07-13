@@ -1026,11 +1026,47 @@ static char *str_replace_once(const char *hay, const char *needle, const char *r
  * alone can't tell apart. Sound: IR-equal ⇒ safe to substitute; any difference
  * (or a failure to compile) ⇒ refuse. */
 
-/* Extract the `define …@sym(…){ … }` block and normalize: strip comments,
- * metadata (!…) and attribute-group refs (#N), drop linkage/param noise,
- * canonicalize the function's own name to @SELF, collapse whitespace. clang's
+/* Append the body of module-level "attributes #n = { … }" to `sb`, so two
+ * functions are compared by their actual attribute SET (memory(none),
+ * nounwind, …) rather than a module-relative index. Falls back to "#n". */
+static void resolve_attr(StringBuf *sb, const char *ir, int n) {
+    char pat[40]; snprintf(pat, sizeof(pat), "\nattributes #%d = ", n);
+    const char *a = strstr(ir, pat);
+    if (a) a = strchr(a, '{');
+    const char *e = a ? strchr(a, '}') : NULL;
+    if (!a || !e) { char t[16]; snprintf(t, sizeof(t), "#%d", n); sb_append_str(sb, t); return; }
+    sb_append(sb, a, (size_t)(e - a + 1));            /* the "{ … }" verbatim */
+}
+
+/* Append the recursively-resolved definition of metadata "!n" to `sb`,
+ * canonicalizing module-relative numbering and guarding the self-referential
+ * cycles LLVM uses for `distinct` loop metadata. This compares !tbaa / !range /
+ * !llvm.loop by CONTENT, so a real aliasing/range difference is caught while a
+ * genuine clone (identical metadata content) still matches. */
+static void resolve_md(StringBuf *sb, const char *ir, int n, int *seen, int *nseen, int depth) {
+    if (depth > 24) { sb_append_str(sb, "!.."); return; }
+    for (int i = 0; i < *nseen; i++) if (seen[i] == n) { sb_append_str(sb, "!cyc"); return; }
+    char pat[24]; snprintf(pat, sizeof(pat), "\n!%d = ", n);
+    const char *d = strstr(ir, pat);
+    if (!d) { char t[16]; snprintf(t, sizeof(t), "!%d", n); sb_append_str(sb, t); return; }
+    d += strlen(pat);
+    const char *e = strchr(d, '\n'); if (!e) e = d + strlen(d);
+    if (*nseen < 64) seen[(*nseen)++] = n;
+    for (const char *p = d; p < e; ) {
+        if (*p == '!' && p + 1 < e && isdigit((unsigned char)p[1])) {
+            resolve_md(sb, ir, atoi(p + 1), seen, nseen, depth + 1);
+            p++; while (p < e && isdigit((unsigned char)*p)) p++;
+        } else { sb_append_char(sb, *p); p++; }
+    }
+    if (*nseen > 0) (*nseen)--;
+}
+
+/* Extract the `define …@sym(…){ … }` block and normalize: strip comments and
+ * linkage noise, canonicalize the function's own name to @SELF, and RESOLVE
+ * attribute-group (#N) and metadata (!N) references to their content so a
+ * module-relative index difference doesn't hide a real semantic one. clang's
  * canonical SSA numbering already makes equivalent functions share register
- * numbers, so no renaming is needed. Returns malloc'd or NULL.
+ * numbers, so no register renaming is needed. Returns malloc'd or NULL.
  *
  * The self-symbol is `@name` for C (verbatim) or the Itanium-mangled
  * `@_Z…<len><name>…` for C++; both are canonicalized to @SELF so renamed
@@ -1103,7 +1139,23 @@ static char *ir_extract_normalize(const char *ir, const char *name) {
             const char *ts = q;
             while (q < lend && !isspace((unsigned char)*q)) q++;
             size_t tl = (size_t)(q - ts);
-            if (ts[0] == '!' || ts[0] == '#') continue;
+            /* Attribute-group / metadata references: resolve to their content
+             * (their numbers are module-relative, so a raw #N/!N comparison is
+             * meaningless — but the SET/tree they name is what matters). A
+             * named kind like `!tbaa` is kept verbatim; `!N`/`#N` are resolved. */
+            if (ts[0] == '#' && tl > 1 && isdigit((unsigned char)ts[1])) {
+                if (!first) sb_append_char(&lb, ' ');
+                first = false;
+                resolve_attr(&lb, ir, atoi(ts + 1));
+                continue;
+            }
+            if (ts[0] == '!' && tl > 1 && isdigit((unsigned char)ts[1])) {
+                if (!first) sb_append_char(&lb, ' ');
+                first = false;
+                int seen[64], nseen = 0;
+                resolve_md(&lb, ir, atoi(ts + 1), seen, &nseen, 0);
+                continue;
+            }
             /* Strip only non-semantic linkage/visibility tokens. `nsw`/`nuw`
              * (no-signed/unsigned-wrap) and `noundef` are NOT stripped: they
              * carry poison/UB semantics, so two functions differing only in
