@@ -1104,11 +1104,16 @@ static char *ir_extract_normalize(const char *ir, const char *name) {
             while (q < lend && !isspace((unsigned char)*q)) q++;
             size_t tl = (size_t)(q - ts);
             if (ts[0] == '!' || ts[0] == '#') continue;
+            /* Strip only non-semantic linkage/visibility tokens. `nsw`/`nuw`
+             * (no-signed/unsigned-wrap) and `noundef` are NOT stripped: they
+             * carry poison/UB semantics, so two functions differing only in
+             * them are not refinement-equivalent (a signed `mul nsw` may be
+             * poison on overflow where an unsigned `mul` is defined). Dropping
+             * them made the verifier certify such twins as equal — an unsound
+             * autofix. Keeping them refuses the substitution (sound: a genuine
+             * renamed clone still emits identical flags and still matches). */
             if ((tl == 9  && !memcmp(ts, "dso_local", 9)) ||
-                (tl == 18 && !memcmp(ts, "local_unnamed_addr", 18)) ||
-                (tl == 7  && !memcmp(ts, "noundef", 7)) ||
-                (tl == 3  && !memcmp(ts, "nsw", 3)) ||
-                (tl == 3  && !memcmp(ts, "nuw", 3))) continue;
+                (tl == 18 && !memcmp(ts, "local_unnamed_addr", 18))) continue;
             if (!first) sb_append_char(&lb, ' ');
             first = false;
             for (size_t i = 0; i < tl; ) {
