@@ -55,7 +55,7 @@ int reuse_gate_enabled(void) { return env_flag("BASI_REUSE_GATE"); }
  * dynamic ones). Adding a language = one entry here + its tool on PATH. */
 
 typedef enum { LANG_C = 0, LANG_CPP = 1, LANG_PY = 2, LANG_JS = 3, LANG_GO = 4,
-               LANG_UNKNOWN = 255 } LangId;
+               LANG_TS = 5, LANG_UNKNOWN = 255 } LangId;
 /* Stage-2 verifier: NONE (detect-only, autofix refuses), compiler IR, or a
  * language-specific AST equivalence check (the ast_verify function pointer). */
 typedef enum { VERIFY_NONE = 0, VERIFY_IR, VERIFY_AST } VerifyTier;
@@ -65,6 +65,7 @@ typedef enum { VERIFY_NONE = 0, VERIFY_IR, VERIFY_AST } VerifyTier;
 typedef bool (*AstVerifyFn)(const char *cand_body, const char *helper_body);
 static bool py_ast_equivalent(const char *cand_body, const char *helper_body);
 static bool go_ast_equivalent(const char *cand_body, const char *helper_body);
+static bool ts_ast_equivalent(const char *cand_body, const char *helper_body);
 
 typedef struct {
     LangId       id;
@@ -83,14 +84,16 @@ typedef struct {
 /* ctags language/kind flags — one invocation handles every backend, ctags
  * auto-detects each file's language by extension and tags it accordingly. */
 #define CTAGS_ARGS "--output-format=json --fields=+neSl " \
-    "--languages=C,C++,Python,JavaScript,Go " \
-    "--kinds-C=f --kinds-C++=f --kinds-Python=fm --kinds-JavaScript=fm --kinds-Go=f"
+    "--languages=C,C++,Python,JavaScript,Go,TypeScript " \
+    "--kinds-C=f --kinds-C++=f --kinds-Python=fm --kinds-JavaScript=fm " \
+    "--kinds-Go=f --kinds-TypeScript=fm"
 
 static const char *C_EXTS[]   = { ".c", ".h", NULL };
 static const char *CPP_EXTS[] = { ".cpp", ".cc", ".cxx", ".hpp", ".hh", NULL };
 static const char *PY_EXTS[]  = { ".py", NULL };
 static const char *JS_EXTS[]  = { ".js", ".mjs", ".cjs", NULL };
 static const char *GO_EXTS[]  = { ".go", NULL };
+static const char *TS_EXTS[]  = { ".ts", ".tsx", ".mts", ".cts", NULL };
 
 static const char *C_KW[] = {
     "auto","break","case","char","const","continue","default","do","double",
@@ -119,6 +122,16 @@ static const char *GO_KW[] = {
     "package","range","return","select","struct","switch","type","var",
     "true","false","nil","iota", NULL,
 };
+static const char *TS_KW[] = {   /* JS keywords + the common TypeScript ones */
+    "break","case","catch","class","const","continue","debugger","default",
+    "delete","do","else","export","extends","finally","for","function","if",
+    "import","in","instanceof","new","return","super","switch","this","throw",
+    "try","typeof","var","void","while","with","yield","let","static","async",
+    "await","of","true","false","null","undefined",
+    "abstract","any","as","asserts","boolean","declare","enum","implements",
+    "interface","is","keyof","namespace","never","number","readonly","string",
+    "type","unknown","public","private","protected","override","satisfies","infer", NULL,
+};
 
 static const LangBackend BACKENDS[] = {
     { LANG_C,   "C",          C_EXTS,   C_KW,  "//", "/*", "*/", VERIFY_IR,   NULL,               true,  NULL },
@@ -126,6 +139,7 @@ static const LangBackend BACKENDS[] = {
     { LANG_PY,  "Python",     PY_EXTS,  PY_KW, "#",  NULL, NULL, VERIFY_AST,  py_ast_equivalent,  false, "from %s import %s" },
     { LANG_JS,  "JavaScript", JS_EXTS,  JS_KW, "//", "/*", "*/", VERIFY_NONE, NULL,               true,  NULL },
     { LANG_GO,  "Go",         GO_EXTS,  GO_KW, "//", "/*", "*/", VERIFY_AST,  go_ast_equivalent,  true,  NULL },
+    { LANG_TS,  "TypeScript", TS_EXTS,  TS_KW, "//", "/*", "*/", VERIFY_AST,  ts_ast_equivalent,  true,  NULL },
 };
 #define N_BACKENDS (sizeof(BACKENDS) / sizeof(BACKENDS[0]))
 
@@ -1511,6 +1525,86 @@ static bool go_ast_equivalent(const char *cand_body, const char *helper_body) {
     sb_append_str(&cmd, hf);   sb_append_str(&cmd, " 2>/dev/null");
     char *cmdstr = sb_to_str(&cmd);
     char *out = run_command_timeout(cmdstr, 4096, 30, NULL);
+    free(cmdstr);
+    unlink(prog); unlink(cf); unlink(hf);
+    bool eq = out && out[0] == '1';
+    free(out);
+    return eq;
+}
+
+/* ── Stage-2 semantic verification: TypeScript AST equivalence ──────────
+ * TypeScript has no LLVM IR and no zero-dep parser, but `deno` runs TS natively
+ * and can pull the canonical TypeScript compiler on demand (npm:typescript,
+ * cached in deno's own store — not vendored into the repo). The script parses
+ * each function with the real TS parser, renames the function's own name +
+ * params + locals, and compares the printed AST — a renamed clone matches, a
+ * changed constant/operator does not. Requires `deno` on PATH (+ network on the
+ * first run to fetch typescript); absent → run fails → refuse (safe). A bare
+ * class-method body is retried wrapped in a dummy class so methods parse too. */
+#define TS_VERIFY_SRC \
+    "import ts from \"npm:typescript@5\";\n" \
+    "function normOne(src: string): string {\n" \
+    "  const sf = ts.createSourceFile(\"f.ts\", src, ts.ScriptTarget.Latest, true);\n" \
+    "  let fn: any;\n" \
+    "  const find = (n: ts.Node) => {\n" \
+    "    if (!fn && (ts.isFunctionDeclaration(n) || ts.isMethodDeclaration(n) ||\n" \
+    "                ts.isFunctionExpression(n) || ts.isArrowFunction(n))) fn = n;\n" \
+    "    ts.forEachChild(n, find);\n" \
+    "  };\n" \
+    "  ts.forEachChild(sf, find);\n" \
+    "  if (!fn) return \"\";\n" \
+    "  const m = new Map<string, string>();\n" \
+    "  const bind = (s: string) => { if (!m.has(s)) m.set(s, \"v\" + m.size); };\n" \
+    "  if (fn.name && ts.isIdentifier(fn.name)) bind(fn.name.text);\n" \
+    "  for (const p of fn.parameters) if (ts.isIdentifier(p.name)) bind(p.name.text);\n" \
+    "  const collect = (n: ts.Node) => {\n" \
+    "    if (ts.isVariableDeclaration(n) && ts.isIdentifier(n.name)) bind(n.name.text);\n" \
+    "    ts.forEachChild(n, collect);\n" \
+    "  };\n" \
+    "  if (fn.body) collect(fn.body);\n" \
+    "  const f = ts.factory;\n" \
+    "  const tr = (ctx: ts.TransformationContext) => {\n" \
+    "    const visit = (n: ts.Node): ts.Node => {\n" \
+    "      if (ts.isIdentifier(n) && m.has(n.text)) {\n" \
+    "        const par = n.parent;\n" \
+    "        if (par && ts.isPropertyAccessExpression(par) && par.name === n) return n;\n" \
+    "        return f.createIdentifier(m.get(n.text)!);\n" \
+    "      }\n" \
+    "      return ts.visitEachChild(n, visit, ctx);\n" \
+    "    };\n" \
+    "    return (node: ts.Node) => ts.visitNode(node, visit);\n" \
+    "  };\n" \
+    "  const t = ts.transform(fn, [tr]).transformed[0];\n" \
+    "  return ts.createPrinter({ removeComments: true }).printNode(ts.EmitHint.Unspecified, t, sf);\n" \
+    "}\n" \
+    "function norm(src: string): string { let r = normOne(src); if (!r) r = normOne(\"class __W {\\n\" + src + \"\\n}\"); return r; }\n" \
+    "try {\n" \
+    "  const a = norm(Deno.readTextFileSync(Deno.args[0]));\n" \
+    "  const b = norm(Deno.readTextFileSync(Deno.args[1]));\n" \
+    "  console.log(a !== \"\" && a === b ? \"1\" : \"0\");\n" \
+    "} catch { console.log(\"0\"); }\n"
+
+static bool ts_ast_equivalent(const char *cand_body, const char *helper_body) {
+    if (kb_ensure_dirs() != 0) return false;
+    const char *prog = ".basi/reuse_tsnorm.ts";
+    const char *cf = ".basi/.reuse_cand.ts", *hf = ".basi/.reuse_help.ts";
+    FILE *p = fopen(prog, "w"); if (!p) return false;
+    fwrite(TS_VERIFY_SRC, 1, strlen(TS_VERIFY_SRC), p); fclose(p);
+    FILE *a = fopen(cf, "w"); if (!a) { unlink(prog); return false; }
+    fwrite(cand_body, 1, strlen(cand_body), a); fclose(a);
+    FILE *b = fopen(hf, "w"); if (!b) { unlink(prog); unlink(cf); return false; }
+    fwrite(helper_body, 1, strlen(helper_body), b); fclose(b);
+
+    const char *deno = getenv("BASI_REUSE_DENO");
+    if (!deno || !*deno) deno = "deno";
+    StringBuf cmd; sb_init(&cmd);
+    sb_append_str(&cmd, deno);
+    sb_append_str(&cmd, " run --quiet --allow-read --allow-env ");
+    sb_append_str(&cmd, prog); sb_append_char(&cmd, ' ');
+    sb_append_str(&cmd, cf);   sb_append_char(&cmd, ' ');
+    sb_append_str(&cmd, hf);   sb_append_str(&cmd, " 2>/dev/null");
+    char *cmdstr = sb_to_str(&cmd);
+    char *out = run_command_timeout(cmdstr, 4096, 40, NULL);   /* first run may fetch typescript */
     free(cmdstr);
     unlink(prog); unlink(cf); unlink(hf);
     bool eq = out && out[0] == '1';
