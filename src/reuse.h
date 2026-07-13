@@ -39,6 +39,20 @@ char *reuse_gate_autofix(const char *path, const char *replace, const char *sear
  * and for a future detect/report use. */
 double reuse_similarity(const char *body_a, const char *body_b);
 
+/* True if the behavior-preservation guard (BASI_REUSE_REGRESS) is enabled. */
+int reuse_regress_enabled(void);
+
+/* Behavior-preservation check on an edit. Given the file `path` and its OLD
+ * (pre-edit) and NEW (post-edit) full contents, return a malloc'd model-facing
+ * warning naming every EXISTING function whose behavior the edit CHANGED
+ * (compiler-IR / parser-AST verified — a silent regression the type checker
+ * misses, e.g. routing an existing shape's collision through new geometry), or
+ * NULL if all existing behavior is preserved or the language has no verifier.
+ * Warn-once per function name, so re-issuing the same edit applies it. Caller
+ * frees the returned string and should return it as the tool result instead of
+ * writing the file. */
+char *reuse_regress_check(const char *path, const char *old_src, const char *new_src);
+
 /* Free the in-process symbol store + warned-name set. Optional; process exit
  * reclaims everything. */
 void reuse_shutdown(void);

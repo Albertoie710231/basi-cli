@@ -1725,6 +1725,106 @@ char *reuse_gate_autofix(const char *path, const char *replace, const char *sear
     return fixes ? result : (free(result), (char *)NULL);
 }
 
+/* ── Behavior-preservation guard (translation-validate the model's edit) ──
+ * The autofix refuses to MERGE two non-equivalent functions; the mirror risk is
+ * the model doing its own merge — "generalizing" two shapes' collision into one
+ * helper that silently changes one of them. Same compiler/AST oracle, aimed at
+ * the edit: for every function present both before and after the edit whose body
+ * changed, ask whether its behavior is preserved. Only a CONFIDENT change (both
+ * versions verify and differ) is flagged — uncertainty (won't compile, inlined
+ * away) never raises a false alarm. */
+
+int reuse_regress_enabled(void) { return env_flag("BASI_REUSE_REGRESS"); }
+
+/* Compile flags for the two temp files, from the real target's DB entry or a
+ * best-effort guess. malloc'd. */
+static char *regress_iflags(const char *path) {
+    char *cc = cc_lookup_flags(path);
+    if (cc) return cc;
+    char pd[1024];
+    dir_of(path, pd, sizeof(pd));
+    StringBuf g; sb_init(&g);
+    sb_append_str(&g, "-I. -I"); sb_append_str(&g, pd);
+    return sb_to_str(&g);
+}
+
+/* Confident behavior change for a compiled function: both temp files compile,
+ * the function is found in both IRs, and the normalized IR differs. */
+static bool ir_fn_changed(const char *oldf, const char *newf, const char *name, const char *iflags) {
+    char *iro = compile_ir(oldf, iflags), *irn = compile_ir(newf, iflags);
+    bool changed = false;
+    if (iro && irn) {
+        char *a = ir_extract_normalize(iro, name), *b = ir_extract_normalize(irn, name);
+        if (a && b) changed = (strcmp(a, b) != 0);   /* both found → compare; else don't flag */
+        free(a); free(b);
+    }
+    free(iro); free(irn);
+    return changed;
+}
+
+char *reuse_regress_check(const char *path, const char *old_src, const char *new_src) {
+    if (!reuse_regress_enabled() || !old_src || !new_src) return NULL;
+    const LangBackend *be = backend_by_id(lang_of_path(path));
+    if (!be) return NULL;
+    if (be->verify == VERIFY_NONE) return NULL;                 /* no oracle (e.g. JS) */
+    if (be->verify == VERIFY_AST && !be->ast_verify) return NULL;
+    if (kb_ensure_dirs() != 0) return NULL;
+
+    const char *ext = be->exts[0];
+    char oldf[64], newf[64];
+    snprintf(oldf, sizeof(oldf), ".basi/.reuse_old%s", ext);
+    snprintf(newf, sizeof(newf), ".basi/.reuse_new%s", ext);
+    FILE *fa = fopen(oldf, "w"); if (!fa) return NULL;
+    fwrite(old_src, 1, strlen(old_src), fa); fclose(fa);
+    FILE *fb = fopen(newf, "w"); if (!fb) { unlink(oldf); return NULL; }
+    fwrite(new_src, 1, strlen(new_src), fb); fclose(fb);
+
+    int no = 0, nn = 0;
+    FuncDef *fo = ctags_extract_file(oldf, &no);
+    FuncDef *fn = ctags_extract_file(newf, &nn);
+    char *iflags = (be->verify == VERIFY_IR) ? regress_iflags(path) : NULL;
+    bool dbg = env_flag("BASI_REUSE_DEBUG");
+
+    StringBuf msg; sb_init(&msg);
+    int hits = 0;
+    for (int i = 0; i < nn; i++) {
+        FuncDef *o = NULL;
+        for (int j = 0; j < no; j++)
+            if (strcmp(fo[j].name, fn[i].name) == 0) { o = &fo[j]; break; }
+        if (!o) continue;                                    /* newly added, not a regression */
+        if (strcmp(o->body, fn[i].body) == 0) continue;      /* text unchanged */
+        if (warned_seen(fn[i].name)) continue;               /* warn-once → re-issue applies */
+
+        bool changed = (be->verify == VERIFY_IR)
+            ? ir_fn_changed(oldf, newf, fn[i].name, iflags)
+            : !be->ast_verify(o->body, fn[i].body);
+        if (!changed) continue;
+
+        if (hits == 0)
+            sb_append_str(&msg, "edit paused — behavior guard: this edit changes the behavior of code that already exists.\n");
+        char line[512];
+        snprintf(line, sizeof(line),
+            "  \xe2\x80\xa2 existing function `%s` behaves differently after this edit (compiler-verified)\n",
+            fn[i].name);
+        sb_append_str(&msg, line);
+        warned_add(fn[i].name);
+        hits++;
+        if (dbg) fprintf(stderr, "reuse-regress: `%s` behavior changed\n", fn[i].name);
+    }
+
+    for (int i = 0; i < no; i++) funcdef_free(&fo[i]);
+    for (int i = 0; i < nn; i++) funcdef_free(&fn[i]);
+    free(fo); free(fn); free(iflags);
+    unlink(oldf); unlink(newf);
+
+    if (hits == 0) { sb_free(&msg); return NULL; }
+    sb_append_str(&msg,
+        "\nIf these behavior changes are intended, re-issue this same edit — it will apply. "
+        "If not (e.g. you consolidated shared logic and altered one existing caller), fix it so "
+        "the existing behavior is preserved before re-issuing.\n");
+    return sb_to_str(&msg);
+}
+
 void reuse_shutdown(void) {
     if (g_loaded) { sym_clear(&g_store); g_loaded = false; }
     for (int i = 0; i < g_warned_n; i++) free(g_warned[i]);

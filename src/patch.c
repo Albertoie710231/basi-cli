@@ -479,6 +479,23 @@ char *execute_edit(const char *args) {
         if (err) { sb_free(&cur); free_parsed_edit(p); return err; }
     }
 
+    /* Behavior-preservation guard (opt-in BASI_REUSE_REGRESS): before writing,
+     * check whether this edit silently changed the behavior of a function that
+     * already existed. The old content is still on disk (we write below), so we
+     * re-read it and compare against the assembled new content. Warn-once per
+     * function name — a re-issue applies. No-op when disabled or the file is new. */
+    if (file_existed && reuse_regress_enabled()) {
+        size_t olen = 0;
+        char *oldc = read_file_all(path, &olen);   /* disk still holds the pre-edit content */
+        if (oldc) {
+            char *newc = malloc(cur.len + 1);
+            memcpy(newc, cur.data, cur.len); newc[cur.len] = '\0';
+            char *rwarn = reuse_regress_check(path, oldc, newc);
+            free(oldc); free(newc);
+            if (rwarn) { sb_free(&cur); free_parsed_edit(p); return rwarn; }
+        }
+    }
+
     if (!file_existed) {
         char *pc = strdup(path);
         char *dir = dirname(pc);
