@@ -18,7 +18,7 @@
  * Overridable at runtime so the gate can be calibrated without a rebuild. */
 #define SYM_STORE      ".basi/.symbols.bin"
 #define SYM_MAGIC      0x32595342u          /* 'BSY2' little-endian */
-#define SYM_VER        2u
+#define SYM_VER        3u                    /* v3 adds a per-entry language byte */
 #define MIN_BODY       60                    /* ignore trivial one-liners */
 #define BODY_CAP       2000                  /* chars of a func body kept/compared */
 #define MAX_FILE_BYTES (512 * 1024)          /* skip generated / vendored blobs */
@@ -48,88 +48,98 @@ static bool use_embed(void) {
 
 int reuse_gate_enabled(void) { return env_flag("BASI_REUSE_GATE"); }
 
-/* ── Heuristic C/C++ function extractor ─────────────────────────────────
- * Runs identically on files-on-disk (the index) and on an edit's REPLACE text
- * (the candidate). Not a parser: it finds top-level `name(...) { ... }`
- * definitions and skips everything else (prototypes, structs, initializers,
- * macros). See make_skeleton() for how comments/strings are neutralized. */
+/* ── Language backends ──────────────────────────────────────────────────
+ * A language is pure configuration: which extensions to index, the keyword list
+ * that makes the clone detector rename-insensitive, its comment/string rules,
+ * and a Stage-2 verify tier (compiler IR for compiled langs, parser AST for
+ * dynamic ones). Adding a language = one entry here + its tool on PATH. */
+
+typedef enum { LANG_C = 0, LANG_CPP = 1, LANG_PY = 2, LANG_UNKNOWN = 255 } LangId;
+typedef enum { VERIFY_NONE = 0, VERIFY_IR, VERIFY_AST } VerifyTier;
 
 typedef struct {
-    char *name;
-    char *sig;    /* signature text up to the '{', whitespace-collapsed */
-    char *body;   /* the '{...}' block, verbatim (capped at use sites) */
-    int   line;   /* 1-based line of the definition start */
+    LangId       id;
+    const char  *name;         /* value ctags reports in the "language" field */
+    const char **exts;         /* NULL-terminated extension list (with dot) */
+    const char **keywords;     /* NULL-terminated; kept verbatim in normalization */
+    const char  *line_comment; /* line-comment marker, or NULL */
+    const char  *block_open;   /* block-comment open marker, or NULL */
+    const char  *block_close;  /* block-comment close marker, or NULL */
+    VerifyTier   verify;
+    bool         brace_lang;   /* true: C-style { … } bodies; false: Python */
+} LangBackend;
+
+/* ctags language/kind flags — one invocation handles every backend, ctags
+ * auto-detects each file's language by extension and tags it accordingly. */
+#define CTAGS_ARGS "--output-format=json --fields=+neSl " \
+    "--languages=C,C++,Python --kinds-C=f --kinds-C++=f --kinds-Python=fm"
+
+static const char *C_EXTS[]   = { ".c", ".h", NULL };
+static const char *CPP_EXTS[] = { ".cpp", ".cc", ".cxx", ".hpp", ".hh", NULL };
+static const char *PY_EXTS[]  = { ".py", NULL };
+
+static const char *C_KW[] = {
+    "auto","break","case","char","const","continue","default","do","double",
+    "else","enum","extern","float","for","goto","if","inline","int","long",
+    "register","restrict","return","short","signed","sizeof","static","struct",
+    "switch","typedef","union","unsigned","void","volatile","while","bool",
+    "_Bool","true","false","NULL","class","namespace","template","new","delete",
+    "public","private","protected","virtual","override","nullptr","using", NULL,
+};
+static const char *PY_KW[] = {
+    "False","None","True","and","as","assert","async","await","break","class",
+    "continue","def","del","elif","else","except","finally","for","from","global",
+    "if","import","in","is","lambda","nonlocal","not","or","pass","raise","return",
+    "try","while","with","yield","match","case", NULL,
+};
+
+static const LangBackend BACKENDS[] = {
+    { LANG_C,   "C",      C_EXTS,   C_KW,  "//", "/*", "*/", VERIFY_IR,  true  },
+    { LANG_CPP, "C++",    CPP_EXTS, C_KW,  "//", "/*", "*/", VERIFY_IR,  true  },
+    { LANG_PY,  "Python", PY_EXTS,  PY_KW, "#",  NULL, NULL, VERIFY_AST, false },
+};
+#define N_BACKENDS (sizeof(BACKENDS) / sizeof(BACKENDS[0]))
+
+static const LangBackend *backend_by_id(LangId id) {
+    for (size_t i = 0; i < N_BACKENDS; i++) if (BACKENDS[i].id == id) return &BACKENDS[i];
+    return NULL;
+}
+static const LangBackend *backend_by_name(const char *ctags_lang) {
+    if (!ctags_lang) return NULL;
+    for (size_t i = 0; i < N_BACKENDS; i++)
+        if (strcmp(BACKENDS[i].name, ctags_lang) == 0) return &BACKENDS[i];
+    return NULL;
+}
+/* LangId for a path (by extension); LANG_UNKNOWN if unsupported. Used to filter
+ * the tree walk and choose the candidate temp file's extension. The definitive
+ * per-function language always comes from ctags' own detection. */
+static LangId lang_of_path(const char *path) {
+    const char *dot = strrchr(path, '.');
+    if (!dot) return LANG_UNKNOWN;
+    for (size_t i = 0; i < N_BACKENDS; i++)
+        for (const char **e = BACKENDS[i].exts; *e; e++)
+            if (strcmp(dot, *e) == 0) return BACKENDS[i].id;
+    return LANG_UNKNOWN;
+}
+
+/* ── ctags-based function extractor ─────────────────────────────────────
+ * Language-agnostic: shells out to Universal Ctags, which reports each function
+ * with a start line, an end line and a parameter signature. The body is the
+ * whole-function text (lines [start..end], signature included) — uniform across
+ * braced and indentation-based languages. Runs identically on files-on-disk
+ * (the index) and on an edit's REPLACE text written to a temp file. */
+
+typedef struct {
+    char  *name;
+    char  *sig;    /* reconstructed "<ret> name(params)" for the autofix parsers */
+    char  *body;   /* whole-function text, lines [start..end] */
+    int    line;   /* 1-based start line */
+    LangId lang;
 } FuncDef;
 
 static void funcdef_free(FuncDef *f) {
     free(f->name); free(f->sig); free(f->body);
     f->name = f->sig = f->body = NULL;
-}
-
-/* Same-length copy with comment and string/char-literal contents blanked to
- * spaces (newlines preserved), so brace/paren counting isn't fooled. */
-static char *make_skeleton(const char *s, size_t n) {
-    char *sk = malloc(n + 1);
-    enum { CODE, LC, BC, STR, CH } st = CODE;
-    size_t i = 0;
-    while (i < n) {
-        char c = s[i];
-        char d = (i + 1 < n) ? s[i + 1] : '\0';
-        if (st == CODE) {
-            if (c == '/' && d == '/') { sk[i] = ' '; sk[i + 1] = ' '; i += 2; st = LC;  continue; }
-            if (c == '/' && d == '*') { sk[i] = ' '; sk[i + 1] = ' '; i += 2; st = BC;  continue; }
-            if (c == '"')  { sk[i] = ' '; i++; st = STR; continue; }
-            if (c == '\'') { sk[i] = ' '; i++; st = CH;  continue; }
-            sk[i] = c; i++; continue;
-        }
-        if (st == LC) {
-            if (c == '\n') { sk[i] = '\n'; st = CODE; } else sk[i] = ' ';
-            i++; continue;
-        }
-        if (st == BC) {
-            if (c == '*' && d == '/') { sk[i] = ' '; sk[i + 1] = ' '; i += 2; st = CODE; continue; }
-            sk[i] = (c == '\n') ? '\n' : ' '; i++; continue;
-        }
-        if (c == '\\') { sk[i] = ' '; if (i + 1 < n) sk[i + 1] = ' '; i += 2; continue; }
-        if ((st == STR && c == '"') || (st == CH && c == '\'')) { sk[i] = ' '; i++; st = CODE; continue; }
-        sk[i] = (c == '\n') ? '\n' : ' '; i++; continue;
-    }
-    sk[n] = '\0';
-    return sk;
-}
-
-static bool ident_reject(const char *w) {
-    static const char *kw[] = {
-        "if", "for", "while", "switch", "return", "sizeof", "do", "else",
-        "case", "default", "goto", "typedef", "struct", "union", "enum",
-        "static", "const", "void", "unsigned", "signed", "extern", "inline",
-        "register", "volatile", "__attribute__", "class", "namespace", "template",
-    };
-    for (size_t i = 0; i < sizeof(kw) / sizeof(kw[0]); i++)
-        if (strcmp(w, kw[i]) == 0) return true;
-    return false;
-}
-
-static size_t match_brace(const char *sk, size_t len, size_t pos) {
-    int depth = 0;
-    for (size_t k = pos; k < len; k++) {
-        if (sk[k] == '{') depth++;
-        else if (sk[k] == '}') { depth--; if (depth == 0) return k; }
-    }
-    return len;
-}
-
-static char *collapse_range(const char *src, size_t a, size_t b) {
-    StringBuf sb; sb_init(&sb);
-    bool in_ws = true;
-    for (size_t i = a; i < b; i++) {
-        char c = src[i];
-        if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
-            if (!in_ws) { sb_append_char(&sb, ' '); in_ws = true; }
-        } else { sb_append_char(&sb, c); in_ws = false; }
-    }
-    if (sb.len && sb.data[sb.len - 1] == ' ') sb.len--;
-    return sb_to_str(&sb);
 }
 
 static char *slice_dup(const char *src, size_t a, size_t b) {
@@ -140,125 +150,174 @@ static char *slice_dup(const char *src, size_t a, size_t b) {
     return o;
 }
 
-static FuncDef *extract_funcs(const char *src, size_t len, int *out_n) {
-    *out_n = 0;
-    if (!src || len == 0) return NULL;
-    char *sk = make_skeleton(src, len);
-    FuncDef *arr = NULL; int n = 0, cap = 0;
+/* Byte offset of the start of 1-based line `ln`; `n` (EOF) if past the end. */
+static size_t line_offset(const char *src, size_t n, int ln) {
+    if (ln <= 1) return 0;
+    int cur = 1;
+    for (size_t i = 0; i < n; i++)
+        if (src[i] == '\n') { cur++; if (cur == ln) return i + 1; }
+    return n;
+}
 
-    size_t i = 0;
-    while (i < len) {
-        while (i < len && (sk[i] == ' ' || sk[i] == '\t' || sk[i] == '\n' || sk[i] == '\r')) i++;
-        if (i >= len) break;
-
-        if (sk[i] == '#') {
-            while (i < len && sk[i] != '\n') {
-                if (sk[i] == '\\' && i + 1 < len && sk[i + 1] == '\n') i++;
-                i++;
-            }
-            continue;
-        }
-        if (sk[i] == '}' || sk[i] == ';') { i++; continue; }
-        if (sk[i] == '{') { size_t e = match_brace(sk, len, i); i = (e < len) ? e + 1 : len; continue; }
-
-        size_t start = i, j = i;
-        long paren = -1;
-        while (j < len && sk[j] != '{' && sk[j] != ';') {
-            if (sk[j] == '(' && paren < 0) paren = (long)j;
-            j++;
-        }
-        if (j >= len) break;
-        if (sk[j] == ';') { i = j + 1; continue; }
-
-        size_t bpos = j;
-        size_t bend = match_brace(sk, len, bpos);
-        bool is_func = (paren >= 0 && (size_t)paren < bpos);
-
-        if (is_func) {
-            long p = paren - 1;
-            while (p >= (long)start && (sk[p] == ' ' || sk[p] == '\t' || sk[p] == '\n' || sk[p] == '\r')) p--;
-            long e = p;
-            while (p >= (long)start && (isalnum((unsigned char)sk[p]) || sk[p] == '_')) p--;
-            long nstart = p + 1;
-            if (e >= nstart) {
-                size_t nlen = (size_t)(e - nstart + 1);
-                char *name = malloc(nlen + 1);
-                memcpy(name, src + nstart, nlen);
-                name[nlen] = '\0';
-                if ((isalpha((unsigned char)name[0]) || name[0] == '_') && !ident_reject(name)) {
-                    if (n >= cap) { cap = cap ? cap * 2 : 8; arr = realloc(arr, cap * sizeof(FuncDef)); }
-                    int line = 1;
-                    for (size_t z = 0; z < start; z++) if (src[z] == '\n') line++;
-                    size_t body_end = (bend < len) ? bend + 1 : len;
-                    arr[n].name = name;
-                    arr[n].sig  = collapse_range(src, start, bpos);
-                    arr[n].body = slice_dup(src, bpos, body_end);
-                    arr[n].line = line;
-                    n++;
-                } else {
-                    free(name);
-                }
-            }
-        }
-        i = (bend < len) ? bend + 1 : len;
+/* Tiny scalar readers over one JSON tag line (must be NUL-terminated at its
+ * newline first, so strstr stays within the line). */
+static char *j_str(const char *o, const char *k) {
+    char pat[48]; int pl = snprintf(pat, sizeof(pat), "\"%s\":", k);
+    if (pl <= 0 || pl >= (int)sizeof(pat)) return NULL;
+    const char *x = strstr(o, pat); if (!x) return NULL;
+    const char *q = x + pl; while (*q == ' ') q++;
+    if (*q != '"') return NULL;
+    q++;
+    StringBuf s; sb_init(&s);
+    while (*q && *q != '"') {
+        if (*q == '\\' && q[1]) { q++; sb_append_char(&s, *q == 'n' ? '\n' : (*q == 't' ? '\t' : *q)); }
+        else sb_append_char(&s, *q);
+        q++;
     }
+    return sb_to_str(&s);
+}
+static int j_int(const char *o, const char *k) {
+    char pat[48]; int pl = snprintf(pat, sizeof(pat), "\"%s\":", k);
+    if (pl <= 0 || pl >= (int)sizeof(pat)) return -1;
+    const char *x = strstr(o, pat); if (!x) return -1;
+    const char *q = x + pl; while (*q == ' ') q++;
+    return atoi(q);
+}
 
-    free(sk);
+static FuncDef *ctags_extract_file(const char *path, int *out_n) {
+    *out_n = 0;
+    size_t flen = 0;
+    char *src = read_file_all(path, &flen);
+    if (!src) return NULL;
+
+    const char *ct = getenv("BASI_REUSE_CTAGS");
+    StringBuf cmd; sb_init(&cmd);
+    sb_append_str(&cmd, (ct && *ct) ? ct : "ctags");
+    sb_append_str(&cmd, " " CTAGS_ARGS " -o - ");
+    sb_append_str(&cmd, path);
+    sb_append_str(&cmd, " 2>/dev/null");
+    char *cmdstr = sb_to_str(&cmd);
+    char *out = run_command(cmdstr, 8u * 1024 * 1024);
+    free(cmdstr);
+    if (!out) { free(src); return NULL; }
+
+    FuncDef *arr = NULL; int n = 0, cap = 0;
+    char *line = out;
+    while (*line) {
+        char *nl = strchr(line, '\n');
+        if (nl) *nl = '\0';
+        if (strstr(line, "\"_type\"")) {
+            char *name = j_str(line, "name");
+            int   ls   = j_int(line, "line");
+            int   le   = j_int(line, "end");
+            char *sig  = j_str(line, "signature");
+            char *lang = j_str(line, "language");
+            char *tref = j_str(line, "typeref");
+            if (name && ls > 0) {
+                if (le < ls) le = ls;
+                size_t a = line_offset(src, flen, ls);
+                size_t b = line_offset(src, flen, le + 1);
+                /* Rebuild a C-style "<ret> name(params)" signature so the
+                 * autofix param/type/void parsers keep working unchanged. For
+                 * dynamic langs (no typeref) the return type is simply absent. */
+                StringBuf sb; sb_init(&sb);
+                if (tref) {
+                    const char *colon = strchr(tref, ':');
+                    sb_append_str(&sb, colon ? colon + 1 : tref);
+                    sb_append_char(&sb, ' ');
+                }
+                sb_append_str(&sb, name);
+                sb_append_str(&sb, sig ? sig : "()");
+                const LangBackend *be = backend_by_name(lang);
+                if (n >= cap) { cap = cap ? cap * 2 : 8; arr = realloc(arr, cap * sizeof(FuncDef)); }
+                arr[n].name = name; name = NULL;
+                arr[n].sig  = sb_to_str(&sb);
+                arr[n].body = slice_dup(src, a, b);
+                arr[n].line = ls;
+                arr[n].lang = be ? be->id : LANG_UNKNOWN;
+                n++;
+            }
+            free(name); free(sig); free(lang); free(tref);
+        }
+        if (!nl) break;
+        line = nl + 1;
+    }
+    free(out); free(src);
     *out_n = n;
     return arr;
 }
 
-/* ── NiCad-style normalization + token clone similarity ─────────────────
- * Blind-rename: every identifier that isn't a C keyword → "ID", numbers →
- * "NUM", string/char literals → "LIT"; keywords, operators and punctuation kept
- * verbatim. This defeats Type-2 (renamed-variable) duplicates that a text
- * embedding misses, while preserving the structural token sequence that keeps
- * unrelated code apart. See the arXiv notes on NiCad / SourcererCC. */
+/* Extract the functions an edit ADDS by writing its REPLACE text to a temp file
+ * (extension chosen from the target path's language) and ctags-ing it. */
+static FuncDef *extract_candidate(const char *path, const char *replace, int *out_n) {
+    *out_n = 0;
+    const LangBackend *be = backend_by_id(lang_of_path(path));
+    const char *ext = be ? be->exts[0] : ".c";
+    if (kb_ensure_dirs() != 0) return NULL;
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), ".basi/.reuse_ext%s", ext);
+    FILE *f = fopen(tmp, "w");
+    if (!f) return NULL;
+    fwrite(replace, 1, strlen(replace), f);
+    fclose(f);
+    FuncDef *fs = ctags_extract_file(tmp, out_n);
+    unlink(tmp);
+    return fs;
+}
 
-static bool is_c_keyword(const char *w, size_t n) {
-    static const char *kw[] = {
-        "auto","break","case","char","const","continue","default","do","double",
-        "else","enum","extern","float","for","goto","if","inline","int","long",
-        "register","restrict","return","short","signed","sizeof","static","struct",
-        "switch","typedef","union","unsigned","void","volatile","while","bool",
-        "_Bool","true","false","NULL","class","namespace","template","new","delete",
-        "public","private","protected","virtual","override","nullptr","using",
-    };
-    for (size_t i = 0; i < sizeof(kw) / sizeof(kw[0]); i++)
-        if (strlen(kw[i]) == n && memcmp(kw[i], w, n) == 0) return true;
+/* ── NiCad-style normalization + token clone similarity ─────────────────
+ * Blind-rename: every identifier that isn't one of the language's keywords →
+ * "ID", numbers → "NUM", string/char literals → "LIT"; keywords, operators and
+ * punctuation kept verbatim. This defeats Type-2 (renamed-variable) duplicates
+ * that a text embedding misses, while preserving the structural token sequence
+ * that keeps unrelated code apart. See the arXiv notes on NiCad / SourcererCC.
+ * The keyword list and comment/string rules come from the LangBackend, so the
+ * same code normalizes C, C++, Python, … . */
+
+static bool kw_is(const LangBackend *be, const char *w, size_t n) {
+    for (const char **k = be->keywords; *k; k++)
+        if (strlen(*k) == n && memcmp(*k, w, n) == 0) return true;
     return false;
 }
 
-/* Space-joined normalized token stream for a function body. */
-static char *ntok_string(const char *body) {
+/* Space-joined normalized token stream for a function body, per language. */
+static char *ntok_string(const LangBackend *be, const char *body) {
     static const char *ops[] = {
-        "<<=", ">>=", "...", "->", "++", "--", "<<", ">>", "<=", ">=", "==",
-        "!=", "&&", "||", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "::",
+        "<<=", ">>=", "...", "//", "**", "->", "++", "--", "<<", ">>", "<=",
+        ">=", "==", "!=", "&&", "||", "+=", "-=", "*=", "/=", "%=", "&=", "|=",
+        "^=", "::", ":=",
     };
+    size_t lc = be->line_comment ? strlen(be->line_comment) : 0;
+    size_t bo = be->block_open   ? strlen(be->block_open)   : 0;
+    size_t bc = be->block_close  ? strlen(be->block_close)  : 0;
     StringBuf sb; sb_init(&sb);
     const char *p = body;
     bool first = true;
     while (*p) {
         if (isspace((unsigned char)*p)) { p++; continue; }
-        if (p[0] == '/' && p[1] == '/') { while (*p && *p != '\n') p++; continue; }
-        if (p[0] == '/' && p[1] == '*') { p += 2; while (*p && !(p[0] == '*' && p[1] == '/')) p++; if (*p) p += 2; continue; }
+        if (lc && strncmp(p, be->line_comment, lc) == 0) { while (*p && *p != '\n') p++; continue; }
+        if (bo && strncmp(p, be->block_open, bo) == 0) {
+            p += bo; while (*p && !(bc && strncmp(p, be->block_close, bc) == 0)) p++; if (*p) p += bc; continue;
+        }
 
         const char *emit = NULL;
         char idbuf[8];
         if (*p == '"' || *p == '\'') {
-            char q = *p++;
-            while (*p && *p != q) { if (*p == '\\' && p[1]) p++; p++; }
-            if (*p) p++;
+            char q = *p;
+            if (!be->brace_lang && p[1] == q && p[2] == q) {           /* python triple-quote */
+                p += 3; while (*p && !(p[0] == q && p[1] == q && p[2] == q)) p++; if (*p) p += 3;
+            } else {
+                p++; while (*p && *p != q) { if (*p == '\\' && p[1]) p++; p++; } if (*p) p++;
+            }
             emit = "LIT";
         } else if (isalpha((unsigned char)*p) || *p == '_') {
             const char *s = p;
             while (isalnum((unsigned char)*p) || *p == '_') p++;
-            emit = is_c_keyword(s, (size_t)(p - s)) ? NULL : "ID";
-            if (!emit) {
-                size_t n = (size_t)(p - s);
+            size_t n = (size_t)(p - s);
+            if (kw_is(be, s, n)) {
                 if (n >= sizeof(idbuf)) n = sizeof(idbuf) - 1;
                 memcpy(idbuf, s, n); idbuf[n] = '\0'; emit = idbuf;   /* keyword verbatim */
-            }
+            } else emit = "ID";
         } else if (isdigit((unsigned char)*p)) {
             while (isalnum((unsigned char)*p) || *p == '.' || *p == 'x' || *p == 'X') p++;
             emit = "NUM";
@@ -270,7 +329,7 @@ static char *ntok_string(const char *body) {
             }
             if (oplen == 0) {
                 char c = *p++;
-                if (c == '{' || c == '}' || c == ';') continue;   /* drop formatting punctuation (brace/statement style) */
+                if (be->brace_lang && (c == '{' || c == '}' || c == ';')) continue;   /* drop brace/statement formatting */
                 idbuf[0] = c; idbuf[1] = '\0'; emit = idbuf;
             }
             else { size_t l = oplen < sizeof(idbuf) ? oplen : sizeof(idbuf) - 1;
@@ -349,7 +408,8 @@ static double jaccard(const uint64_t *a, size_t na, const uint64_t *b, size_t nb
  * ranks on). Exposed for evaluation/reporting; deterministic, no model. */
 double reuse_similarity(const char *body_a, const char *body_b) {
     if (!body_a || !body_b) return 0.0;
-    char *na = ntok_string(body_a), *nb = ntok_string(body_b);
+    const LangBackend *be = backend_by_id(LANG_C);   /* eval harness is C */
+    char *na = ntok_string(be, body_a), *nb = ntok_string(be, body_b);
     size_t nta = 0, ntb = 0;
     uint64_t *ta = trigram_set(na, &nta), *tb = trigram_set(nb, &ntb);
     double j = jaccard(ta, nta, tb, ntb);
@@ -369,6 +429,7 @@ typedef struct {
     char     *sig;
     int       line;
     long      mtime;
+    LangId    lang;      /* so matches never cross languages */
     char     *body;      /* capped */
     uint64_t *tri;       /* derived trigram set (not persisted) */
     size_t    n_tri;
@@ -377,7 +438,9 @@ typedef struct {
 typedef struct { SymEntry *e; size_t n, cap; } SymStore;
 
 static void sym_derive(SymEntry *v) {
-    char *nt = ntok_string(v->body);
+    const LangBackend *be = backend_by_id(v->lang);
+    if (!be) be = backend_by_id(LANG_C);   /* unknown → C rules (safe default) */
+    char *nt = ntok_string(be, v->body);
     v->tri = trigram_set(nt, &v->n_tri);
     free(nt);
 }
@@ -394,11 +457,11 @@ static void sym_clear(SymStore *s) {
 }
 
 static void sym_push(SymStore *s, char *file, char *name, char *sig,
-                     int line, long mtime, char *body) {
+                     int line, long mtime, LangId lang, char *body) {
     if (s->n == s->cap) { s->cap = s->cap ? s->cap * 2 : 32; s->e = realloc(s->e, s->cap * sizeof(SymEntry)); }
     SymEntry *v = &s->e[s->n++];
     v->file = file; v->name = name; v->sig = sig;
-    v->line = line; v->mtime = mtime; v->body = body;
+    v->line = line; v->mtime = mtime; v->lang = lang; v->body = body;
     v->tri = NULL; v->n_tri = 0;
     sym_derive(v);
 }
@@ -423,13 +486,15 @@ static int sym_load(SymStore *s) {
         char *sig = malloc(slen + 1);
         if (fread(sig, 1, slen, f) != slen) { free(file); free(name); free(sig); fclose(f); return -1; }
         sig[slen] = '\0';
-        if (fread(&line, 4, 1, f) != 1 || fread(&mtime, 8, 1, f) != 1 || fread(&blen, 4, 1, f) != 1) {
+        uint8_t lang;
+        if (fread(&line, 4, 1, f) != 1 || fread(&mtime, 8, 1, f) != 1 ||
+            fread(&lang, 1, 1, f) != 1 || fread(&blen, 4, 1, f) != 1) {
             free(file); free(name); free(sig); fclose(f); return -1;
         }
         char *body = malloc(blen + 1);
         if (fread(body, 1, blen, f) != blen) { free(file); free(name); free(sig); free(body); fclose(f); return -1; }
         body[blen] = '\0';
-        sym_push(s, file, name, sig, (int)line, (long)mtime, body);
+        sym_push(s, file, name, sig, (int)line, (long)mtime, (LangId)lang, body);
     }
     fclose(f);
     return 0;
@@ -447,11 +512,13 @@ static int sym_save(const SymStore *s) {
         const SymEntry *v = &s->e[i];
         uint16_t flen = (uint16_t)strlen(v->file), nlen = (uint16_t)strlen(v->name), slen = (uint16_t)strlen(v->sig);
         int32_t line = (int32_t)v->line; int64_t mt = (int64_t)v->mtime;
+        uint8_t lang = (uint8_t)v->lang;
         uint32_t blen = (uint32_t)strlen(v->body);
         if (fwrite(&flen, 2, 1, f) != 1 || fwrite(v->file, 1, flen, f) != flen ||
             fwrite(&nlen, 2, 1, f) != 1 || fwrite(v->name, 1, nlen, f) != nlen ||
             fwrite(&slen, 2, 1, f) != 1 || fwrite(v->sig, 1, slen, f) != slen  ||
             fwrite(&line, 4, 1, f) != 1 || fwrite(&mt, 8, 1, f) != 1 ||
+            fwrite(&lang, 1, 1, f) != 1 ||
             fwrite(&blen, 4, 1, f) != 1 || fwrite(v->body, 1, blen, f) != blen) { fclose(f); unlink(tmp); return -1; }
     }
     if (fclose(f) != 0) { unlink(tmp); return -1; }
@@ -465,12 +532,7 @@ typedef struct { char *path; long mtime; } SrcFile;
 typedef struct { SrcFile *v; int n, cap; } SrcList;
 
 static bool has_src_ext(const char *name) {
-    const char *dot = strrchr(name, '.');
-    if (!dot) return false;
-    static const char *ext[] = { ".c", ".h", ".cpp", ".cc", ".cxx", ".hpp", ".hh" };
-    for (size_t i = 0; i < sizeof(ext) / sizeof(ext[0]); i++)
-        if (strcmp(dot, ext[i]) == 0) return true;
-    return false;
+    return lang_of_path(name) != LANG_UNKNOWN;
 }
 
 static bool skip_dir(const char *name) {
@@ -545,21 +607,18 @@ static int sym_sync(SymStore *s, int *dropped) {
     int indexed = 0;
     for (int j = 0; j < files.n; j++) {
         if (store_has_current(s, files.v[j].path, files.v[j].mtime)) continue;
-        size_t flen = 0;
-        char *buf = read_file_all(files.v[j].path, &flen);
-        if (!buf) continue;
         int nf = 0;
-        FuncDef *fs = extract_funcs(buf, flen, &nf);
+        FuncDef *fs = ctags_extract_file(files.v[j].path, &nf);
         for (int k = 0; k < nf; k++) {
             size_t blen = strlen(fs[k].body);
             if (blen < MIN_BODY) { funcdef_free(&fs[k]); continue; }
             if (blen > BODY_CAP) { fs[k].body[BODY_CAP] = '\0'; }
-            sym_push(s, strdup(files.v[j].path), fs[k].name, fs[k].sig, fs[k].line, files.v[j].mtime, fs[k].body);
+            sym_push(s, strdup(files.v[j].path), fs[k].name, fs[k].sig, fs[k].line,
+                     files.v[j].mtime, fs[k].lang, fs[k].body);
             fs[k].name = fs[k].sig = fs[k].body = NULL;   /* moved */
             indexed++;
         }
         free(fs);
-        free(buf);
     }
     srclist_free(&files);
     return indexed;
@@ -580,6 +639,7 @@ static int sym_best_match(const SymStore *s, const FuncDef *cand,
         float *qv = malloc((size_t)dim * sizeof(float)), *ev = malloc((size_t)dim * sizeof(float));
         if (embed_text(cand->body, qv) != 0) { free(qv); free(ev); *out_score = 0.0; return -1; }
         for (size_t i = 0; i < s->n; i++) {
+            if (s->e[i].lang != cand->lang) continue;   /* never match across languages */
             if (strcmp(s->e[i].file, exclude_file) == 0) continue;
             if (embed_text(s->e[i].body, ev) != 0) continue;
             double dot = 0.0;
@@ -592,11 +652,14 @@ static int sym_best_match(const SymStore *s, const FuncDef *cand,
     }
 
     /* Token mode (default). */
-    char *nt = ntok_string(cand->body);
+    const LangBackend *be = backend_by_id(cand->lang);
+    if (!be) be = backend_by_id(LANG_C);
+    char *nt = ntok_string(be, cand->body);
     size_t nq = 0;
     uint64_t *q = trigram_set(nt, &nq);
     free(nt);
     for (size_t i = 0; i < s->n; i++) {
+        if (s->e[i].lang != cand->lang) continue;       /* never match across languages */
         if (strcmp(s->e[i].file, exclude_file) == 0) continue;
         double j = jaccard(q, nq, s->e[i].tri, s->e[i].n_tri);
         if (j > bs) { bs = j; best = (int)i; }
@@ -655,7 +718,7 @@ char *reuse_gate_check(const char *path, const char *replace, const char *search
     if (!ensure_store()) return NULL;
 
     int nf = 0;
-    FuncDef *fs = extract_funcs(replace, strlen(replace), &nf);
+    FuncDef *fs = extract_candidate(path, replace, &nf);
     if (nf == 0) { free(fs); return NULL; }
 
     float tau = env_tau(use_embed() ? DEFAULT_TAU_EMBED : DEFAULT_TAU_TOKEN);
@@ -1089,13 +1152,159 @@ static bool ir_equivalent(const char *cand_src, const char *cand_name, const cha
     return eq;
 }
 
+/* ── Stage-2 semantic verification: Python AST equivalence ──────────────
+ * The dynamic-language analog of IR equivalence. Renaming only the function's
+ * own parameters (its locals) — not called-function names or constants — then
+ * comparing the normalized AST dumps: a renamed clone matches, a constant twin
+ * (21 vs 20) or a differing call does not. Uses only the builtin `ast` module,
+ * so the sole dependency is python3 itself. */
+#define PY_AST_SCRIPT \
+    "import ast,sys,textwrap\n" \
+    "def norm(t):\n" \
+    " fn=ast.parse(textwrap.dedent(t)).body[0]\n" \
+    " params={a.arg for a in fn.args.args}\n" \
+    " m={}\n" \
+    " def rn(x):return m.setdefault(x,\"p%d\"%len(m))\n" \
+    " class R(ast.NodeTransformer):\n" \
+    "  def visit_arg(s,n):\n" \
+    "   n.arg=rn(n.arg) if n.arg in params else n.arg;return n\n" \
+    "  def visit_Name(s,n):\n" \
+    "   n.id=rn(n.id) if n.id in params else n.id;return n\n" \
+    " fn.name=\"F\";R().visit(fn);return ast.dump(fn)\n" \
+    "try:\n" \
+    " a=open(sys.argv[1]).read();b=open(sys.argv[2]).read()\n" \
+    " print(\"1\" if norm(a)==norm(b) else \"0\")\n" \
+    "except Exception:\n" \
+    " print(\"0\")\n"
+
+static bool py_ast_equivalent(const char *cand_body, const char *helper_body) {
+    if (kb_ensure_dirs() != 0) return false;
+    const char *cf = ".basi/.reuse_cand.py", *hf = ".basi/.reuse_help.py";
+    FILE *a = fopen(cf, "w"); if (!a) return false;
+    fwrite(cand_body, 1, strlen(cand_body), a); fclose(a);
+    FILE *b = fopen(hf, "w"); if (!b) { unlink(cf); return false; }
+    fwrite(helper_body, 1, strlen(helper_body), b); fclose(b);
+
+    const char *py = getenv("BASI_REUSE_PYTHON");
+    if (!py || !*py) py = "python3";
+    StringBuf cmd; sb_init(&cmd);
+    sb_append_str(&cmd, py);
+    sb_append_str(&cmd, " -c '" PY_AST_SCRIPT "' ");
+    sb_append_str(&cmd, cf); sb_append_char(&cmd, ' ');
+    sb_append_str(&cmd, hf); sb_append_str(&cmd, " 2>/dev/null");
+    char *cmdstr = sb_to_str(&cmd);
+    char *out = run_command_timeout(cmdstr, 4096, 15, NULL);
+    free(cmdstr); unlink(cf); unlink(hf);
+    bool eq = out && out[0] == '1';
+    free(out);
+    return eq;
+}
+
+/* Dispatch Stage-2 verification by the candidate's language: compiled → LLVM IR
+ * equivalence, dynamic → parser AST equivalence, otherwise refuse (we can only
+ * auto-substitute what a tool can certify equivalent). */
+static bool verify_equivalent(const LangBackend *be, const char *replace,
+                              const FuncDef *cand, const char *cand_path,
+                              const SymEntry *helper) {
+    if (be->verify == VERIFY_IR)
+        return ir_equivalent(replace, cand->name, cand_path, helper->file, helper->name);
+    if (be->verify == VERIFY_AST)
+        return py_ast_equivalent(cand->body, helper->body);
+    return false;
+}
+
+/* Is `s` a legal identifier (used to gate Python module-name injection)? */
+static bool is_ident(const char *s) {
+    if (!s || !*s || isdigit((unsigned char)*s)) return false;
+    for (const char *p = s; *p; p++)
+        if (!(isalnum((unsigned char)*p) || *p == '_')) return false;
+    return true;
+}
+
+/* Leading-whitespace width of the first line of `body` (0 for a top-level def). */
+static size_t leading_indent(const char *body) {
+    size_t i = 0;
+    while (body[i] == ' ' || body[i] == '\t') i++;
+    return i;
+}
+
+/* Byte length of `body`'s signature header — up to and including the opening
+ * brace (brace langs) or the def-line colon (Python). 0 if not found. */
+static size_t header_len(const FuncDef *f, const LangBackend *be) {
+    if (be->brace_lang) {
+        const char *br = strchr(f->body, '{');
+        return br ? (size_t)(br - f->body) : 0;
+    }
+    const char *op = strchr(f->body, '(');
+    if (!op) return 0;
+    int depth = 0; const char *p = op;
+    for (; *p; p++) {
+        if (*p == '(' || *p == '[' || *p == '{') depth++;
+        else if (*p == ')' || *p == ']' || *p == '}') { if (--depth == 0) { p++; break; } }
+    }
+    while (*p && *p != ':') p++;              /* skip an optional -> annotation */
+    return *p == ':' ? (size_t)(p - f->body + 1) : 0;
+}
+
+/* Rebuild the whole candidate function so its body is a single call to the
+ * helper, preserving the original signature line verbatim. malloc'd/NULL. */
+static char *build_reuse_function(const FuncDef *f, const LangBackend *be,
+                                  const char *helper, char **params, int ca) {
+    size_t hl = header_len(f, be);
+    if (hl == 0) return NULL;
+    StringBuf b; sb_init(&b);
+    sb_append(&b, f->body, hl);               /* original signature, verbatim */
+    if (be->brace_lang) {
+        sb_append_str(&b, "{\n    ");
+        if (!sig_returns_void(f->sig)) sb_append_str(&b, "return ");
+    } else {
+        size_t ind = leading_indent(f->body);
+        sb_append_char(&b, '\n');
+        for (size_t i = 0; i < ind + 4; i++) sb_append_char(&b, ' ');
+        sb_append_str(&b, "return ");
+    }
+    sb_append_str(&b, helper);
+    sb_append_char(&b, '(');
+    for (int i = 0; i < ca; i++) { if (i) sb_append_str(&b, ", "); sb_append_str(&b, params[i]); }
+    sb_append_char(&b, ')');
+    if (be->brace_lang) sb_append_str(&b, ";\n}");
+    else                sb_append_char(&b, '\n');
+    return sb_to_str(&b);
+}
+
+/* Injected line that makes the helper reachable from the rewritten file, plus a
+ * guard that the rewrite would actually resolve. Returns malloc'd import/include
+ * text (caller frees) or NULL to refuse the rewrite. */
+static char *reachability_line(const LangBackend *be, const char *helper_file, const char *helper_name) {
+    if (be->brace_lang) {
+        char *hdr = header_for(helper_file);
+        if (!hdr || !header_declares(hdr, helper_name)) { free(hdr); return NULL; }
+        const char *slash = strrchr(hdr, '/');
+        const char *hbase = slash ? slash + 1 : hdr;
+        char inc[300]; snprintf(inc, sizeof(inc), "#include \"%s\"", hbase);
+        free(hdr);
+        return strdup(inc);
+    }
+    /* Python: import the helper from its module (file stem). */
+    const char *slash = strrchr(helper_file, '/');
+    const char *base = slash ? slash + 1 : helper_file;
+    const char *dot = strrchr(base, '.');
+    size_t stemlen = dot ? (size_t)(dot - base) : strlen(base);
+    char stem[128];
+    if (stemlen == 0 || stemlen >= sizeof(stem)) return NULL;
+    memcpy(stem, base, stemlen); stem[stemlen] = '\0';
+    if (!is_ident(stem)) return NULL;
+    char imp[300]; snprintf(imp, sizeof(imp), "from %s import %s", stem, helper_name);
+    return strdup(imp);
+}
+
 char *reuse_gate_autofix(const char *path, const char *replace, const char *search) {
     if (!reuse_gate_enabled() || !env_flag("BASI_REUSE_AUTOFIX")) return NULL;
     if (!replace || !*replace) return NULL;
     if (!ensure_store()) return NULL;
 
     int nf = 0;
-    FuncDef *fs = extract_funcs(replace, strlen(replace), &nf);
+    FuncDef *fs = extract_candidate(path, replace, &nf);
     if (nf == 0) { free(fs); return NULL; }
 
     bool dbg = env_flag("BASI_REUSE_DEBUG");
@@ -1107,69 +1316,67 @@ char *reuse_gate_autofix(const char *path, const char *replace, const char *sear
         if (strlen(f->body) < MIN_BODY) continue;
         if (name_in_text(search, f->name)) continue;
 
+        const LangBackend *be = backend_by_id(f->lang);
+        if (!be) continue;
+
         double score;
         int mi = sym_best_match(&g_store, f, path, &score);
         if (mi < 0 || score < AUTOFIX_TAU) continue;
+        SymEntry *h = &g_store.e[mi];
 
         char *cparams[MAX_PARAMS], *hparams[MAX_PARAMS];
         int ca = parse_params(f->sig, cparams, MAX_PARAMS);
-        int ha = parse_params(g_store.e[mi].sig, hparams, MAX_PARAMS);
+        int ha = parse_params(h->sig, hparams, MAX_PARAMS);
         for (int i = 0; i < ha; i++) free(hparams[i]);
         if (ca < 0 || ca != ha) { for (int i = 0; i < ca; i++) free(cparams[i]); continue; }
 
         /* Type-compatibility guard: same arity is not enough (two enum→name
-         * mappers over different enums match on arity but not types). */
-        if (!types_compatible(f->sig, g_store.e[mi].sig)) {
-            for (int i = 0; i < ca; i++) free(cparams[i]); continue;
+         * mappers over different enums match on arity but not types). C-family
+         * only — dynamic langs have no static types to compare. */
+        if (be->brace_lang && !types_compatible(f->sig, h->sig)) {
+            for (int i = 0; i < ca; i++) free(cparams[i]);
+            continue;
         }
 
         /* Stage-2 semantic guard: structural + type match still can't tell a
          * behavioural twin (anetRecvTimeout vs anetSendTimeout — same shape,
-         * one differing constant) from a true clone. Only substitute when the
-         * compiler certifies the two functions are IR-equivalent. Skippable via
-         * BASI_REUSE_NOVERIFY for A/B, but that reinstates the unsafe path. */
+         * one differing constant) from a true clone. Only substitute when a
+         * verifier (compiler IR / parser AST) certifies the two functions
+         * equivalent. Skippable via BASI_REUSE_NOVERIFY for A/B, but that
+         * reinstates the unsafe path. */
         if (!env_flag("BASI_REUSE_NOVERIFY") &&
-            !ir_equivalent(replace, f->name, path, g_store.e[mi].file, g_store.e[mi].name)) {
-            if (dbg) fprintf(stderr, "reuse-autofix: `%s` not IR-equivalent to `%s` — refusing rewrite\n",
-                             f->name, g_store.e[mi].name);
-            for (int i = 0; i < ca; i++) free(cparams[i]); continue;
+            !verify_equivalent(be, replace, f, path, h)) {
+            if (dbg) fprintf(stderr, "reuse-autofix: `%s` not equivalent to `%s` — refusing rewrite\n",
+                             f->name, h->name);
+            for (int i = 0; i < ca; i++) free(cparams[i]);
+            continue;
         }
 
-        /* Reachability guard: only rewrite if the helper has a header that
-         * declares it — otherwise the injected call would not compile. */
-        char *hdr = header_for(g_store.e[mi].file);
-        if (!hdr || !header_declares(hdr, g_store.e[mi].name)) {
-            free(hdr); for (int i = 0; i < ca; i++) free(cparams[i]); continue;
-        }
+        /* Reachability guard: only rewrite if the injected call would resolve
+         * (C: helper's header declares it; Python: helper is an importable
+         * module). */
+        char *reach = reachability_line(be, h->file, h->name);
+        if (!reach) { for (int i = 0; i < ca; i++) free(cparams[i]); continue; }
 
-        StringBuf b; sb_init(&b);
-        sb_append_str(&b, "{\n    ");
-        if (!sig_returns_void(f->sig)) sb_append_str(&b, "return ");
-        sb_append_str(&b, g_store.e[mi].name);
-        sb_append_char(&b, '(');
-        for (int i = 0; i < ca; i++) { if (i) sb_append_str(&b, ", "); sb_append_str(&b, cparams[i]); free(cparams[i]); }
-        sb_append_str(&b, ");\n}");
-        char *reuse_body = sb_to_str(&b);
+        char *reuse_fn = build_reuse_function(f, be, h->name, cparams, ca);
+        for (int i = 0; i < ca; i++) free(cparams[i]);
+        if (!reuse_fn) { free(reach); continue; }
 
         const char *base = result ? result : replace;
-        char *rewritten = str_replace_once(base, f->body, reuse_body);
-        free(reuse_body);
+        char *rewritten = str_replace_once(base, f->body, reuse_fn);
+        free(reuse_fn);
         if (rewritten) {
-            /* Ensure the helper's header is included so the call resolves. */
-            const char *slash = strrchr(hdr, '/');
-            const char *hbase = slash ? slash + 1 : hdr;
-            char inc[300]; snprintf(inc, sizeof(inc), "#include \"%s\"", hbase);
-            if (!strstr(rewritten, inc)) {
+            if (!strstr(rewritten, reach)) {          /* prepend import/include once */
                 StringBuf s; sb_init(&s);
-                sb_append_str(&s, inc); sb_append_char(&s, '\n');
+                sb_append_str(&s, reach); sb_append_char(&s, '\n');
                 sb_append_str(&s, rewritten);
                 free(rewritten); rewritten = sb_to_str(&s);
             }
             free(result); result = rewritten; fixes++;
             if (dbg) fprintf(stderr, "reuse-autofix: rewrote `%s` -> call `%s` (%s:%d, score %.2f)\n",
-                             f->name, g_store.e[mi].name, g_store.e[mi].file, g_store.e[mi].line, score);
+                             f->name, h->name, h->file, h->line, score);
         }
-        free(hdr);
+        free(reach);
     }
 
     for (int k = 0; k < nf; k++) funcdef_free(&fs[k]);
