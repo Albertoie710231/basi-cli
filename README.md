@@ -9,7 +9,7 @@ from a single terminal binary.
 C) is; the LLM is used only for the irreducible reasoning/pattern-matching. The agent loop, tool
 dispatch, ranking, guards, and parsing are plain C — the model just decides and synthesizes.
 
-> Personal research project. The build defaults point at the author's paths — override them (below).
+> Personal research project, Linux-only. `./install.sh` builds it from source on any distro — see [Install](#install).
 
 Type `/` for an autocomplete dropdown of every slash command:
 
@@ -30,6 +30,12 @@ Type `/` for an autocomplete dropdown of every slash command:
 - **Code context** — `code_context` surfaces C symbol info via a clangd LSP.
 - **Editing & scaffolding** — `edit` (SEARCH/REPLACE blocks with fuzzy matching) and `scaffold`
   (templates), gated by an approval prompt.
+- **Reuse & behavior guards** *(opt-in)* — deterministic, compiler-verified guardrails that stop the
+  model re-implementing code the repo already has, or silently breaking an existing function while
+  "refactoring". A **verified autofix** rewrites a duplicate to call the existing function *only*
+  when a compiler (LLVM IR) or the language's own parser (AST) proves them equivalent; a **behavior
+  guard** confirms a suspected regression against your test suite and hard-blocks a green→red change.
+  Across C/C++/Python/Go/JS/TS. See [Reuse & behavior guards](#reuse--behavior-guards).
 - **Planning pillar** — an A3 / spike / pre-mortem plan workflow with phase-gated tools.
 - **Native chat templates** — each model is driven in its *own* chat format via llama.cpp's jinja
   engine (Qwen, Gemma, DeepSeek, custom merges…), not a one-size-fits-all fallback.
@@ -51,15 +57,35 @@ Type `/` for an autocomplete dropdown of every slash command:
   (poppler), `unzip`, and a local **SearXNG** instance with the JSON format enabled (for
   `web_search`).
 
-## Build
+## Install
+
+Native binaries don't move across Linux distros (glibc floors, absolute rpaths), so BASI installs by
+compiling on your machine. The one-command source install clones a **pinned** upstream llama.cpp,
+builds it with the **Vulkan** backend (runs on any NVIDIA/AMD/Intel GPU), compiles BASI against it,
+and drops a `basi` launcher on your PATH:
 
 ```sh
-make LLAMA_DIR=/path/to/llama.cpp LLAMA_BUILD=/path/to/llama.cpp/build
+./install.sh                 # add --install-deps to install build deps via your package manager
 ```
 
-`LLAMA_DIR`/`LLAMA_BUILD` default to the author's paths; override them for your machine. The headers
-come from `$(LLAMA_DIR)/include`, `$(LLAMA_DIR)/common`, and `$(LLAMA_DIR)/vendor`; the libs from
-`$(LLAMA_BUILD)/bin`.
+Already have llama.cpp built as shared libs? Reuse it and skip the clone/build:
+
+```sh
+./install.sh --llama-dir /path/to/llama.cpp --llama-build /path/to/llama.cpp/build_vulkan
+```
+
+Runtime needs a Vulkan-capable GPU driver — Mesa (`vulkan-radeon` / `vulkan-intel`) for AMD/Intel, or
+the proprietary NVIDIA driver. CPU-only works but is slow.
+
+### Manual build
+
+```sh
+make LLAMA_DIR=/path/to/llama.cpp LLAMA_BUILD=/path/to/llama.cpp/build_vulkan
+```
+
+`LLAMA_DIR` defaults to `$HOME/llama.cpp`, `LLAMA_BUILD` to `$(LLAMA_DIR)/build_vulkan`; override for
+your layout. Headers come from `$(LLAMA_DIR)/include`, `$(LLAMA_DIR)/common`, and
+`$(LLAMA_DIR)/vendor`; libs from `$(LLAMA_BUILD)/bin`.
 
 ## Usage
 
@@ -127,6 +153,46 @@ for an autocomplete dropdown (↑/↓ to pick, Tab to complete).
 | `BASI_NO_SEARXNG` | — | Set to disable the SearXNG auto-launch |
 | `BASI_DEEPSEARCH_ROUNDS` | `5` | Max deep-research rounds |
 | `BASI_DEEPSEARCH_CTX` | `32768` | Deep-research context size (lower for interactive `/deepsearch` on a single GPU) |
+| `BASI_REUSE_GATE` / `BASI_REUSE_AUTOFIX` / `BASI_REUSE_REGRESS` | off | Enable the reuse gate / verified autofix / behavior guard — see [Reuse & behavior guards](#reuse--behavior-guards) |
+
+## Reuse & behavior guards
+
+Local models tend to re-implement code that already exists, or "consolidate" two similar functions
+and silently change one of them — bugs that compile and pass the type-checker. BASI ships three
+deterministic guardrails for this, each decided by a **compiler or a real parser, never a heuristic
+or the LLM**. All are opt-in (default off) and degrade safely: when a language's verifier tool is
+missing, detection still works and the safety-critical steps refuse rather than guess. **Nothing is
+ever fetched from the network** — verifiers use tools already on your machine (including the
+project's own `typescript`).
+
+| Guard | Enable | What it does |
+|---|---|---|
+| **Reuse gate** | `BASI_REUSE_GATE=1` | Before an `edit` adds a new top-level function, blind-rename token clone detection (NiCad-style trigram Jaccard) compares it against a project symbol index. A near-duplicate pauses the edit and points at the existing function. |
+| **Verified autofix** | *(also)* `BASI_REUSE_AUTOFIX=1` | When the new function is a high-confidence duplicate **and a compiler certifies it equivalent**, rewrites its body to a call to the existing one. This is *output-side* — it doesn't depend on the model heeding a warning. Behavioural twins that merely *look* alike (e.g. redis's `anetSendTimeout` vs `anetRecvTimeout`, which differ by one constant) are refused. |
+| **Behavior guard** | `BASI_REUSE_REGRESS=1` | After an edit, if it changed the behaviour of a function that already existed, confirm against your test suite and **hard-block + revert only when a previously-green test goes red**. Catches the "compiles, passes the type-checker, silently wrong" regressions a refactor introduces — e.g. routing an existing shape's hit-test through new geometry. |
+
+**Language coverage.** A language is one config entry; extraction is
+[Universal Ctags](https://github.com/universal-ctags/ctags), so adding one needs no parser.
+
+| Language | Detect | Verified autofix | Behavior guard | Equivalence verifier |
+|---|---|---|---|---|
+| C, C++ | ✓ | ✓ | ✓ | `clang -O2 -emit-llvm` — normalized LLVM IR |
+| Python, Go | ✓ | ✓ | ✓ | `python3` `ast` / `go/parser` — normalized AST |
+| TypeScript | ✓ | — | ✓ | the project's own `typescript`, driven by `node` |
+| JavaScript | ✓ | — | — | none (detect-only) |
+
+The verifier a language needs must be on PATH — `clang` (C/C++), `python3`, `go`, or `node` plus the
+project's `typescript` (TS). The IR/AST check is *sound, not complete*: it only substitutes or blocks
+when the tool is confident, so it never makes a wrong rewrite or a false block on unverifiable code.
+
+**Related environment variables:**
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `BASI_REUSE_TEST_CMD` | auto-detect | Test command the behavior guard confirms a flag against (else it tries `go test ./...` / `make test`). |
+| `BASI_REUSE_TAU` | `0.50` | Clone-similarity threshold for the reuse gate. |
+| `BASI_REUSE_DEBUG` | — | Trace each guard decision to stderr. |
+| `BASI_REUSE_CLANG` / `BASI_REUSE_PYTHON` / `BASI_REUSE_GO` / `BASI_REUSE_NODE` / `BASI_REUSE_CTAGS` | — | Override the verifier/extractor binaries. |
 
 ## License
 
