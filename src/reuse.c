@@ -951,6 +951,92 @@ static void dir_of(const char *path, char *buf, size_t n) {
     memcpy(buf, path, len); buf[len] = '\0';
 }
 
+/* Value of a "key":"…" string pair within a bounded JSON object slice. */
+static char *cc_json_str(const char *obj, size_t len, const char *key) {
+    char pat[64];
+    int pl = snprintf(pat, sizeof(pat), "\"%s\"", key);
+    if (pl <= 0 || pl >= (int)sizeof(pat)) return NULL;
+    const char *k = memmem(obj, len, pat, (size_t)pl);
+    if (!k) return NULL;
+    const char *p = k + pl, *end = obj + len;
+    while (p < end && (*p == ' ' || *p == '\t' || *p == ':' || *p == '\n' || *p == '\r')) p++;
+    if (p >= end || *p != '"') return NULL;
+    p++;
+    StringBuf sb; sb_init(&sb);
+    while (p < end && *p != '"') {
+        if (*p == '\\' && p + 1 < end) {
+            p++;
+            char c = *p;
+            sb_append_char(&sb, c == 'n' ? '\n' : (c == 't' ? '\t' : c));
+        } else sb_append_char(&sb, *p);
+        p++;
+    }
+    return sb_to_str(&sb);
+}
+
+/* Keep only the preprocessing flags (-I/-D/-U/-std/-isystem/-include) from a
+ * full compile command — the parts that give a file its include/define context. */
+static char *cc_extract_flags(const char *cmd) {
+    StringBuf out; sb_init(&out);
+    const char *p = cmd;
+    while (*p) {
+        while (*p == ' ' || *p == '\t') p++;
+        if (!*p) break;
+        const char *ts = p;
+        while (*p && *p != ' ' && *p != '\t') p++;
+        size_t tl = (size_t)(p - ts);
+        bool keep = false, takes_arg = false;
+        if (tl >= 2 && ts[0] == '-') {
+            char c = ts[1];
+            if (c == 'I' || c == 'D' || c == 'U') { keep = true; takes_arg = (tl == 2); }
+            else if (tl >= 4 && !strncmp(ts, "-std", 4)) keep = true;
+            else if (tl == 8 && !strncmp(ts, "-isystem", 8)) { keep = true; takes_arg = true; }
+            else if (tl == 8 && !strncmp(ts, "-include", 8)) { keep = true; takes_arg = true; }
+        }
+        if (keep) {
+            if (out.len) sb_append_char(&out, ' ');
+            sb_append(&out, ts, tl);
+            if (takes_arg) {
+                while (*p == ' ' || *p == '\t') p++;
+                const char *as = p;
+                while (*p && *p != ' ' && *p != '\t') p++;
+                if (p > as) { sb_append_char(&out, ' '); sb_append(&out, as, (size_t)(p - as)); }
+            }
+        }
+    }
+    return sb_to_str(&out);
+}
+
+/* Compile flags for `target` from ./compile_commands.json (matched by basename),
+ * or NULL if there is no database or no matching entry. */
+static char *cc_lookup_flags(const char *target) {
+    size_t n = 0;
+    char *json = read_file_all("compile_commands.json", &n);
+    if (!json) return NULL;
+    const char *tb = strrchr(target, '/'); tb = tb ? tb + 1 : target;
+    char *result = NULL;
+    const char *p = json, *end = json + n;
+    while (p < end && !result) {
+        const char *ob = memchr(p, '{', (size_t)(end - p));
+        if (!ob) break;
+        const char *oe = memchr(ob, '}', (size_t)(end - ob));
+        if (!oe) break;
+        size_t olen = (size_t)(oe - ob + 1);
+        char *file = cc_json_str(ob, olen, "file");
+        if (file) {
+            const char *fb = strrchr(file, '/'); fb = fb ? fb + 1 : file;
+            if (strcmp(fb, tb) == 0) {
+                char *cmd = cc_json_str(ob, olen, "command");
+                if (cmd) { result = cc_extract_flags(cmd); free(cmd); }
+            }
+            free(file);
+        }
+        p = oe + 1;
+    }
+    free(json);
+    return result;
+}
+
 /* True iff the candidate function (as it stands in `cand_src`) compiles to IR
  * byte-equal to the helper — i.e. they are genuinely equivalent, so replacing
  * the candidate's body with a call to the helper is behaviour-preserving. */
@@ -963,16 +1049,29 @@ static bool ir_equivalent(const char *cand_src, const char *cand_name, const cha
     fwrite(cand_src, 1, strlen(cand_src), f);
     fclose(f);
 
-    char hd[1024], cd[1024];
-    dir_of(helper_file, hd, sizeof(hd));
-    dir_of(cand_path, cd, sizeof(cd));
-    StringBuf iflags; sb_init(&iflags);
-    sb_append_str(&iflags, "-I. -I"); sb_append_str(&iflags, hd);
-    sb_append_str(&iflags, " -I");    sb_append_str(&iflags, cd);
+    /* Prefer the project's real per-file flags (compile_commands.json); fall
+     * back to a best-effort guess for self-contained files / no database. */
+    char *ccflags = cc_lookup_flags(helper_file);
+    char *guessed = NULL;
+    const char *iflags;
+    if (ccflags) {
+        iflags = ccflags;
+    } else {
+        char hd[1024], cd[1024];
+        dir_of(helper_file, hd, sizeof(hd));
+        dir_of(cand_path, cd, sizeof(cd));
+        StringBuf g; sb_init(&g);
+        sb_append_str(&g, "-I. -I"); sb_append_str(&g, hd);
+        sb_append_str(&g, " -I");    sb_append_str(&g, cd);
+        guessed = sb_to_str(&g);
+        iflags = guessed;
+    }
+    if (env_flag("BASI_REUSE_DEBUG"))
+        fprintf(stderr, "ir-equiv flags [%s]: %s\n", ccflags ? "compile_commands.json" : "guessed", iflags);
 
-    char *ir_c = compile_ir(tmp, iflags.data);
-    char *ir_h = compile_ir(helper_file, iflags.data);
-    sb_free(&iflags);
+    char *ir_c = compile_ir(tmp, iflags);
+    char *ir_h = compile_ir(helper_file, iflags);
+    free(ccflags); free(guessed);
     unlink(tmp);
 
     bool eq = false;
