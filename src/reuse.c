@@ -1533,60 +1533,44 @@ static bool go_ast_equivalent(const char *cand_body, const char *helper_body) {
 }
 
 /* ── Stage-2 semantic verification: TypeScript AST equivalence ──────────
- * TypeScript has no LLVM IR and no zero-dep parser, but `deno` runs TS natively
- * and can pull the canonical TypeScript compiler on demand (npm:typescript,
- * cached in deno's own store — not vendored into the repo). The script parses
- * each function with the real TS parser, renames the function's own name +
- * params + locals, and compares the printed AST — a renamed clone matches, a
- * changed constant/operator does not. Requires `deno` on PATH (+ network on the
- * first run to fetch typescript); absent → run fails → refuse (safe). A bare
- * class-method body is retried wrapped in a dummy class so methods parse too. */
+ * TypeScript has no LLVM IR, but every real TS project already ships the
+ * canonical TypeScript compiler in its own node_modules (a dev dependency of
+ * every TS repo). We drive THAT local copy with `node` — no fetch, no network,
+ * fully offline (`require("typescript")` is a filesystem read up from the .basi
+ * script's dir to the project root). The script parses each function with the
+ * real TS parser, renames the function name + params + locals, and compares the
+ * printed AST — a renamed clone matches, a changed constant/operator does not.
+ * Requires `node` + the project's typescript; absent → run fails → refuse
+ * (safe: detection still works via ctags, and we NEVER auto-install/fetch). A
+ * bare class-method body is retried wrapped in a dummy class so methods parse. */
 #define TS_VERIFY_SRC \
-    "import ts from \"npm:typescript@5\";\n" \
-    "function normOne(src: string): string {\n" \
+    "const ts = require(\"typescript\"), fs = require(\"fs\");\n" \
+    "function normOne(src) {\n" \
     "  const sf = ts.createSourceFile(\"f.ts\", src, ts.ScriptTarget.Latest, true);\n" \
-    "  let fn: any;\n" \
-    "  const find = (n: ts.Node) => {\n" \
-    "    if (!fn && (ts.isFunctionDeclaration(n) || ts.isMethodDeclaration(n) ||\n" \
-    "                ts.isFunctionExpression(n) || ts.isArrowFunction(n))) fn = n;\n" \
-    "    ts.forEachChild(n, find);\n" \
-    "  };\n" \
+    "  let fn;\n" \
+    "  const find = (n) => { if (!fn && (ts.isFunctionDeclaration(n) || ts.isMethodDeclaration(n) || ts.isFunctionExpression(n) || ts.isArrowFunction(n))) fn = n; ts.forEachChild(n, find); };\n" \
     "  ts.forEachChild(sf, find);\n" \
     "  if (!fn) return \"\";\n" \
-    "  const m = new Map<string, string>();\n" \
-    "  const bind = (s: string) => { if (!m.has(s)) m.set(s, \"v\" + m.size); };\n" \
+    "  const m = new Map(), bind = (s) => { if (!m.has(s)) m.set(s, \"v\" + m.size); };\n" \
     "  if (fn.name && ts.isIdentifier(fn.name)) bind(fn.name.text);\n" \
     "  for (const p of fn.parameters) if (ts.isIdentifier(p.name)) bind(p.name.text);\n" \
-    "  const collect = (n: ts.Node) => {\n" \
-    "    if (ts.isVariableDeclaration(n) && ts.isIdentifier(n.name)) bind(n.name.text);\n" \
-    "    ts.forEachChild(n, collect);\n" \
-    "  };\n" \
+    "  const collect = (n) => { if (ts.isVariableDeclaration(n) && ts.isIdentifier(n.name)) bind(n.name.text); ts.forEachChild(n, collect); };\n" \
     "  if (fn.body) collect(fn.body);\n" \
     "  const f = ts.factory;\n" \
-    "  const tr = (ctx: ts.TransformationContext) => {\n" \
-    "    const visit = (n: ts.Node): ts.Node => {\n" \
-    "      if (ts.isIdentifier(n) && m.has(n.text)) {\n" \
-    "        const par = n.parent;\n" \
-    "        if (par && ts.isPropertyAccessExpression(par) && par.name === n) return n;\n" \
-    "        return f.createIdentifier(m.get(n.text)!);\n" \
-    "      }\n" \
-    "      return ts.visitEachChild(n, visit, ctx);\n" \
-    "    };\n" \
-    "    return (node: ts.Node) => ts.visitNode(node, visit);\n" \
-    "  };\n" \
+    "  const tr = (ctx) => { const visit = (n) => { if (ts.isIdentifier(n) && m.has(n.text)) { const par = n.parent; if (par && ts.isPropertyAccessExpression(par) && par.name === n) return n; return f.createIdentifier(m.get(n.text)); } return ts.visitEachChild(n, visit, ctx); }; return (node) => ts.visitNode(node, visit); };\n" \
     "  const t = ts.transform(fn, [tr]).transformed[0];\n" \
     "  return ts.createPrinter({ removeComments: true }).printNode(ts.EmitHint.Unspecified, t, sf);\n" \
     "}\n" \
-    "function norm(src: string): string { let r = normOne(src); if (!r) r = normOne(\"class __W {\\n\" + src + \"\\n}\"); return r; }\n" \
+    "function norm(src) { let r = normOne(src); if (!r) r = normOne(\"class __W {\\n\" + src + \"\\n}\"); return r; }\n" \
     "try {\n" \
-    "  const a = norm(Deno.readTextFileSync(Deno.args[0]));\n" \
-    "  const b = norm(Deno.readTextFileSync(Deno.args[1]));\n" \
+    "  const a = norm(fs.readFileSync(process.argv[2], \"utf8\"));\n" \
+    "  const b = norm(fs.readFileSync(process.argv[3], \"utf8\"));\n" \
     "  console.log(a !== \"\" && a === b ? \"1\" : \"0\");\n" \
-    "} catch { console.log(\"0\"); }\n"
+    "} catch (e) { console.log(\"0\"); }\n"
 
 static bool ts_ast_equivalent(const char *cand_body, const char *helper_body) {
     if (kb_ensure_dirs() != 0) return false;
-    const char *prog = ".basi/reuse_tsnorm.ts";
+    const char *prog = ".basi/reuse_tsnorm.js";
     const char *cf = ".basi/.reuse_cand.ts", *hf = ".basi/.reuse_help.ts";
     FILE *p = fopen(prog, "w"); if (!p) return false;
     fwrite(TS_VERIFY_SRC, 1, strlen(TS_VERIFY_SRC), p); fclose(p);
@@ -1595,16 +1579,16 @@ static bool ts_ast_equivalent(const char *cand_body, const char *helper_body) {
     FILE *b = fopen(hf, "w"); if (!b) { unlink(prog); unlink(cf); return false; }
     fwrite(helper_body, 1, strlen(helper_body), b); fclose(b);
 
-    const char *deno = getenv("BASI_REUSE_DENO");
-    if (!deno || !*deno) deno = "deno";
+    const char *node = getenv("BASI_REUSE_NODE");
+    if (!node || !*node) node = "node";
     StringBuf cmd; sb_init(&cmd);
-    sb_append_str(&cmd, deno);
-    sb_append_str(&cmd, " run --quiet --allow-read --allow-env ");
+    sb_append_str(&cmd, node);
+    sb_append_char(&cmd, ' ');
     sb_append_str(&cmd, prog); sb_append_char(&cmd, ' ');
     sb_append_str(&cmd, cf);   sb_append_char(&cmd, ' ');
     sb_append_str(&cmd, hf);   sb_append_str(&cmd, " 2>/dev/null");
     char *cmdstr = sb_to_str(&cmd);
-    char *out = run_command_timeout(cmdstr, 4096, 40, NULL);   /* first run may fetch typescript */
+    char *out = run_command_timeout(cmdstr, 4096, 20, NULL);
     free(cmdstr);
     unlink(prog); unlink(cf); unlink(hf);
     bool eq = out && out[0] == '1';
@@ -1889,9 +1873,18 @@ char *reuse_regress_check(const char *path, const char *old_src, const char *new
         if (strcmp(o->body, fn[i].body) == 0) continue;      /* text unchanged */
         if (warned_seen(fn[i].name)) continue;               /* warn-once → re-issue applies */
 
-        bool changed = (be->verify == VERIFY_IR)
-            ? ir_fn_changed(oldf, newf, fn[i].name, iflags)
-            : !be->ast_verify(o->body, fn[i].body);
+        bool changed;
+        if (be->verify == VERIFY_IR) {
+            changed = ir_fn_changed(oldf, newf, fn[i].name, iflags);
+        } else {
+            /* AST: only a CONFIDENT change counts. The old-vs-old self-check
+             * confirms the verifier actually works for this language+function
+             * (tool present, source parses) before we trust a "different"
+             * verdict — so a missing verifier (e.g. no typescript installed)
+             * degrades to "don't flag", never a false alarm. */
+            changed = be->ast_verify(o->body, o->body)
+                   && !be->ast_verify(o->body, fn[i].body);
+        }
         if (!changed) continue;
 
         if (hits == 0)
