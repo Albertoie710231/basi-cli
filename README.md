@@ -52,7 +52,12 @@ Type `/` for an autocomplete dropdown of every slash command:
 - **llama.cpp built as shared libraries.** BASI links `-lllama`, `-lggml`, `-lggml-base`, and
   `-lllama-common` (the same shared common lib `llama-cli` uses). The Makefile assumes a Vulkan build
   (`build_vulkan/`, `-lvulkan`) — adjust `LLAMA_BUILD` and the backend lib for your setup.
-- A model in **GGUF** format. Instruct models follow the tool format most reliably.
+- A model in **GGUF** format. The agentic tool loop is most reliable with a **Qwen-family instruct**
+  model in the ~7–14B range — these emit BASI's native `<tool_call>` format, which BASI further pins
+  with a constrained tool grammar. Very small models (≤~4B) tend to lose the thread on multi-step
+  tasks, and a model whose function-calling convention BASI doesn't recognize (the grammar targets
+  Qwen/Hermes-style formats — e.g. Gemma's `tool_code` blocks aren't parsed) may not drive tools at
+  all. Any GGUF works for flat single-shot generation (`--no-tools`).
 - Optional runtime tools: `curl` (web fetch + `/cookbook` model downloads), `w3m`, `pdftotext`
   (poppler), `unzip`, and a local **SearXNG** instance with the JSON format enabled (for
   `web_search`).
@@ -160,10 +165,12 @@ for an autocomplete dropdown (↑/↓ to pick, Tab to complete).
 Local models tend to re-implement code that already exists, or "consolidate" two similar functions
 and silently change one of them — bugs that compile and pass the type-checker. BASI ships three
 deterministic guardrails for this, each decided by a **compiler or a real parser, never a heuristic
-or the LLM**. All are opt-in (default off) and degrade safely: when a language's verifier tool is
-missing, detection still works and the safety-critical steps refuse rather than guess. **Nothing is
-ever fetched from the network** — verifiers use tools already on your machine (including the
-project's own `typescript`).
+or the LLM**. Because the decision is plain C, the guards behave **identically for any model** BASI's
+tool loop can drive — a capable model, faced with a hard-block ("a passing test now fails"), reliably
+recognises the mistake and fixes it rather than shipping it. All are opt-in (default off) and degrade
+safely: when a language's verifier tool is missing, detection still works and the safety-critical
+steps refuse rather than guess. **Nothing is ever fetched from the network** — verifiers use tools
+already on your machine (including the project's own `typescript`).
 
 | Guard | Enable | What it does |
 |---|---|---|
