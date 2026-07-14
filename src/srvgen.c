@@ -7,7 +7,6 @@
 #include <string.h>
 #include <unistd.h>
 #include <time.h>
-#include <errno.h>
 #include <signal.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
@@ -92,22 +91,24 @@ pid_t srvgen_spawn(const char *server_bin, const char *model_path, int ngl, int 
 }
 
 char *srvgen_complete(int port, const char *prompt, int n_predict, double temp,
-                      int greedy, void (*emit)(const char *chunk, void *ud), void *ud,
+                      int greedy, const char *grammar,
+                      void (*emit)(const char *chunk, void *ud), void *ud,
                       double *tps, int *n_out) {
     char *esc = json_escape(prompt);
     if (!esc) return NULL;
+    char *gesc = grammar && *grammar ? json_escape(grammar) : NULL;
 
     /* write the request body to a temp file (avoids quoting a big prompt on argv) */
     char reqpath[] = "/tmp/basi_srvreq_XXXXXX";
     int rfd = mkstemp(reqpath);
-    if (rfd < 0) { free(esc); return NULL; }
+    if (rfd < 0) { free(esc); free(gesc); return NULL; }
     FILE *rf = fdopen(rfd, "w");
-    fprintf(rf,
-        "{\"prompt\":\"%s\",\"n_predict\":%d,\"temperature\":%.3f,%s"
-        "\"cache_prompt\":true,\"stream\":true}",
-        esc, n_predict, temp, greedy ? "\"top_k\":1," : "");
+    fprintf(rf, "{\"prompt\":\"%s\",\"n_predict\":%d,\"temperature\":%.3f,%s",
+            esc, n_predict, temp, greedy ? "\"top_k\":1," : "");
+    if (gesc) fprintf(rf, "\"grammar\":\"%s\",", gesc);
+    fprintf(rf, "\"cache_prompt\":true,\"stream\":true}");
     fclose(rf);
-    free(esc);
+    free(esc); free(gesc);
 
     char cmd[512];
     snprintf(cmd, sizeof cmd,
@@ -187,8 +188,12 @@ void srvgen_selftest(const char *model_path, int ngl, int ctx) {
     if (pid < 0) { fprintf(stderr, "[srv] spawn/health FAILED (see /tmp/basi_srvgen.log)\n"); return; }
     fprintf(stderr, "[srv] ready in %.1fs. streaming completion:\n---\n", now_s() - ts0);
 
+    /* optional grammar round-trip test: BASI_SRV_GRAMMAR="root ::= \"yes\" | \"no\"" */
+    const char *grammar = getenv("BASI_SRV_GRAMMAR");
+    if (grammar && *grammar) fprintf(stderr, "[srv] sending grammar (%zu bytes)\n", strlen(grammar));
+
     double tps = 0; int n = 0;
-    char *txt = srvgen_complete(port, prompt, n_predict, 0.0, 1, print_emit, NULL, &tps, &n);
+    char *txt = srvgen_complete(port, prompt, n_predict, 0.0, 1, grammar, print_emit, NULL, &tps, &n);
     fprintf(stderr, "\n---\n[srv] %d tokens, %.2f tok/s\n", n, tps);
 
     free(txt);

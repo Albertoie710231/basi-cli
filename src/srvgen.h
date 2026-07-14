@@ -21,7 +21,8 @@ pid_t srvgen_spawn(const char *server_bin, const char *model_path, int ngl, int 
  * arrive. Returns the full generated text (malloc'd; caller frees) or NULL.
  * Fills *tps (tok/s) and *n_out (tokens) if non-NULL. greedy!=0 => argmax. */
 char *srvgen_complete(int port, const char *prompt, int n_predict, double temp,
-                      int greedy, void (*emit)(const char *chunk, void *ud), void *ud,
+                      int greedy, const char *grammar,
+                      void (*emit)(const char *chunk, void *ud), void *ud,
                       double *tps, int *n_out);
 
 void srvgen_kill(pid_t pid);

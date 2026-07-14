@@ -44,6 +44,11 @@ int  basi_tools_active(const struct llama_model *model);
    format has no tool grammar, or on any error (caller proceeds unconstrained). */
 struct llama_sampler *basi_tool_grammar_sampler(const struct llama_model *model);
 
+/* Server-backend: the same tool-call grammar serialized as spliceable
+   llama-server request fields ("grammar":…,"grammar_lazy":…,"grammar_triggers":…),
+   no outer braces. NULL if no grammar. Caller frees. */
+char *basi_tool_grammar_json(const struct llama_model *model);
+
 /* Parse a finished assistant generation into tool calls. Returns the count
    (0 = none / parse failure → treat as a plain answer). On >0, *out points to
    a malloc'd array the caller frees with basi_free_tool_calls. */

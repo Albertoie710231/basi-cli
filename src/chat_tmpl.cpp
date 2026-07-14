@@ -212,6 +212,37 @@ extern "C" struct llama_sampler *basi_tool_grammar_sampler(const struct llama_mo
     }
 }
 
+// Server-backend (M2): the SAME tool-call grammar as basi_tool_grammar_sampler,
+// but serialized as the llama-server /completion request fields — the inner
+// object body (no braces) "grammar":...,"grammar_lazy":...,"grammar_triggers":[...]
+// ready to splice into a request. NULL if this format has no grammar. Caller frees.
+extern "C" char *basi_tool_grammar_json(const struct llama_model *model) {
+    if (g_tools.empty() || !model) return nullptr;
+    try {
+        if (!ensure_tmpls(model)) return nullptr;
+        llama_chat_message probe[1] = { { "user", "hi" } };
+        common_chat_templates_inputs in = make_inputs(probe, 1, true);
+        common_chat_params params = common_chat_templates_apply(g_tmpls.get(), in);
+        if (params.grammar.empty()) return nullptr;
+        if (params.grammar.compare(0, 11, "%llguidance") == 0) return nullptr;
+
+        nlohmann::json triggers = nlohmann::json::array();
+        for (const auto & t : params.grammar_triggers)
+            triggers.push_back({ {"type", (int) t.type}, {"value", t.value}, {"token", t.token} });
+
+        nlohmann::json obj;
+        obj["grammar"]          = params.grammar;
+        obj["grammar_lazy"]     = params.grammar_lazy;
+        obj["grammar_triggers"] = triggers;
+        std::string s = obj.dump();
+        if (s.size() >= 2 && s.front() == '{' && s.back() == '}')
+            s = s.substr(1, s.size() - 2);   // strip outer braces -> spliceable fragment
+        return strdup(s.c_str());
+    } catch (...) {
+        return nullptr;
+    }
+}
+
 extern "C" int basi_thinking_tags(const char **start, const char **end) {
     if (!g_have_params || !g_last_params.supports_thinking) return 0;
     if (g_last_params.thinking_start_tag.empty() ||
