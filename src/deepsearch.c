@@ -160,10 +160,13 @@ static void msgs_add(struct llama_chat_message **m, size_t *n, size_t *cap,
 static char *ds_generate(struct llama_context *dctx, const struct llama_vocab *vocab,
                          struct llama_sampler *smpl, const struct llama_model *model,
                          const struct llama_chat_message *msgs, size_t nmsg, char *fmt_buf) {
-    int len = apply_template(model, msgs, nmsg, true, fmt_buf, DEEPSEARCH_FMT_SZ);
-    if (len < 0) return NULL;
-    llama_memory_clear(llama_get_memory(dctx), true);
-    GenerateResult r = generate(dctx, vocab, smpl, fmt_buf, (size_t)len);
+    /* Server-backed: the server templates from the messages. deepsearch has cleared
+       g_tools, so generate_chat() advertises no tools and the model emits its own
+       <tool>…</tool> / <answer> ReAct format in the content (or, if it lands in the
+       reasoning stream, generate_chat promotes that to the text) — which the loop
+       below parses. dctx/vocab/smpl/model/fmt_buf are now unused. */
+    (void) dctx; (void) vocab; (void) smpl; (void) model; (void) fmt_buf;
+    GenerateResult r = generate_chat(msgs, nmsg, NULL, NULL);
     return r.text;
 }
 
