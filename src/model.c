@@ -226,84 +226,9 @@ void log_callback(enum ggml_log_level level, const char *text, void *user_data) 
     }
 }
 
-/* ── Custom ChatML template ────────────────────────────────────────── */
-
-/*
- * Format messages as ChatML. Same format for all models:
- *   <|im_start|>role\ncontent<|im_end|>\n
- *
- * If add_generation_prompt is true, appends <|im_start|>assistant\n
- * If buf is NULL, returns the required length without writing.
- */
-static int apply_chatml(
-    const struct llama_chat_message *msgs, size_t n_msgs,
-    bool add_gen_prompt,
-    char *buf, size_t buf_size)
-{
-    size_t total = 0;
-
-    #define CHATML_WRITE(s, len) do { \
-        if (buf && total + (len) < buf_size) \
-            memcpy(buf + total, (s), (len)); \
-        total += (len); \
-    } while(0)
-    #define CHATML_STR(s) CHATML_WRITE(s, strlen(s))
-
-    for (size_t i = 0; i < n_msgs; i++) {
-        CHATML_STR("<|im_start|>");
-        CHATML_STR(msgs[i].role);
-        CHATML_WRITE("\n", 1);
-        if (msgs[i].content)
-            CHATML_STR(msgs[i].content);
-        CHATML_STR("<|im_end|>\n");
-    }
-
-    if (add_gen_prompt) {
-        CHATML_STR("<|im_start|>assistant\n");
-    }
-
-    #undef CHATML_WRITE
-    #undef CHATML_STR
-
-    if (buf && total < buf_size) buf[total] = '\0';
-    return (int)total;
-}
-
-/*
- * Apply chat template with fallback. The C-API llama_chat_apply_template only
- * matches a hardcoded list of templates (no Jinja parser). Modern HF GGUFs ship
- * custom Jinja templates that it rejects with -1. When that happens, fall back
- * to plain ChatML, which is the de-facto format for Qwen/Phi/etc.
- */
-int apply_template(
-    const struct llama_model *model,
-    const struct llama_chat_message *msgs, size_t n_msgs,
-    bool add_gen_prompt,
-    char *buf, size_t buf_size)
-{
-    bool dbg = getenv("BASI_DEBUG_TEMPLATE") != NULL;
-
-    /* 1) Native: render the model's actual chat template via the jinja engine.
-          This drives every model in its real format (Gemma/DeepSeek/custom). */
-    char *rendered = basi_render_chat(model, msgs, n_msgs, add_gen_prompt);
-    if (rendered) {
-        size_t len = strlen(rendered);
-        if (dbg) fprintf(stderr, "[tmpl] native jinja render: %zu bytes\n", len);
-        if (!buf) { free(rendered); return (int)len; }       /* length-only query */
-        if (len < buf_size) { memcpy(buf, rendered, len + 1); free(rendered); return (int)len; }
-        free(rendered);   /* doesn't fit this buffer — fall through to legacy */
-        if (dbg) fprintf(stderr, "[tmpl] rendered prompt too big for buffer; falling back\n");
-    }
-
-    /* 2) Legacy fallback: llama.cpp's C-API detection, then ChatML. */
-    const char *tmpl = model ? llama_model_chat_template(model, NULL) : NULL;
-    if (tmpl) {
-        int r = llama_chat_apply_template(tmpl, msgs, n_msgs, add_gen_prompt, buf, buf_size);
-        if (dbg) fprintf(stderr, "[tmpl] fallback llama_chat_apply_template -> %d\n", r);
-        if (r >= 0) return r;
-    }
-    return apply_chatml(msgs, n_msgs, add_gen_prompt, buf, buf_size);
-}
+/* Chat templating is done server-side now (llama-server templates from the
+   messages we POST to /v1/chat/completions), so there is no in-process
+   apply_template / basi_render_chat anymore. */
 
 /* ── Model picker ──────────────────────────────────────────────────── */
 

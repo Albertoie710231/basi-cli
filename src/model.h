@@ -25,15 +25,6 @@ LaunchConfig pick_model(void);
  * count. Used by the /model command to resolve a name substring to a path. */
 int basi_list_models(char ***out);
 
-/* ── Chat template wrapper (handles non-Jinja fallback) ────────────── */
-/* Renders the conversation using the model's own chat template (jinja engine,
-   via the chat_tmpl shim), falling back to llama_chat_apply_template + ChatML
-   only if that fails. Returns the formatted length, or <0 on error. buf may be
-   NULL to query the length only. */
-int apply_template(const struct llama_model *model,
-                   const struct llama_chat_message *msgs, size_t n_msgs,
-                   bool add_gen_prompt,
-                   char *buf, size_t buf_size);
 
 /* ── Generation ────────────────────────────────────────────────────── */
 typedef struct {
