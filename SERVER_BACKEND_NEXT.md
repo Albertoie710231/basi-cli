@@ -8,16 +8,17 @@ maintained, faster path. BASI's identity (reuse pillar — llama-independent —
 agent loop, tools, prompts, deterministic-first) lives ABOVE the generation layer,
 so the pivot sharpens "its own thing," doesn't dilute it.
 
-## STATE: server-only rewrite well underway. Branch `spec-decode-mtp`, latest `f50ac68`.
+## STATE: server-only rewrite well underway. Branch `spec-decode-mtp`, latest `b3bde9e`.
 Items 1/2/4/5/5b DONE+verified. Item 6 (drop libllama) IN PROGRESS: (a) chat client +
 (b) agent-loop-over-chat DONE. **(c) native teardown MOSTLY DONE: chat+server are the
 DEFAULT/mandatory path (no env needed); spec.cpp + the 448-line in-process decode loop +
 the ENTIRE /completion path (generate/generate_server/SrvDisplay) are DELETED; ALL
 generation (agent loop, --no-tools, final-gen, summary, deepsearch) now flows through
-generate_chat → /v1/chat/completions.** model.c 1870→1108 lines; srvgen.c + srvchat.cpp
-are already libllama-free. Remaining (c): remove the DEAD run_turn renders + main.c
-native leftovers (sampler chain, ctx, g_tool_grammar) + common_chat + embed→HTTP. Then
-(d) drop the link. See §6 for the precise list.
+generate_chat → /v1/chat/completions.** model.c 1870→~1050 lines. **common_chat GUTTED
+(chat_tmpl.cpp nlohmann-only), sampler chain + all dead renders removed, deepsearch
+dctx removed — chat_tmpl.cpp + deepsearch.c are now function-libllama-free.** Remaining
+(c): main.c model+ctx load (swap statusbar off llama_n_ctx), model.c ggml gguf-reading,
+embed.c→HTTP (net-new). Then (d) drop the link. See §6 for the precise list.
 
 **Launch-script feature (`5791c05`,`b15517a`):** the model picker now configures the
 llama-server launch (SPEC-DECODE + FLASH-ATTN sections, auto-following model MTP-ness)
@@ -168,27 +169,32 @@ Server logs → `/tmp/basi_srvgen.log`. Server binds `127.0.0.1:8181`.
          generate_server(), the SrvDisplay STATE_* machine, strip_thinking_dup,
          ThinkingState, utf8_seq_len. model.c 1422→1108. srvgen_complete kept (self-test,
          libllama-free). generate_server was the last generation-path user of common_chat grammar.
-     REMAINING (c) — precise, all now DEAD code (chat is the only path):
-       - **run_turn dead renders**: 5 `apply_template(...)` sites (turn-start ~2936, in-loop
-         reclaim re-render ~3006, post-tool ~3145/3154, reprompt ~3192) + the delta_unsafe/
-         kv_resync_full/prev_len machinery + srv_update_ctx_used — all feed prompt/prompt_len
-         which nothing reads now (currently `(void)`-silenced). Remove them → basi_render_chat
-         becomes dead.
-       - **main.c native leftovers**: the sampler chain (llama_sampler_* + SAMPLER_TAIL),
-         g_tool_grammar + basi_tool_grammar_sampler, the ctx create + VRAM-retry, llama_n_ctx/
-         llama_get_memory (statusbar/`context_used_tokens` — replace with basi_srv_ctx_used +
-         a stored srv_ctx total), tokenize in srv_update_ctx_used (dead).
-       - **chat_tmpl.cpp**: drop common_chat grammar/parse/render (basi_render_chat,
-         basi_tool_grammar_sampler/_json, basi_parse_tool_calls, basi_thinking_tags,
-         basi_tools_active→just return 1) once the above stop calling them; KEEP the nlohmann
-         serializers (basi_messages_to_json/basi_tools_to_json).
-       - **deepsearch.c**: delete the now-unused dctx create + dsmpl/xsmpl samplers.
-       - **model load**: once nothing uses the vocab_only model/vocab, drop the load + ctx +
-         llama_backend. `llama_chat_message` POD {role,content} → local struct so headers need
-         no llama.h.
-       - **embed.c**: route to a SPAWNED embedder llama-server `--embedding` + `/embedding`.
-     Surface now: main.c 33, embed.c 23, chat_tmpl.cpp 21, deepsearch.c 16 symbols;
-     srvgen.c + srvchat.cpp already ZERO. Then (d) drop `-lllama -lllama-common -lggml*`.
+     DONE (steps 8–11, `b382498`…`b3bde9e`): removed ALL run_turn dead renders +
+     delta/kv machinery + srv_update_ctx_used; removed the in-process sampler chain +
+     g_tool_grammar; **gutted common_chat** — chat_tmpl.cpp rewritten to keep ONLY the
+     nlohmann serializers (2 llama symbols, TYPE-only), deleted apply_template/
+     apply_chatml + basi_render_chat/tool_grammar_*/parse_tool_calls/thinking_tags/
+     tools_active; native_tools hardcoded 1; removed deepsearch's dead dctx + samplers
+     (now function-libllama-free). Verified at each step (chat tool loops + multi-turn
+     recall + deepsearch).
+     REMAINING (c) — the last function-level libllama users:
+       - **main.c** (~11 fns): the vocab_only MODEL LOAD (llama_model_load_from_file/
+         default_params/get_vocab/free) + CTX (llama_init_from_model/free/n_ctx/
+         get_memory/memory_seq_pos_max/memory_clear/context_default_params). To drop:
+         make `context_used_tokens` return basi_srv_ctx_used unconditionally; store the
+         server ctx size in a global and swap `llama_n_ctx(ctx)`→it (statusbar +
+         format_context_meter); make kv_resync_full just reset prev_len (drop
+         llama_memory_clear); then delete the model+ctx load entirely (nothing uses
+         model/vocab/ctx after — basi_srv_model was only for the deleted grammar).
+       - **model.c** (3 fns): model_init (ggml_backend_load_all + llama_log_set) + the
+         picker's read_gguf_arch (ggml_dtype_bytes_per_elem, VRAM estimate). The picker
+         reads GGUF metadata off disk directly — reimplement the dtype-size lookup as a
+         static table to drop ggml, and model_init becomes unnecessary once no model loads.
+       - **embed.c** (15 fns, NET-NEW WORK): route to a SPAWNED embedder llama-server
+         (`--embedding`) + `/embedding` HTTP. The one piece that's new code, not deletion.
+       - `llama_chat_message` POD {role,content} → a local struct so headers drop llama.h.
+     Surface now: main.c 19, embed.c 23, model.c 6, deepsearch.c 4 (TYPES only),
+     chat_tmpl.cpp 2 (TYPE only); srvgen.c + srvchat.cpp ZERO. Then (d) drop the link.
    - ⬜ **(d) drop link** — remove `-lllama -lllama-common -lggml* -lvulkan` and the
      `-I$(LLAMA_DIR)/...` includes (keep a vendored nlohmann). Verify `ldd basi-cli`
      shows no libllama/libggml. ABI-coupling gotcha GONE.
