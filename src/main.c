@@ -1509,11 +1509,10 @@ static void fmt_token_count(char *buf, size_t n, int t) {
     else                 snprintf(buf, n, "%dk", (t + 500) / 1000);
 }
 
-/* Format a colour-graded "ctx 12.3k/32k 38%" gauge into `out`. The denominator
- * is llama_n_ctx(ctx) — the context the model was ACTUALLY loaded with, which
- * may be smaller than the requested CONTEXT_SIZE if the load OOM-retry halved
- * it. Colour is the at-a-glance warning: green < 70%, amber 70-89%, red >= 90%.
- * Trailing reset returns to the caller's dim style. */
+/* Format a colour-graded "ctx 12.3k/32k 38%" gauge into `out`. The denominator is
+ * basi_srv_ctx_total — the context the llama-server was launched with. Colour is
+ * the at-a-glance warning: green < 70%, amber 70-89%, red >= 90%. Trailing reset
+ * returns to the caller's dim style. */
 static void format_context_meter(struct llama_context *ctx, char *out, size_t n) {
     int used  = context_used_tokens(ctx);
     int total = basi_srv_ctx_total;
@@ -3367,82 +3366,19 @@ int main(int argc, char **argv) {
 
     model_init();
 
-    /* Server-backed generation only: the weights live in the spawned llama-server,
-       so BASI loads only the vocab/metadata (cheap) — for its own templating,
-       tokenization and tool-grammar derivation. (The in-process decode path has
-       been removed; generate() now always delegates to the server.) */
+    /* Server-backed generation only: the weights + KV + templating + tool grammar
+       all live in the spawned llama-server. BASI loads NO model in-process — the
+       model/vocab/ctx handles stay NULL (retained only in the signatures of
+       functions that no longer touch them). */
     const bool use_server = true;
-    struct llama_model_params model_params = llama_model_default_params();
-    model_params.n_gpu_layers = n_gpu_layers;
-    model_params.vocab_only   = use_server;
+    struct llama_model *model = NULL;
+    const struct llama_vocab *vocab = NULL;
+    struct llama_context *ctx = NULL;
 
-    struct llama_model *model = llama_model_load_from_file(model_path, model_params);
-    if (!model) {
-        fprintf(stderr, "Error: Failed to load model from %s\n", model_path);
-        return 1;
-    }
-
-    const struct llama_vocab *vocab = llama_model_get_vocab(model);
-    if (!vocab) {
-        fprintf(stderr, "Error: Failed to get vocabulary from model\n");
-        llama_model_free(model);
-        return 1;
-    }
-
-    /* In one-shot deep-research the main context is never used for generation
-       (we run deep_search in its own large context, then exit), so shrink it to
-       free VRAM for the research context — important on a single GPU where two
-       full-size contexts won't both fit. */
+    /* In one-shot deep-research shrink the server context to free VRAM. */
     if (oneshot_deepsearch_q) ctx_override = 4096;
 
-    /* Create context */
-    struct llama_context_params ctx_params = llama_context_default_params();
-    ctx_params.n_ctx   = ctx_override > 0 ? (uint32_t)ctx_override : CONTEXT_SIZE;
-    ctx_params.n_batch = ctx_params.n_ctx;
-    /* Use physical cores (half of hyperthreaded count) for CPU layers */
-    int n_cores = (int)sysconf(_SC_NPROCESSORS_ONLN);
-    if (n_cores > 2) {
-        int phys = n_cores / 2;  /* physical cores, no hyperthreading */
-        ctx_params.n_threads = phys;
-        ctx_params.n_threads_batch = phys;
-    }
-
-    /* Context allocation (KV cache + compute buffers) is where VRAM actually
-     * runs out — the picker's estimate is only a guess. The model weights are
-     * already resident, so on failure we halve n_ctx and retry WITHOUT
-     * reloading. This is the hard backstop that guarantees we never crash on a
-     * mis-estimate: it degrades context length until the KV cache fits. */
-    struct llama_context *ctx = NULL;
-    {
-        const uint32_t requested_ctx = ctx_params.n_ctx;
-        const uint32_t min_ctx = 2048;
-        while (1) {
-            ctx = llama_init_from_model(model, ctx_params);
-            if (ctx) break;
-            if (ctx_params.n_ctx <= min_ctx) break;
-            uint32_t reduced = ctx_params.n_ctx / 2;
-            if (reduced < min_ctx) reduced = min_ctx;
-            fprintf(stderr,
-                "\033[33m[VRAM: context of %u didn't fit — retrying at %u]\033[0m\n",
-                ctx_params.n_ctx, reduced);
-            ctx_params.n_ctx   = reduced;
-            ctx_params.n_batch = reduced;
-        }
-        if (ctx && ctx_params.n_ctx < requested_ctx) {
-            fprintf(stderr,
-                "\033[33m[VRAM: loaded with context %u instead of %u to fit available memory]\033[0m\n",
-                ctx_params.n_ctx, requested_ctx);
-        }
-    }
-    if (!ctx && !use_server) {
-        fprintf(stderr, "Error: Failed to create context (out of VRAM even at minimum size)\n");
-        llama_model_free(model);
-        return 1;
-    }
-
-    /* Server-backed mode: spawn the llama-server that holds the weights + does
-       generation, and route generate() to it. BASI keeps only the vocab_only
-       model handle (for templating/grammar/tokenization). */
+    /* Spawn the llama-server that holds the weights + does generation. */
     if (use_server) {
         const char *sbin = getenv("BASI_SERVER_BIN");
         if (!sbin || !*sbin) sbin = "/home/alberto/llama.cpp/build_vulkan/bin/llama-server";
@@ -3482,7 +3418,6 @@ int main(int argc, char **argv) {
         g_srv_pid = srvgen_spawn_script(script, 8181, "/tmp/basi_srvgen.log", 300);
         if (g_srv_pid < 0) {
             fprintf(stderr, "Error: llama-server failed to start (see /tmp/basi_srvgen.log and %s)\n", script);
-            llama_model_free(model);
             return 1;
         }
         atexit(kill_srv);
@@ -3610,7 +3545,7 @@ int main(int argc, char **argv) {
     if (!oneshot) {
         if (resume_path) {
             session_load_into(resume_path, &messages, &msg_count, &msg_cap,
-                              (int)ctx_params.n_ctx);
+                              basi_srv_ctx_total);
             session_fp = fopen(resume_path, "a");
             session_path = strdup(resume_path);
             printf("\033[90m[Resumed session: %s]\033[0m\n\n", resume_path);
@@ -3621,7 +3556,7 @@ int main(int argc, char **argv) {
                 char *load_path = session_picker(sess_dir);
                 if (load_path) {
                     session_load_into(load_path, &messages, &msg_count, &msg_cap,
-                                      (int)ctx_params.n_ctx);
+                                      basi_srv_ctx_total);
                     session_fp = fopen(load_path, "a");
                     session_path = strdup(load_path);
                     printf("\033[90m[Session: %s]\033[0m\n\n", load_path);
@@ -3708,9 +3643,6 @@ cleanup:
         free((void *)messages[i].content);
     free(messages);
     history_free_all();
-
-    llama_free(ctx);
-    llama_model_free(model);
 
     /* --no-tools keeps stdout to the completion alone; no sign-off banner. */
     if (!no_tools) printf("\nGoodbye!\n");
