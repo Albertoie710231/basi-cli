@@ -56,13 +56,6 @@ extern SrvSampling basi_srv_sampling;
    around its own ReAct loop so the main tool grammar can't leak in). */
 extern int basi_srv_suppress_grammar;
 
-GenerateResult generate(
-    struct llama_context *ctx,
-    const struct llama_vocab *vocab,
-    struct llama_sampler *smpl,
-    const char *prompt,
-    size_t prompt_len);
-
 /* Server-chat generation (item 6b): serialize `messages` (+ registered tools) and
    drive /v1/chat/completions. Returns the answer text (res.text) + the server's
    prompt token count (res.prompt_tokens) and fills tc_out/n_tc_out with the
