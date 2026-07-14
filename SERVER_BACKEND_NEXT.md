@@ -8,7 +8,25 @@ maintained, faster path. BASI's identity (reuse pillar — llama-independent —
 agent loop, tools, prompts, deterministic-first) lives ABOVE the generation layer,
 so the pivot sharpens "its own thing," doesn't dilute it.
 
-## STATE: the core works. Branch `spec-decode-mtp`, latest `521892e`.
+## STATE: the core works. Branch `spec-decode-mtp`, latest `eaab47b`.
+
+**2026-07-14 session added (committed `eaab47b`):**
+- **Item 1 DONE — display fidelity.** `SrvDisplay` streaming state machine in
+  model.c mirrors native generate()'s STATE_* filter over the SSE chunks: `<think>`
+  collapses to the spinner box (or dim `[thinking]` under Ctrl+T), native
+  `<tool_call>` markup is suppressed, answer text is markdown-rendered,
+  forced-open `<think>` handled. Display only; returned text keeps markup for the
+  parser. Verified: zero leaked think/tool markup, tool executed and fed back.
+- **Item 2 DONE — sampling parity.** `SrvSampling` (srvgen.h) threads BASI's native
+  knobs (temp, repeat_penalty 1.1 + repeat_last_n 256, min_p 0.05, top_k, top_p,
+  seed) from main.c into the /completion request; temp==0 pins top_k:1. Verified:
+  server accepts them, coherent output.
+- **Item 3 REASSESSED — lower priority than the doc implied.** `embed.c` loads its
+  OWN dedicated retrieval embedder (jina/bge) in-process, independent of the chat
+  model, so RAG/reuse already work in server mode. Routing to the chat server's
+  `/embedding` would give chat-model embeddings (worse for retrieval), so item 3 is
+  only meaningful as a prerequisite for item 6 (drop libllama) — e.g. spawn a
+  second small server for the embedder. Not a correctness fix.
 
 **DONE + TESTED (all committed):**
 - **M1** `c3a3a3e` — `src/srvgen.{c,h}`: spawn llama-server (fork/exec + `/health`
@@ -42,19 +60,27 @@ BASI_SERVER_SELFTEST=1 BASI_SRV_GRAMMAR='root ::= "yes" | "no"' ... ./basi-cli .
 Server logs → `/tmp/basi_srvgen.log`. Server binds `127.0.0.1:8181`.
 
 ## REMAINING (refinement/cleanup — no unknowns left)
-1. **Display fidelity** (most visible). `generate_server()`'s `srv_display_emit` streams
-   chunks raw → some `<think>` / `<tool_call>` markup shows. Native has a full
-   per-char state machine (model.c generate(), STATE_* + openers[]). Rebuild an
-   equivalent streaming state machine that hides thinking + tool markup live. Keep
-   `strip_thinking_dup()` for the returned/stored text.
-2. **Sampling parity** — `generate_server` sends temp=0.4 + the grammar only. Add
-   BASI's repeat_penalty(1.1)/min_p(0.05)/top_k/seed to the request so quality
-   matches native (fields: `repeat_penalty`, `min_p`, `top_k`, `seed`).
-3. **Embeddings** — route `embed.c` to the server `/embedding` endpoint (RAG/reuse).
+1. ~~**Display fidelity**~~ ✅ DONE `eaab47b` (see above).
+2. ~~**Sampling parity**~~ ✅ DONE `eaab47b` (see above).
+3. **Embeddings** — reassessed (see above): only meaningful for item 6. Deprioritized;
+   embed.c already works in server mode via its own in-process embedder.
 4. **deepsearch** — `ds_generate()` currently uses in-process ctx/sampler; route to srvgen.
-5. **Lifecycle / model-switch** — `/model` re-execs today; make it restart the server.
-   Harden the interactive REPL for the vocab_only/NULL-ctx case (statusbar ctx meter,
-   `kv_resync_full`, `context_used_tokens` — the `-p` path is already clean).
+5. **Lifecycle / model-switch** — partially done:
+   - ✅ **Interactive REPL context accounting** (`<next commit>`). ctx is a valid but
+     empty vocab_only context in server mode (no crash), but the local KV never fills
+     so the meter read `0/33k 0%`, compaction NEVER fired, and the model's
+     "tokens remaining" hint was always wrong. Fixed: `srv_update_ctx_used()` tokenizes
+     each rendered prompt and `context_used_tokens()` returns it when `basi_srv_port>0`
+     — meter, reclaim trigger, and hint now honest. ALSO fixed a latent bug: the
+     KV-delta feed (`formatted_buf+prev_len`) would send only the tail to the server
+     (which prefix-caches the FULL prompt itself), losing history for non-thinking
+     models — server mode now always feeds the full prompt. Verified: meter grows
+     (2.5k→2.6k), turn-2 recalled "42" from turn-1, compaction triggers at used=2529.
+   - ⬜ **`/model` switch** still re-execs (spawns a fresh process → fresh server).
+     Could instead restart just the server in-process. Low priority — re-exec works.
+   - Note: `summarize_head()` (COMPACT_SUMMARY/HYBRID only, NOT the default RETRIEVE)
+     still decodes into the local vocab_only ctx and would break in server mode. Only
+     matters if someone sets BASI_COMPACT=summary; route it through srvgen when addressed.
 6. **Drop the libllama link** once the above are done → kills the ABI-coupling gotcha
    for good. BASI would still link a *small* piece for vocab_only tokenization/template
    (or move templating to the server chat endpoint and drop it entirely).

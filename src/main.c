@@ -1495,7 +1495,22 @@ static void repl_add_message(struct llama_chat_message **messages,
  * This measures live context OCCUPANCY (what decides the context limit),
  * which is distinct from the cumulative session token counts /cost reports
  * (those measure throughput across the whole session). */
+/* Server mode holds the KV inside llama-server, not our (empty, vocab_only) local
+   context — so measuring llama_memory would always report 0. Instead we track the
+   exact token count of the last prompt rendered and sent to the server; the ctx
+   meter, the compaction trigger, and the model's "tokens remaining" hint all read
+   this. Updated after every render via srv_update_ctx_used(). */
+static int basi_srv_ctx_used = 0;
+static void srv_update_ctx_used(const struct llama_vocab *vocab, const char *rendered, int len) {
+    if (basi_srv_port <= 0 || !vocab || !rendered || len <= 0) return;
+    /* parse_special so the chat-template control tokens count as the server counts
+       them; NULL/0 buffer just returns the (negated) token count needed. */
+    int n = -llama_tokenize(vocab, rendered, len, NULL, 0, /*add_special*/ false, /*parse_special*/ true);
+    basi_srv_ctx_used = n > 0 ? n : 0;
+}
+
 static int context_used_tokens(struct llama_context *ctx) {
+    if (basi_srv_port > 0) return basi_srv_ctx_used;   /* server owns the KV, not us */
     llama_pos m = llama_memory_seq_pos_max(llama_get_memory(ctx), 0);
     return m < 0 ? 0 : (int)m + 1;
 }
@@ -2923,6 +2938,7 @@ static void run_agentic_turn(char *user_input,
             fflush(stdout);
             return;
         }
+        srv_update_ctx_used(vocab, formatted_buf, new_len);   /* server-mode ctx meter */
 
         /* Delta-prompt invariant guard. The KV holds the prefix up to prev_len
            and we feed only formatted_buf+prev_len, trusting the render to grow
@@ -2942,7 +2958,10 @@ static void run_agentic_turn(char *user_input,
                (Costs a full prefill per turn for thinking models — correct over
                fast; a future optimization could surgically drop the think tokens
                from the KV instead.) */
-        bool delta_unsafe = (prev_len > (size_t)new_len) || basi_thinking_tags(NULL, NULL);
+        /* Server mode has no local KV to delta against — the server prefix-caches
+           the FULL prompt itself (cache_prompt=true), so a delta would send only
+           the tail as the entire prompt and lose all history. Always feed full. */
+        bool delta_unsafe = (prev_len > (size_t)new_len) || basi_thinking_tags(NULL, NULL) || basi_srv_port > 0;
         if (delta_unsafe) {
             if (getenv("BASI_DEBUG_RECLAIM"))
                 fprintf(stderr, "[delta] resync (prev_len=%zu new_len=%d thinking=%d)\n",
@@ -3073,8 +3092,10 @@ static void run_agentic_turn(char *user_input,
                         TOOL_RESULT_MAX_BYTES);
                 print_tool_result_line(tool_result, dropped);
 
-                llama_memory_t mem = llama_get_memory(ctx);
-                int used = llama_memory_seq_pos_max(mem, 0) + 1;
+                /* context_used_tokens() reads the server's tracked prompt count in
+                   server mode, or the local KV otherwise — so the budget hint the
+                   model sees is honest in both. */
+                int used = context_used_tokens(ctx);
                 int remaining = (int)llama_n_ctx(ctx) - used;
 
                 if (native_tools) {
@@ -3129,12 +3150,13 @@ static void run_agentic_turn(char *user_input,
                     fflush(stdout);
                     break;
                 }
+                srv_update_ctx_used(vocab, formatted_buf, next_len);   /* server-mode ctx meter */
                 int prev = apply_template(
                     model, messages, msg_count - 1, false, NULL, 0);
                 /* Same non-monotonic-render guard as the turn-start delta: if the
                    all-but-last render is longer than the full one, the delta would
                    underflow — resync the KV and feed the whole prompt instead. */
-                if (prev < 0 || prev > next_len) {
+                if (prev < 0 || prev > next_len || basi_srv_port > 0) {   /* server: always full prompt */
                     kv_resync_full(ctx, prev_len_p);
                     prev = 0;
                 }
@@ -3171,7 +3193,7 @@ static void run_agentic_turn(char *user_input,
                                             formatted_buf, FORMATTED_BUF_SZ);
                     if (nl < 0) { printf("Error: Failed to apply chat template\n"); break; }
                     int pv = apply_template(model, messages, msg_count - 1, false, NULL, 0);
-                    if (pv < 0 || pv > nl) { kv_resync_full(ctx, prev_len_p); pv = 0; }
+                    if (pv < 0 || pv > nl || basi_srv_port > 0) { kv_resync_full(ctx, prev_len_p); pv = 0; }
                     prompt = formatted_buf + pv;
                     prompt_len = (size_t)nl - (size_t)pv;
                     printf("\n");
