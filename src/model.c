@@ -107,6 +107,11 @@ const struct llama_model *basi_srv_model = NULL;
    temp 0.4, repeat_penalty 1.1 over 256 tokens, min_p 0.05, top_k/top_p/seed off. */
 SrvSampling basi_srv_sampling = { .temperature = 0.4, .repeat_penalty = 1.1, .repeat_last_n = 256,
                                   .min_p = 0.05, .top_k = 0, .top_p = 1.0, .seed = -1 };
+/* When set, generate_server() omits the tool-call grammar. deepsearch drives its
+   own ReAct loop with a private sampler chain that (in native mode) carries no
+   grammar; this flag reproduces that on the server path so the main tool grammar
+   can't leak into deepsearch's rounds or its final synthesis. */
+int basi_srv_suppress_grammar = 0;
 
 /* Remove <think>…</think> spans from a response (unless generate_keep_think).
  * Returns a malloc'd copy. */
@@ -366,7 +371,8 @@ static void srv_display_finish(SrvDisplay *d) {
 static GenerateResult generate_server(const char *prompt) {
     GenerateResult res = { NULL, 0, 0, 0.0, 0.0 };
 
-    char *frag = basi_srv_model ? basi_tool_grammar_json(basi_srv_model) : NULL;
+    char *frag = (basi_srv_model && !basi_srv_suppress_grammar)
+                     ? basi_tool_grammar_json(basi_srv_model) : NULL;
 
     long cap = 0; { const char *e = getenv("BASI_MAX_TOKENS"); if (e && *e) cap = atol(e); }
     int n_predict = cap > 0 ? (int) cap : -1;

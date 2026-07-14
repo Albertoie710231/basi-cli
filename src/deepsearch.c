@@ -288,6 +288,12 @@ char *execute_deep_search(struct llama_model *model,
     /* Keep <think> in the model's turns so reasoning models stay consistent. */
     sig_atomic_t prev_keep_think = generate_keep_think;
     generate_keep_think = 1;
+    /* Server mode: keep the MAIN tool-call grammar out of deepsearch's rounds and
+       synthesis — deepsearch drives its own ReAct format, and in native mode its
+       sampler carries no grammar. Without this the grammar leaks in and the final
+       synthesis degenerates into a stray tool query instead of an answer. */
+    int prev_suppress_grammar = basi_srv_suppress_grammar;
+    basi_srv_suppress_grammar = 1;
 
     struct sigaction old_sa, sa;
     memset(&sa, 0, sizeof(sa));
@@ -464,6 +470,7 @@ char *execute_deep_search(struct llama_model *model,
     generation_interrupted = 0;
     generate_quiet = prev_quiet;
     generate_keep_think = prev_keep_think;
+    basi_srv_suppress_grammar = prev_suppress_grammar;
     for (size_t i = 0; i < nmsg; i++) free((void *)msgs[i].content);
     free(msgs);
     free(fmt_buf);

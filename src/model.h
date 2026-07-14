@@ -50,6 +50,9 @@ extern const struct llama_model *basi_srv_model;
 /* Sampling knobs for the server /completion request (filled by main.c to mirror
    the native sampler chain). */
 extern SrvSampling basi_srv_sampling;
+/* When nonzero, generate_server() omits the tool-call grammar (deepsearch sets it
+   around its own ReAct loop so the main tool grammar can't leak in). */
+extern int basi_srv_suppress_grammar;
 
 GenerateResult generate(
     struct llama_context *ctx,
