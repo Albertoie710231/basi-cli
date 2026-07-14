@@ -8,7 +8,10 @@ maintained, faster path. BASI's identity (reuse pillar — llama-independent —
 agent loop, tools, prompts, deterministic-first) lives ABOVE the generation layer,
 so the pivot sharpens "its own thing," doesn't dilute it.
 
-## STATE: the core works. Branch `spec-decode-mtp`, latest `eaab47b`.
+## STATE: the core works + refinement done. Branch `spec-decode-mtp`, latest `a8fcc5b`.
+Items 1/2/4/5/5b DONE+verified. Item 6 (drop libllama) IN PROGRESS: phases (a) chat
+client + (b)pt1 serialization DONE+verified; (b)pt2 wiring + (c) delete-native + (d)
+drop-link remaining (see §6). User greenlit the full server-only rewrite.
 
 **2026-07-14 session added (committed `eaab47b`):**
 - **Item 1 DONE — display fidelity.** `SrvDisplay` streaming state machine in
@@ -105,19 +108,45 @@ Server logs → `/tmp/basi_srvgen.log`. Server binds `127.0.0.1:8181`.
    - n_ctx / chat_template / bos/eos → **`/props`**.
    - embeddings → `/embedding` (embed.c is already self-contained in-process).
 
-   **Scope: a real rearchitecture, not an edit.** ~half the current libllama surface
-   is the NATIVE (non-server) generate() path — `llama_decode`/batch/samplers/
-   `llama_get_memory` in model.c + deepsearch's own `dctx`. Dropping libllama means
-   committing to **server-only** (delete the native path) and turning templating/
-   tokenization/grammar/parse into HTTP calls. Suggested phasing:
-     (a) route `apply_template`/tokenization through the server endpoints behind the
-         existing vocab_only handle (still linked, but usage centralized);
-     (b) switch tool handling to `/v1/chat/completions`-with-tools so the server owns
-         grammar+parse (removes chat_tmpl.cpp's grammar code);
-     (c) delete the native generate()/sampler/ctx path (server becomes mandatory);
-     (d) drop `-lllama -lllama-common -lggml*` from the link → ABI gotcha gone.
-   Needs a product call (native in-process mode goes away). NOT started — endpoint
-   evidence gathered; recommend greenlight before the multi-step (b)/(c) work.
+   **User GREENLIT the full server-only rewrite (2026-07-14).** ~half the current
+   libllama surface is the NATIVE generate() path — `llama_decode`/batch/samplers/
+   `llama_get_memory` in model.c + deepsearch's own `dctx` — which gets DELETED
+   (native in-process mode goes away). Phasing + PROGRESS:
+
+   - ✅ **(a) chat client** (`8d1c3c7`). `src/srvchat.{h,cpp}` — `srvchat_complete()`
+     POSTs `/v1/chat/completions` (stream=true, tools), parses SSE deltas (content,
+     server-separated `reasoning_content`, incrementally-streamed `tool_calls`) +
+     final `usage.prompt_tokens` + `timings` tok/s. nlohmann + curl only, NO libllama.
+     Self-test `BASI_SRV_CHAT_SELFTEST=1`. Verified: reasoning streams, structured
+     `bash({"command":"ls -la"})` assembled, prompt_tokens/tps captured.
+   - ✅ **(b) pt1 serialization** (`a8fcc5b`). `basi_messages_to_json()` /
+     `basi_tools_to_json()` (chat_tmpl.cpp, nlohmann-only): BASI messages+tools →
+     OpenAI JSON. Roles map: tool_call→assistant+tool_calls[] (synthetic `call_N`
+     id); tool_result→role:"tool"+`tool_call_id`. Round-trip `BASI_SRV_CHAT_MSGTEST=1`
+     verified: model ANSWERS FROM an injected tool_result (id-pairing templates right).
+   - ⬜ **(b) pt2 WIRING (next)** — the run_turn surgery. Add `generate_chat(messages,
+     msg_count, &tool_calls_out, &n_out)` in model.c: build msgs/tools JSON →
+     `srvchat_complete` with a display cb (reasoning→thinking box, content→md answer;
+     SIMPLER than SrvDisplay — reasoning is pre-separated, no `<think>` tag parsing) →
+     return content as GenerateResult.text + STRUCTURED tool_calls (convert SrvToolCall
+     →BasiToolCall, reuse the existing dispatch). In `run_turn` (main.c ~2857-3241),
+     when server-chat: SKIP apply_template + prev_len delta + `basi_parse_tool_calls`;
+     feed the structured tool_calls straight to the dispatch; take ctx-used from
+     `r->prompt_tokens` (drop `srv_update_ctx_used` tokenize). Gate on a flag first
+     (BASI_SERVER_CHAT) to keep the /completion path as fallback until proven, then
+     make default. deepsearch: point ds_generate at the same chat path.
+   - ⬜ **(c) delete native path** — remove model.c generate() decode loop + samplers +
+     the ThinkingState machine + SrvDisplay(/completion), deepsearch `dctx`, spec.cpp
+     (dead-end), the `common_chat` grammar/parse/render in chat_tmpl.cpp (keep only the
+     nlohmann serializers), main.c model-load/ctx/sampler-chain. Route embed.c → a
+     SPAWNED embedder llama-server (jina/bge) `--embedding` + `/embedding` (2nd server;
+     keeps retrieval quality). `llama_chat_message` is a POD {role,content} — replace
+     with a local struct so headers need no llama.h.
+   - ⬜ **(d) drop link** — remove `-lllama -lllama-common -lggml* -lvulkan` and the
+     `-I$(LLAMA_DIR)/...` includes (keep a vendored nlohmann). Verify `ldd basi-cli`
+     shows no libllama/libggml. ABI-coupling gotcha GONE.
+
+   Endpoint evidence + serialization + client all PROVEN; remaining is plumbing.
 
 ## GOTCHAS / NOTES
 - Branch `spec-decode-mtp` also carries the **PARKED native-MTP attempt** (`src/spec.{c,h}`,
