@@ -8,7 +8,17 @@ maintained, faster path. BASI's identity (reuse pillar — llama-independent —
 agent loop, tools, prompts, deterministic-first) lives ABOVE the generation layer,
 so the pivot sharpens "its own thing," doesn't dilute it.
 
-## STATE: server-only rewrite well underway. Branch `spec-decode-mtp`, latest `e3670bb`.
+## ✅✅ COMPLETE (2026-07-14, `7dd147b`): BASI IS A PURE HTTP CLIENT — ZERO LIBLLAMA LINKED.
+`ldd basi-cli` shows no libllama/libggml. The ABI-coupling gotcha is GONE. All of
+item 6 (a→d) done: chat client, agent-loop-over-/v1/chat/completions, native path
+fully deleted (~2000 lines), common_chat gutted, embed.c→spawned embedder /embedding,
+link dropped (LIBS = -lm -lvulkan). llama.cpp headers stay on the include path
+(compile-time opaque types only) + vendored nlohmann. Verified end-to-end: tool loops,
+multi-turn recall, deepsearch web loop, RAG retrieval, ctx meter, /model switch.
+Follow-ups (optional): llama_chat_message POD → local struct to drop llama.h entirely;
+un-bundle the cookbook.c commit; split winning work onto a clean `server-backend` branch.
+
+## (historical) STATE: server-only rewrite well underway. Branch `spec-decode-mtp`, latest `e3670bb`.
 Items 1/2/4/5/5b DONE+verified. Item 6 (drop libllama) IN PROGRESS: (a) chat client +
 (b) agent-loop-over-chat DONE. **(c) native teardown MOSTLY DONE: chat+server are the
 DEFAULT/mandatory path (no env needed); spec.cpp + the 448-line in-process decode loop +
