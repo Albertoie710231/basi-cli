@@ -38,7 +38,6 @@
 #include "tooldefs.h"
 #include "cookbook.h"
 #include "slashmenu.h"
-#include "spec.h"
 #include "srvgen.h"
 #include "srvchat.h"
 
@@ -3611,17 +3610,6 @@ int main(int argc, char **argv) {
         basi_srv_port  = 8181;
         basi_srv_model = model;
         fprintf(stderr, "\033[90m[server mode] ready — generation delegated to llama-server\033[0m\n");
-    }
-
-    /* Hidden spec-decode self-test (BASI_SPEC_SELFTEST=1): plain-greedy vs
-       spec-greedy A/B on a fixed prompt, report lossless+speed, then exit.
-       Milestone-1 verification of the spec shim before it's wired into generate(). */
-    if (getenv("BASI_SPEC_SELFTEST")) {
-        basi_spec_selftest(model, ctx, model_path, (int)ctx_params.n_ctx, n_gpu_layers);
-        llama_free(ctx);
-        llama_model_free(model);
-        llama_backend_free();
-        return 0;
     }
 
     /* Create sampler chain */
