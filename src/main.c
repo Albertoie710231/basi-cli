@@ -1495,19 +1495,10 @@ static void repl_add_message(struct llama_chat_message **messages,
  * This measures live context OCCUPANCY (what decides the context limit),
  * which is distinct from the cumulative session token counts /cost reports
  * (those measure throughput across the whole session). */
-/* Server mode holds the KV inside llama-server, not our (empty, vocab_only) local
-   context — so measuring llama_memory would always report 0. Instead we track the
-   exact token count of the last prompt rendered and sent to the server; the ctx
-   meter, the compaction trigger, and the model's "tokens remaining" hint all read
-   this. Updated after every render via srv_update_ctx_used(). */
+/* Server mode holds the KV inside llama-server, not us — so we track the server's
+   prompt token count (from the /v1/chat/completions `usage`, set by generate_chat)
+   and the ctx meter / compaction trigger / "tokens remaining" hint all read this. */
 static int basi_srv_ctx_used = 0;
-static void srv_update_ctx_used(const struct llama_vocab *vocab, const char *rendered, int len) {
-    if (basi_srv_port <= 0 || !vocab || !rendered || len <= 0) return;
-    /* parse_special so the chat-template control tokens count as the server counts
-       them; NULL/0 buffer just returns the (negated) token count needed. */
-    int n = -llama_tokenize(vocab, rendered, len, NULL, 0, /*add_special*/ false, /*parse_special*/ true);
-    basi_srv_ctx_used = n > 0 ? n : 0;
-}
 
 static int context_used_tokens(struct llama_context *ctx) {
     if (basi_srv_port > 0) return basi_srv_ctx_used;   /* server owns the KV, not us */
@@ -2931,52 +2922,10 @@ static void run_agentic_turn(char *user_input,
             }
         }
 
-        /* Apply chat template — renders the model's native format via the jinja
-           engine (chat_tmpl shim), with ChatML fallback. */
-        int new_len = apply_template(
-            model, messages, msg_count, true,
-            formatted_buf, FORMATTED_BUF_SZ);
-
-        if (new_len < 0) {
-            printf("Error: Failed to apply chat template\n");
-            fflush(stdout);
-            return;
-        }
-        srv_update_ctx_used(vocab, formatted_buf, new_len);   /* server-mode ctx meter */
-
-        /* Delta-prompt invariant guard. The KV holds the prefix up to prev_len
-           and we feed only formatted_buf+prev_len, trusting the render to grow
-           monotonically. Some templates DON'T — notably thinking models (Qwen3.x)
-           that restructure prior turns — so this render can come out SHORTER than
-           prev_len, underflowing prompt_len to a huge size_t and crashing tokenize.
-           When that happens the cached prefix is invalid anyway: drop the KV and
-           decode the whole freshly-rendered prompt. */
-        /* Resync the KV when a cross-turn delta can't be trusted:
-           (a) prev_len > new_len — a non-monotonic render underflows prompt_len
-               and crashes tokenize.
-           (b) thinking model — BASI strips <think>...</think> from the stored
-               assistant turn, but the KV decoded it. So the KV holds MORE tokens
-               than the re-rendered (stripped) history, and a delta feeds the new
-               turn at the wrong KV position: the model loses the conversation and
-               answers a stale turn. Re-decode the clean full history instead.
-               (Costs a full prefill per turn for thinking models — correct over
-               fast; a future optimization could surgically drop the think tokens
-               from the KV instead.) */
-        /* Server mode has no local KV to delta against — the server prefix-caches
-           the FULL prompt itself (cache_prompt=true), so a delta would send only
-           the tail as the entire prompt and lose all history. Always feed full. */
-        bool delta_unsafe = (prev_len > (size_t)new_len) || basi_thinking_tags(NULL, NULL) || basi_srv_port > 0;
-        if (delta_unsafe) {
-            if (getenv("BASI_DEBUG_RECLAIM"))
-                fprintf(stderr, "[delta] resync (prev_len=%zu new_len=%d thinking=%d)\n",
-                        prev_len, new_len, basi_thinking_tags(NULL, NULL));
-            kv_resync_full(ctx, prev_len_p);
-        }
-        char *prompt = formatted_buf + prev_len;
-        size_t prompt_len = (size_t)new_len - prev_len;
-        (void) prompt; (void) prompt_len;   /* chat path uses messages; these renders
-                                               are now dead — removed in the next step
-                                               along with common_chat/apply_template. */
+        /* No prompt render here anymore: generation is server-backed and
+           generate_chat() serializes `messages` itself (the server templates +
+           owns the KV via cache_prompt). Compaction/retrieval above operate on the
+           message array directly. */
 
         /* Tool execution loop. The per-turn cap defaults to 40 — multi-step work
            on a large/unfamiliar repo (navigate→grep→read→edit→test→fix) needs many
@@ -2995,23 +2944,13 @@ static void run_agentic_turn(char *user_input,
             tool_iterations++;
 
             /* Reclaim INSIDE the tool loop too. A long agentic turn is one user
-               turn with many tool calls, each appending a result — with the
-               reclaim check only before the loop, that history accumulates with
-               no compaction until the KV overflows mid-session (the [Context
-               limit reached] wall, after which a small model often degenerates).
-               On compaction the KV is cleared and prev_len reset, so re-render the
-               full compacted history instead of the now-invalid delta. Skip the
-               first iteration: the pre-loop reclaim + retrieve injection already
-               set up `prompt` for it. */
-            if (tool_iterations > 1 &&
+               turn with many tool calls, each appending a result — without an
+               in-loop reclaim that history accumulates until the server's context
+               overflows. Compaction rewrites the message array; generate_chat()
+               re-serializes it next iteration, so no re-render is needed here. */
+            if (tool_iterations > 1)
                 reclaim_context_if_needed(model, vocab, ctx, smpl, native_tools,
-                                          formatted_buf, messages_p, msg_count_p, prev_len_p)) {
-                int rl = apply_template(model, messages, msg_count, true,
-                                        formatted_buf, FORMATTED_BUF_SZ);
-                if (rl < 0) { printf("Error: Failed to apply chat template\n"); fflush(stdout); break; }
-                prompt = formatted_buf;
-                prompt_len = (size_t)rl;
-            }
+                                          formatted_buf, messages_p, msg_count_p, prev_len_p);
 
             /* Server-chat path (item 6b, opt-in via BASI_SERVER_CHAT): the server
                templates from the message array, owns the tool grammar, and returns
@@ -3144,28 +3083,8 @@ static void run_agentic_turn(char *user_input,
                 free(call_name);
                 free(tool_result);
 
-                /* Update template for next iteration (delta prompt) */
-                int next_len = apply_template(
-                    model, messages, msg_count, true,
-                    formatted_buf, FORMATTED_BUF_SZ);
-                if (next_len < 0) {
-                    printf("Error: Failed to apply chat template\n");
-                    fflush(stdout);
-                    break;
-                }
-                srv_update_ctx_used(vocab, formatted_buf, next_len);   /* server-mode ctx meter */
-                int prev = apply_template(
-                    model, messages, msg_count - 1, false, NULL, 0);
-                /* Same non-monotonic-render guard as the turn-start delta: if the
-                   all-but-last render is longer than the full one, the delta would
-                   underflow — resync the KV and feed the whole prompt instead. */
-                if (prev < 0 || prev > next_len || basi_srv_port > 0) {   /* server: always full prompt */
-                    kv_resync_full(ctx, prev_len_p);
-                    prev = 0;
-                }
-                prompt = formatted_buf + prev;
-                prompt_len = (size_t)next_len - (size_t)prev;
-
+                /* The tool call + result were appended to `messages`; generate_chat()
+                   re-serializes them next iteration. No re-render needed. */
                 printf("\n");
                 fflush(stdout);
             } else {
@@ -3192,16 +3111,9 @@ static void run_agentic_turn(char *user_input,
                         "the correct format with properly matched tags, or give your final answer "
                         "if the task is complete.");
                     free(result.text);
-                    int nl = apply_template(model, messages, msg_count, true,
-                                            formatted_buf, FORMATTED_BUF_SZ);
-                    if (nl < 0) { printf("Error: Failed to apply chat template\n"); break; }
-                    int pv = apply_template(model, messages, msg_count - 1, false, NULL, 0);
-                    if (pv < 0 || pv > nl || basi_srv_port > 0) { kv_resync_full(ctx, prev_len_p); pv = 0; }
-                    prompt = formatted_buf + pv;
-                    prompt_len = (size_t)nl - (size_t)pv;
                     printf("\n");
                     fflush(stdout);
-                    continue;
+                    continue;   /* re-serialized from messages next iteration */
                 }
                 /* genuine final answer (or gave up after repeated parse failures) */
                 ADD_MESSAGE("assistant", result.text);
@@ -3236,11 +3148,6 @@ static void run_agentic_turn(char *user_input,
 
         printf("\n");
         fflush(stdout);
-
-        /* Update prev_len for next turn */
-        int len = apply_template(
-            model, messages, msg_count, false, NULL, 0);
-        if (len >= 0) prev_len = (size_t)len;
 
     #undef messages
     #undef msg_count
