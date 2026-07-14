@@ -63,6 +63,14 @@ GenerateResult generate(
     const char *prompt,
     size_t prompt_len);
 
+/* Server-chat generation (item 6b): serialize `messages` (+ registered tools) and
+   drive /v1/chat/completions. Returns the answer text (res.text) + the server's
+   prompt token count (res.prompt_tokens) and fills tc_out/n_tc_out with the
+   STRUCTURED tool calls (caller frees via basi_free_tool_calls). */
+struct BasiToolCall;
+GenerateResult generate_chat(const struct llama_chat_message *messages, size_t msg_count,
+                             struct BasiToolCall **tc_out, int *n_tc_out);
+
 /* Locate a "<tool>...</tool>" tag in the model's output text.
  * Returns a pointer into `text` to the byte after "<tool>", with *out_len
  * set to the body length. Returns NULL if no tag is found. */

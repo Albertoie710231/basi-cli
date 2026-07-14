@@ -3014,12 +3014,26 @@ static void run_agentic_turn(char *user_input,
                 prompt_len = (size_t)rl;
             }
 
-            /* Reset the lazy tool grammar so this generation starts fresh — no
-               trigger state carried over from the previous tool round. */
-            if (g_tool_grammar) llama_sampler_reset(g_tool_grammar);
+            /* Server-chat path (item 6b, opt-in via BASI_SERVER_CHAT): the server
+               templates from the message array, owns the tool grammar, and returns
+               STRUCTURED tool calls — so we skip the rendered prompt, the grammar
+               reset, and the PEG parse. The prompt/delta above is still built (its
+               cost goes away in phase c); we just don't use it here. */
+            const bool chat_mode = (basi_srv_port > 0 && getenv("BASI_SERVER_CHAT") != NULL);
+            BasiToolCall *ncalls = NULL;
+            int n_ncalls = 0;
+            GenerateResult result;
             generation_interrupted = 0;
             setup_sigint_handler();
-            GenerateResult result = generate(ctx, vocab, smpl, prompt, prompt_len);
+            if (chat_mode) {
+                result = generate_chat(messages, msg_count, &ncalls, &n_ncalls);
+                basi_srv_ctx_used = (int) result.prompt_tokens;   /* honest ctx meter from usage */
+            } else {
+                /* Reset the lazy tool grammar so this generation starts fresh — no
+                   trigger state carried over from the previous tool round. */
+                if (g_tool_grammar) llama_sampler_reset(g_tool_grammar);
+                result = generate(ctx, vocab, smpl, prompt, prompt_len);
+            }
             reset_sigint_handler();
             session_prompt_tokens += result.prompt_tokens;
             session_gen_tokens    += result.gen_tokens;
@@ -3046,11 +3060,11 @@ static void run_agentic_turn(char *user_input,
             char *call_env = NULL;         /* native: structured assistant tool-call envelope */
             char *call_name = NULL;        /* native: tool name, for the result envelope */
             bool have_call = false;
-            BasiToolCall *ncalls = NULL;
-            int n_ncalls = 0;
 
-            if (native_tools) {
-                n_ncalls = basi_parse_tool_calls(result.text, &ncalls);
+            if (native_tools || chat_mode) {
+                /* chat_mode already has the structured calls in ncalls; only the
+                   /completion path needs to PEG-parse them out of the raw text. */
+                if (!chat_mode) n_ncalls = basi_parse_tool_calls(result.text, &ncalls);
                 if (n_ncalls > 0) {        /* one tool per turn for now (2a) */
                     const char *nm = ncalls[0].name ? ncalls[0].name : "?";
                     print_tool_activity(nm, ncalls[0].arguments);

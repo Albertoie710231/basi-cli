@@ -21,6 +21,7 @@
 #include "chat_tmpl.h"
 #include "md.h"
 #include "srvgen.h"
+#include "srvchat.h"
 
 void model_init(void) {
     extern void log_callback(enum ggml_log_level level, const char *text, void *user_data);
@@ -394,6 +395,126 @@ static GenerateResult generate_server(const char *prompt) {
     res.gen_tokens = (size_t) ntok;
     res.text = full ? strip_thinking_dup(full) : strdup("[server generation failed]");
     free(full);
+    return res;
+}
+
+/* ── Chat-completions path (item 6b): server templates from messages, owns the
+ * tool grammar, and returns STRUCTURED tool_calls + separated reasoning. The
+ * display is simpler than the /completion state machine — reasoning arrives on a
+ * distinct stream, so no <think> tag parsing: reasoning → thinking box (or dim
+ * text under Ctrl+T), content → the markdown answer. ─────────────────────────── */
+typedef struct {
+    int    md;
+    bool   thinking_box_shown;
+    bool   md_started;
+    size_t spinner_frame;
+    double last_spinner;
+} ChatDisplay;
+
+static void chat_on_reasoning(const char *chunk, void *ud) {
+    ChatDisplay *d = (ChatDisplay *) ud;
+    if (generate_quiet) return;
+    if (show_thinking) {
+        printf("\033[90m%s\033[0m", chunk); fflush(stdout);
+        d->thinking_box_shown = true;   /* so a newline is emitted when it closes */
+    } else {
+        double now = time_now();
+        if (!d->thinking_box_shown || now - d->last_spinner > 0.08) {
+            d->spinner_frame++; draw_thinking_box(d->spinner_frame); d->last_spinner = now;
+            d->thinking_box_shown = true;
+        }
+    }
+}
+
+static void chat_on_content(const char *chunk, void *ud) {
+    ChatDisplay *d = (ChatDisplay *) ud;
+    if (generate_quiet) return;
+    if (d->thinking_box_shown) {   /* reasoning finished — tear the box down first */
+        if (show_thinking) printf("\033[0m\n"); else clear_thinking_box();
+        d->thinking_box_shown = false;
+    }
+    if (d->md) {
+        if (!d->md_started) { md_begin(); d->md_started = true; }   /* open the answer stream once */
+        md_feed(chunk, strlen(chunk));
+    } else { printf("\033[0m"); fputs(chunk, stdout); fflush(stdout); }
+}
+
+/* Server-chat generation. Serializes `messages` (+ registered tools) to OpenAI
+ * JSON, streams /v1/chat/completions, and returns the answer text plus STRUCTURED
+ * tool calls in tc_out/n_tc_out (caller frees via basi_free_tool_calls).
+ * res.prompt_tokens carries the server's exact prompt count for ctx accounting. */
+GenerateResult generate_chat(const struct llama_chat_message *messages, size_t msg_count,
+                             BasiToolCall **tc_out, int *n_tc_out) {
+    GenerateResult res = { NULL, 0, 0, 0.0, 0.0 };
+    if (tc_out) *tc_out = NULL;
+    if (n_tc_out) *n_tc_out = 0;
+
+    char *mj = basi_messages_to_json(messages, (int) msg_count);
+    if (!mj) { res.text = strdup("[chat serialization failed]"); return res; }
+    /* deepsearch clears g_tools for its own ReAct loop → basi_tools_to_json()
+       returns NULL there, which is exactly what we want (no tools advertised). */
+    char *tj = basi_tools_to_json();
+
+    long cap = 0; { const char *e = getenv("BASI_MAX_TOKENS"); if (e && *e) cap = atol(e); }
+    int n_predict = cap > 0 ? (int) cap : -1;
+
+    ChatDisplay disp = { (generate_markdown && !generate_quiet) ? 1 : 0, false, false, 0, 0.0 };
+    double t0 = time_now();
+    SrvChatResult *r = srvchat_complete(basi_srv_port, mj, tj, &basi_srv_sampling, n_predict,
+                                        chat_on_content, chat_on_reasoning, &disp);
+    free(mj); free(tj);
+
+    if (!r) {
+        if (disp.thinking_box_shown && !generate_quiet) { if (show_thinking) printf("\033[0m\n"); else clear_thinking_box(); }
+        if (disp.md && disp.md_started) md_end();
+        res.text = strdup("[server chat failed]");
+        return res;
+    }
+
+    if (getenv("BASI_DEBUG_CHAT"))
+        fprintf(stderr, "\n[chat] finish=%s content=%zub reasoning=%zub tool_calls=%d\n  reasoning=[%.400s]\n  content=[%.200s]\n",
+                r->finish_reason ? r->finish_reason : "?",
+                r->content ? strlen(r->content) : 0,
+                r->reasoning ? strlen(r->reasoning) : 0, r->n_tool_calls,
+                r->reasoning ? r->reasoning : "", r->content ? r->content : "");
+
+    /* Qwen3.x sometimes keeps a brief final answer INSIDE the reasoning stream
+       (thinks the answer, closes, stops) → content comes back empty. When there's
+       no answer content and no tool call, promote the reasoning to the answer so
+       the turn isn't blank; it was shown live as a hidden box, so reveal it now. */
+    bool answer_in_reasoning = (!r->content || !r->content[0]) && r->n_tool_calls == 0
+                               && r->reasoning && r->reasoning[0];
+    const char *answer = answer_in_reasoning ? r->reasoning : (r->content ? r->content : "");
+
+    if (disp.thinking_box_shown && !generate_quiet) {   /* tear the reasoning box down */
+        if (show_thinking) printf("\033[0m\n"); else clear_thinking_box();
+        disp.thinking_box_shown = false;
+    }
+    if (answer_in_reasoning && !generate_quiet) {        /* box hid the answer — reveal it */
+        if (disp.md) { md_begin(); md_feed(answer, strlen(answer)); md_end(); }
+        else { printf("\033[0m"); fputs(answer, stdout); }
+    } else if (disp.md && disp.md_started) {
+        md_end();                                        /* close the answer stream */
+    }
+    if (!generate_quiet) { printf("\033[0m\n"); fflush(stdout); }
+
+    res.text          = strdup(answer);
+    res.prompt_tokens = (size_t) r->prompt_tokens;
+    res.gen_tokens    = (size_t) r->completion_tokens;
+    res.gen_time_s    = (r->tps > 0) ? r->completion_tokens / r->tps : (time_now() - t0);
+
+    if (r->n_tool_calls > 0 && tc_out) {
+        BasiToolCall *arr = calloc((size_t) r->n_tool_calls, sizeof(BasiToolCall));
+        if (arr) {
+            for (int i = 0; i < r->n_tool_calls; i++) {
+                arr[i].name      = strdup(r->tool_calls[i].name      ? r->tool_calls[i].name      : "");
+                arr[i].arguments = strdup(r->tool_calls[i].arguments ? r->tool_calls[i].arguments : "{}");
+            }
+            *tc_out = arr;
+            if (n_tc_out) *n_tc_out = r->n_tool_calls;
+        }
+    }
+    srvchat_free(r);
     return res;
 }
 

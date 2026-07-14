@@ -22,7 +22,7 @@ typedef struct {
 } BasiToolDef;
 
 /* One parsed tool call returned by basi_parse_tool_calls (caller-owned). */
-typedef struct {
+typedef struct BasiToolCall {
     char *name;        /* malloc'd */
     char *arguments;   /* malloc'd JSON object string */
 } BasiToolCall;
