@@ -12,15 +12,18 @@ CXXFLAGS = -std=c++17 -Wall -Wextra -O2 -Wno-unused-function
 LLAMA_DIR ?= $(HOME)/llama.cpp
 LLAMA_BUILD ?= $(LLAMA_DIR)/build_vulkan
 
+# BASI no longer LINKS libllama — generation, templating, tool grammar, embeddings
+# all run in spawned llama-server processes (HTTP). It still needs a couple of
+# llama.cpp HEADERS at compile time (the llama_chat_message POD + opaque handle
+# types) and the vendored nlohmann/json header — compile-time only, so a llama.cpp
+# rebuild can no longer ABI-break the binary (the old free(): invalid pointer gotcha).
 INCLUDES = -I$(LLAMA_DIR)/include -I$(LLAMA_DIR)/ggml/include -Isrc
-# The C++ shim (chat_tmpl.cpp) calls llama.cpp's chat-template engine, so it
-# also needs the common headers and the vendored nlohmann/json headers.
-CXXINCLUDES = $(INCLUDES) -I$(LLAMA_DIR)/common -I$(LLAMA_DIR)/vendor
+CXXINCLUDES = $(INCLUDES) -I$(LLAMA_DIR)/vendor
 
-LDFLAGS = -L$(LLAMA_BUILD)/bin -Wl,-rpath,$(LLAMA_BUILD)/bin
-# -lllama-common: the SHARED common lib (jinja chat-template engine), the same
-# one llama-cli links — consistent with libllama.so.
-LIBS = -lllama-common -lllama -lggml -lggml-base -lm -lvulkan
+LDFLAGS =
+# -lvulkan: hwinfo.c probes GPU VRAM directly via Vulkan (stable system lib, no
+# llama.cpp ABI coupling) for the picker's fit estimate.
+LIBS = -lm -lvulkan
 
 TARGET = basi-cli
 SRCS = $(wildcard src/*.c)

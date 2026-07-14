@@ -3364,8 +3364,6 @@ int main(int argc, char **argv) {
     fprintf(no_tools ? stderr : stdout, "BASI-CLI - Loading model...\n");
     fflush(no_tools ? stderr : stdout);
 
-    model_init();
-
     /* Server-backed generation only: the weights + KV + templating + tool grammar
        all live in the spawned llama-server. BASI loads NO model in-process — the
        model/vocab/ctx handles stay NULL (retained only in the signatures of

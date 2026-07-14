@@ -12,7 +12,6 @@
 #include <errno.h>
 
 #include "llama.h"
-#include "ggml-backend.h"
 
 #include "util.h"
 #include "globals.h"
@@ -23,11 +22,6 @@
 #include "srvgen.h"
 #include "srvchat.h"
 
-void model_init(void) {
-    extern void log_callback(enum ggml_log_level level, const char *text, void *user_data);
-    llama_log_set(log_callback, NULL);
-    ggml_backend_load_all();
-}
 
 /* ── Spinner frames ────────────────────────────────────────────────── */
 
@@ -216,15 +210,6 @@ GenerateResult generate_chat(const struct llama_chat_message *messages, size_t m
     return res;
 }
 
-
-/* ── Log callback (suppress non-errors) ────────────────────────────── */
-
-void log_callback(enum ggml_log_level level, const char *text, void *user_data) {
-    (void)user_data;
-    if (level >= GGML_LOG_LEVEL_ERROR) {
-        fprintf(stderr, "%s", text);
-    }
-}
 
 /* Chat templating is done server-side now (llama-server templates from the
    messages we POST to /v1/chat/completions), so there is no in-process

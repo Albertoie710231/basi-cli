@@ -6,7 +6,6 @@
 #include "srvgen.h"   /* SrvSampling (server-backed generation knobs) */
 
 /* One-shot init: registers the llama log callback + loads ggml backends. */
-void model_init(void);
 
 /* ── Launch config (returned by interactive picker) ────────────────── */
 typedef struct {
