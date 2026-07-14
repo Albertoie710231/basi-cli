@@ -8,12 +8,13 @@ maintained, faster path. BASI's identity (reuse pillar — llama-independent —
 agent loop, tools, prompts, deterministic-first) lives ABOVE the generation layer,
 so the pivot sharpens "its own thing," doesn't dilute it.
 
-## STATE: the core works + refinement done. Branch `spec-decode-mtp`, latest `b382498`.
-Items 1/2/4/5/5b DONE+verified. Item 6 (drop libllama) IN PROGRESS: phases (a) chat
-client + (b)pt1 serialization + (b)pt2 agent-loop wiring DONE+verified (the full loop
-runs over /v1/chat/completions behind BASI_SERVER_CHAT=1). Remaining: (b) make it the
-default + deepsearch-over-chat; (c) delete-native; (d) drop-link (see §6). User
-greenlit the full server-only rewrite.
+## STATE: server-only rewrite well underway. Branch `spec-decode-mtp`, latest `c22acf5`.
+Items 1/2/4/5/5b DONE+verified. Item 6 (drop libllama) IN PROGRESS: (a) chat client +
+(b) agent-loop-over-chat DONE. **(c) native teardown UNDERWAY: chat+server are now the
+DEFAULT/mandatory path (no BASI_SERVER/BASI_SERVER_CHAT needed), spec.cpp deleted, and
+the 448-line in-process decode loop in generate() is GONE — generate() just delegates
+to the server.** Remaining (c): prune dead native-only main.c, remove the /completion
+path, remove common_chat, embed→HTTP. Then (d) drop the link. See §6.
 
 **Launch-script feature (`5791c05`,`b15517a`):** the model picker now configures the
 llama-server launch (SPEC-DECODE + FLASH-ATTN sections, auto-following model MTP-ness)
@@ -150,13 +151,19 @@ Server logs → `/tmp/basi_srvgen.log`. Server binds `127.0.0.1:8181`.
      `<tool>` ReAct format in `content` (deepsearch parses that) — route ds to
      generate_chat and confirm; (iii) legacy/non-native models in chat mode (today
      the branch assumes tool-capable — fine for the target models).
-   - ⬜ **(c) delete native path** — remove model.c generate() decode loop + samplers +
-     the ThinkingState machine + SrvDisplay(/completion), deepsearch `dctx`, spec.cpp
-     (dead-end), the `common_chat` grammar/parse/render in chat_tmpl.cpp (keep only the
-     nlohmann serializers), main.c model-load/ctx/sampler-chain. Route embed.c → a
-     SPAWNED embedder llama-server (jina/bge) `--embedding` + `/embedding` (2nd server;
-     keeps retrieval quality). `llama_chat_message` is a POD {role,content} — replace
-     with a local struct so headers need no llama.h.
+   - 🔄 **(c) delete native path — IN PROGRESS.** Done so far:
+       - ✅ step1 (`918c7af`): chat mode DEFAULT in server mode (BASI_SERVER_COMPLETION=1 opts back to /completion).
+       - ✅ step2 (`918c7af`… `use_server=true`): server mode DEFAULT/mandatory (was BASI_NATIVE hatch, now removed) — every launch spawns llama-server.
+       - ✅ step3 (`…`): deleted `src/spec.{c,h}` (parked native-MTP dead-end) + its self-test hook.
+       - ✅ step4 (`c22acf5`): DELETED the in-process decode loop in generate() (~448 lines: tokenize→llama_decode→sampler loop, inline ThinkingState, batch/KV, per-token UTF-8/Ctrl+T). generate() is now a thin `return generate_server(prompt)` wrapper. Display helpers (draw/clear_thinking_box, utf8_seq_len, strip_thinking_dup) stay (used by SrvDisplay + ChatDisplay). Verified: chat tool-call + --no-tools both work.
+     REMAINING in (c): prune now-dead native-only main.c (the sampler chain create,
+     full-weight load branch, native ctx VRAM-retry — all unused since generate()
+     ignores smpl and use_server is always true); remove the /completion path
+     (generate_server + SrvDisplay + srvgen_complete) AFTER moving deepsearch / no-tools
+     `-p` / the tool-exhausted final-gen off `generate()`→chat; remove the `common_chat`
+     grammar/parse/render in chat_tmpl.cpp (keep the nlohmann serializers); route embed.c
+     → a SPAWNED embedder llama-server `--embedding` + `/embedding`; `llama_chat_message`
+     POD → local struct so headers need no llama.h.
    - ⬜ **(d) drop link** — remove `-lllama -lllama-common -lggml* -lvulkan` and the
      `-I$(LLAMA_DIR)/...` includes (keep a vendored nlohmann). Verify `ldd basi-cli`
      shows no libllama/libggml. ABI-coupling gotcha GONE.
