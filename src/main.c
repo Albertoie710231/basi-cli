@@ -1490,15 +1490,16 @@ static void repl_add_message(struct llama_chat_message **messages,
  * This measures live context OCCUPANCY (what decides the context limit),
  * which is distinct from the cumulative session token counts /cost reports
  * (those measure throughput across the whole session). */
-/* Server mode holds the KV inside llama-server, not us — so we track the server's
-   prompt token count (from the /v1/chat/completions `usage`, set by generate_chat)
-   and the ctx meter / compaction trigger / "tokens remaining" hint all read this. */
-static int basi_srv_ctx_used = 0;
+/* The server holds the KV, not us — so we track the server's prompt token count
+   (from the /v1/chat/completions `usage`, set by generate_chat) and its context
+   size (set at spawn). The ctx meter / compaction trigger / "tokens remaining"
+   hint all read these. */
+static int basi_srv_ctx_used  = 0;
+static int basi_srv_ctx_total = 0;
 
 static int context_used_tokens(struct llama_context *ctx) {
-    if (basi_srv_port > 0) return basi_srv_ctx_used;   /* server owns the KV, not us */
-    llama_pos m = llama_memory_seq_pos_max(llama_get_memory(ctx), 0);
-    return m < 0 ? 0 : (int)m + 1;
+    (void) ctx;                 /* generation is server-side; the local ctx is gone */
+    return basi_srv_ctx_used;
 }
 
 /* Compact human token count: "830", "12.3k", "131k". */
@@ -1515,7 +1516,7 @@ static void fmt_token_count(char *buf, size_t n, int t) {
  * Trailing reset returns to the caller's dim style. */
 static void format_context_meter(struct llama_context *ctx, char *out, size_t n) {
     int used  = context_used_tokens(ctx);
-    int total = (int)llama_n_ctx(ctx);
+    int total = basi_srv_ctx_total;
     int pct   = total > 0 ? (int)((100.0 * used) / total) : 0;
     char u[16], t[16];
     fmt_token_count(u, sizeof u, used);
@@ -1585,7 +1586,7 @@ static void statusbar_compose(char *out, size_t outsz) {
     /* ctx meter — always shown, colour-graded like the footer */
     {
         int used  = context_used_tokens(g_bar.ctx);
-        int total = (int)llama_n_ctx(g_bar.ctx);
+        int total = basi_srv_ctx_total;
         int pct   = total > 0 ? (int)((100.0 * used) / total) : 0;
         char u[16], t[16];
         fmt_token_count(u, sizeof u, used);
@@ -2192,13 +2193,11 @@ static void try_model_switch(const char *arg, char **argv, int argc,
 }
 
 /* ── Context reclamation (recent-window compaction) ────────────────────
- * Resync after any mutation of the message history. The delta-prompt scheme
- * feeds only formatted_buf+prev_len each turn, trusting the KV cache to hold the
- * prefix; once we rewrite messages[] that prefix is invalid, so we drop the
- * whole KV and zero prev_len — the next render+decode rebuilds it from the
- * (now smaller) history. Shared by /clear, deepsearch-return, and reclaim. */
+ * After any mutation of the message history, reset prev_len. The local KV is gone
+ * (the server prefix-caches the full prompt itself), so there's nothing to clear —
+ * this is now just prev_len bookkeeping. Shared by /clear, deepsearch-return, reclaim. */
 static void kv_resync_full(struct llama_context *ctx, size_t *prev_len) {
-    llama_memory_clear(llama_get_memory(ctx), true);
+    (void) ctx;
     *prev_len = 0;
 }
 
@@ -2319,7 +2318,7 @@ static bool reclaim_context_if_needed(
         bool native_tools, char *formatted_buf,
         struct llama_chat_message **messages_p, size_t *msg_count_p,
         size_t *prev_len_p) {
-    int total = (int)llama_n_ctx(ctx);
+    int total = basi_srv_ctx_total;
     /* RESERVE: headroom left free for the incoming turn + its answer. ~4k on a
        full local ctx, scaled down so it never swallows a small ctx whole. */
     int reserve = total / 4 < 4096 ? total / 4 : 4096;
@@ -2500,7 +2499,7 @@ static void handle_slash_command(char *user_input,
                        session_prompt_tokens, session_gen_tokens,
                        session_prompt_tokens + session_gen_tokens);
                 int used  = context_used_tokens(ctx);
-                int total = (int)llama_n_ctx(ctx);
+                int total = basi_srv_ctx_total;
                 int pct   = total > 0 ? (int)((100.0 * used) / total) : 0;
                 printf("\033[90m[Context: %d/%d tokens in window (%d%%), %d free]\033[0m\n",
                        used, total, pct, total - used);
@@ -3033,7 +3032,7 @@ static void run_agentic_turn(char *user_input,
                    server mode, or the local KV otherwise — so the budget hint the
                    model sees is honest in both. */
                 int used = context_used_tokens(ctx);
-                int remaining = (int)llama_n_ctx(ctx) - used;
+                int remaining = basi_srv_ctx_total - used;
 
                 if (native_tools) {
                     /* Structured round-trip: the assistant's tool call and the
@@ -3048,7 +3047,7 @@ static void run_agentic_turn(char *user_input,
                     char budget[256];
                     snprintf(budget, sizeof(budget),
                         "\n[Context: %d/%d tokens used, %d remaining. Answer now if remaining < 8000.]",
-                        used, (int)llama_n_ctx(ctx), remaining);
+                        used, basi_srv_ctx_total, remaining);
                     sb_append_str(&tr, budget);
                     char *res_env = tool_result_envelope(call_name, sb_to_str(&tr));
                     sb_free(&tr);
@@ -3069,7 +3068,7 @@ static void run_agentic_turn(char *user_input,
                     snprintf(budget, sizeof(budget),
                         "\n</tool_result>\n[Context: %d/%d tokens used, %d remaining. "
                         "Original request: \"%.180s\". You MUST answer now if remaining < 8000.]",
-                        used, (int)llama_n_ctx(ctx), remaining, user_input);
+                        used, basi_srv_ctx_total, remaining, user_input);
                     sb_append_str(&tool_resp, budget);
                     ADD_MESSAGE("user", sb_to_str(&tool_resp));
                     sb_free(&tool_resp);
@@ -3487,8 +3486,8 @@ int main(int argc, char **argv) {
             return 1;
         }
         atexit(kill_srv);
-        basi_srv_port  = 8181;
-        basi_srv_model = model;
+        basi_srv_port      = 8181;
+        basi_srv_ctx_total = srv_ctx;   /* the server's context size, for the ctx meter */
         fprintf(stderr, "\033[90m[server mode] ready — generation delegated to llama-server\033[0m\n");
     }
 
@@ -3510,7 +3509,7 @@ int main(int argc, char **argv) {
     basi_srv_sampling.seed           = (cli_seed == LLAMA_DEFAULT_SEED) ? -1 : (long) cli_seed;
 
     if (!no_tools && !oneshot_prompt) {
-        print_startup_banner(model_path, (int)llama_n_ctx(ctx), n_gpu_layers);
+        print_startup_banner(model_path, basi_srv_ctx_total, n_gpu_layers);
         printf("\033[38;5;245mType your message, or /help. Empty line to quit.\033[0m\n\n");
         fflush(stdout);
     }
