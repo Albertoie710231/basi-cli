@@ -115,16 +115,17 @@ extern "C" int basi_spec_run(basi_spec *s,
     const llama_seq_id seq_id = 0;
 
     fprintf(stderr, "[dbg] run: prefill (%d toks)...\n", n_prompt);
-    // Prefill the target with all but the last prompt token. NOTE: do NOT call
-    // common_speculative_process() on a llama_batch_get_one() batch — that helper
-    // leaves seq_id/n_seq_id/pos NULL and process() dereferences them. Priming the
-    // MTP head is not needed for correctness (the target verify guarantees the
-    // committed tokens); the loop's process() calls (on fully-built batches) prime
-    // it from the first iteration.
+    // Prefill the target with all but the last prompt token, PROPERLY built:
+    // logits=1 on every position (the MTP impl requires this to prime its head —
+    // see speculative.cpp begin() warning) and a real batch (seq_id/pos set) so
+    // common_speculative_process() can prime the head without NULL-derefing.
     {
-        llama_batch pb = llama_batch_get_one(const_cast<llama_token *>(prompt), n_prompt - 1);
-        if (llama_decode(s->ctx_tgt, pb) != 0) return -1;
-        fprintf(stderr, "[dbg] run: prefill decoded\n");
+        common_batch_clear(s->batch_tgt);
+        for (int i = 0; i < n_prompt - 1; ++i)
+            common_batch_add(s->batch_tgt, prompt[i], i, { seq_id }, true);
+        if (llama_decode(s->ctx_tgt, s->batch_tgt) != 0) return -1;
+        common_speculative_process(s->spec, s->batch_tgt);
+        fprintf(stderr, "[dbg] run: prefill decoded + head primed\n");
     }
 
     llama_token id_last = prompt[n_prompt - 1];
@@ -145,6 +146,7 @@ extern "C" int basi_spec_run(basi_spec *s,
 
     llama_tokens draft;
     common_prompt_checkpoint ckpt;
+    int dbg_iter = 0;
 
     while (true) {
         if (draft.empty()) {
@@ -182,6 +184,19 @@ extern "C" int basi_spec_run(basi_spec *s,
         }
 
         if (llama_decode(s->ctx_tgt, s->batch_tgt) != 0) return -1;
+
+        if (dbg_iter < 2) {
+            const int nv = llama_vocab_n_tokens(vocab);
+            for (int bi = 0; bi < (int) draft.size() + 1; ++bi) {
+                const float *lg = llama_get_logits_ith(s->ctx_tgt, bi);
+                if (!lg) { fprintf(stderr, "[dbg] iter%d idx%d: logits NULL\n", dbg_iter, bi); continue; }
+                int am = 0; float av = lg[0];
+                for (int t = 1; t < nv; ++t) if (lg[t] > av) { av = lg[t]; am = t; }
+                fprintf(stderr, "[dbg] iter%d batch-idx%d raw-argmax=%d  draft[%d]=%d\n",
+                        dbg_iter, bi, am, bi, bi < (int) draft.size() ? draft[bi] : -1);
+            }
+        }
+        dbg_iter++;
 
         common_sampler_ptr smpl_save;
         if (use_ckpt_tgt) smpl_save.reset(common_sampler_clone(s->smpl));
@@ -301,16 +316,9 @@ extern "C" void basi_spec_selftest(llama_model *model, llama_context *ctx,
     fprintf(stderr, "\n=== spec self-test: type=%s n_max=%d gen=%d prompt_toks=%d ===\n",
             type, n_max, max_gen, n);
 
-    // plain greedy reference
-    fprintf(stderr, "[dbg] clearing memory before plain...\n");
-    llama_memory_clear(llama_get_memory(ctx), true);
-    fprintf(stderr, "[dbg] memory cleared, starting plain greedy...\n");
-    int64_t t0 = ggml_time_us();
-    std::vector<llama_token> A = plain_greedy(ctx, model, prompt, max_gen);
-    fprintf(stderr, "[dbg] plain greedy done (%zu toks)\n", A.size());
-    double ta = (ggml_time_us() - t0) / 1e6;
-
-    // spec greedy
+    // SPEC FIRST on a fresh context — next-n is enabled before any decode, exactly
+    // as in production. (Running plain first, clearing, then enabling next-n on an
+    // already-used context was the artifact corrupting earlier tests.)
     llama_memory_clear(llama_get_memory(ctx), true);
     basi_spec *s = basi_spec_init(model, ctx, model_path, n_ctx, n_gpu_layers, type, n_max, 0, 0.0f);
     if (!s) { fprintf(stderr, "[spec-selftest] basi_spec_init returned NULL (type unsupported / no head?)\n"); return; }
@@ -321,8 +329,15 @@ extern "C" void basi_spec_selftest(llama_model *model, llama_context *ctx,
                       if (!eog) ((std::vector<llama_token> *) ud)->push_back(tok);
                   }, &B);
     double tb = (ggml_time_us() - t1) / 1e6;
-
     long drafted = 0, accepted = 0; basi_spec_stats(s, &drafted, &accepted);
+    basi_spec_free(s);
+
+    // plain greedy reference (next-n writes only the separate embd buffer, not the
+    // logits, so raw argmax stays valid even with the mode still enabled)
+    llama_memory_clear(llama_get_memory(ctx), true);
+    int64_t t0 = ggml_time_us();
+    std::vector<llama_token> A = plain_greedy(ctx, model, prompt, max_gen);
+    double ta = (ggml_time_us() - t0) / 1e6;
 
     // compare
     bool identical = (A.size() == B.size());
@@ -354,6 +369,4 @@ extern "C" void basi_spec_selftest(llama_model *model, llama_context *ctx,
     };
     dump("A(plain)", A);
     dump("B(spec) ", B);
-
-    basi_spec_free(s);
 }
