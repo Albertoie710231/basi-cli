@@ -39,6 +39,7 @@
 #include "cookbook.h"
 #include "slashmenu.h"
 #include "spec.h"
+#include "srvgen.h"
 
 /* MAX_TOKENS, CONTEXT_SIZE → globals.h */
 #define MAX_FILE_TOKENS     2000
@@ -3369,6 +3370,15 @@ int main(int argc, char **argv) {
     /* Warm up the local SearXNG (web_search backend) while the model loads.
      * --no-tools never touches the web, so don't spin SearXNG up for it. */
     if (!no_tools) web_ensure_searxng();
+
+    /* Server-backed generation spike (M1): BASI_SERVER_SELFTEST=1 spawns a
+       llama-server, streams a completion over its SSE /completion, and exits —
+       WITHOUT loading any model in-process (the server owns the only copy).
+       Proves the Pi-style pivot + gets MTP spec-decode for free. Default-off. */
+    if (getenv("BASI_SERVER_SELFTEST") && model_path) {
+        srvgen_selftest(model_path, n_gpu_layers, ctx_override > 0 ? ctx_override : CONTEXT_SIZE);
+        return 0;
+    }
 
     /* In --no-tools mode stdout must carry only the completion, so load chatter
      * goes to stderr. */
