@@ -2289,6 +2289,7 @@ static char *summarize_head(struct llama_model *model, const struct llama_vocab 
                             struct llama_context *ctx, struct llama_sampler *smpl,
                             bool native_tools, char *formatted_buf,
                             const char *prev_checkpoint, const char *head_text) {
+    (void) model; (void) vocab; (void) ctx; (void) smpl; (void) formatted_buf;  /* server templates now */
     StringBuf up; sb_init(&up);
     if (prev_checkpoint && *prev_checkpoint) {
         sb_append_str(&up, "Update the existing checkpoint using the new transcript: keep "
@@ -2308,17 +2309,13 @@ static char *summarize_head(struct llama_model *model, const struct llama_vocab 
     tmp[0].role = "system"; tmp[0].content = SUMMARY_SYS;
     tmp[1].role = "user";   tmp[1].content = user_content;
 
-    basi_set_tools(NULL, 0);                       /* no tool schemas in the summary prompt */
-    int len = apply_template(model, tmp, 2, true, formatted_buf, FORMATTED_BUF_SZ);
-    if (native_tools) { int n; const BasiToolDef *d = basi_tool_defs(&n); basi_set_tools(d, n); }
-    free(user_content);
-    if (len <= 0) return NULL;
-
-    llama_memory_clear(llama_get_memory(ctx), true);   /* fresh KV for the summary decode */
+    basi_set_tools(NULL, 0);                        /* no tool schemas in the summary prompt */
     sig_atomic_t prev_quiet = generate_quiet;
     generate_quiet = 1;
-    GenerateResult r = generate(ctx, vocab, smpl, formatted_buf, (size_t)len);
+    GenerateResult r = generate_chat(tmp, 2, NULL, NULL);   /* server templates from tmp */
     generate_quiet = prev_quiet;
+    if (native_tools) { int n; const BasiToolDef *d = basi_tool_defs(&n); basi_set_tools(d, n); }
+    free(user_content);                             /* was tmp[1].content — freed after the call */
     return r.text;                                  /* may be an "[error]" string; caller checks */
 }
 
@@ -3022,21 +3019,12 @@ static void run_agentic_turn(char *user_input,
                now (the server owns templating + grammar + tool parsing). The old
                /completion path is still reachable during the teardown via
                BASI_SERVER_COMPLETION=1. */
-            const bool chat_mode = (basi_srv_port > 0 && getenv("BASI_SERVER_COMPLETION") == NULL);
             BasiToolCall *ncalls = NULL;
             int n_ncalls = 0;
-            GenerateResult result;
             generation_interrupted = 0;
             setup_sigint_handler();
-            if (chat_mode) {
-                result = generate_chat(messages, msg_count, &ncalls, &n_ncalls);
-                basi_srv_ctx_used = (int) result.prompt_tokens;   /* honest ctx meter from usage */
-            } else {
-                /* Reset the lazy tool grammar so this generation starts fresh — no
-                   trigger state carried over from the previous tool round. */
-                if (g_tool_grammar) llama_sampler_reset(g_tool_grammar);
-                result = generate(ctx, vocab, smpl, prompt, prompt_len);
-            }
+            GenerateResult result = generate_chat(messages, msg_count, &ncalls, &n_ncalls);
+            basi_srv_ctx_used = (int) result.prompt_tokens;   /* honest ctx meter from usage */
             reset_sigint_handler();
             session_prompt_tokens += result.prompt_tokens;
             session_gen_tokens    += result.gen_tokens;
@@ -3064,34 +3052,21 @@ static void run_agentic_turn(char *user_input,
             char *call_name = NULL;        /* native: tool name, for the result envelope */
             bool have_call = false;
 
-            if (native_tools || chat_mode) {
-                /* chat_mode already has the structured calls in ncalls; only the
-                   /completion path needs to PEG-parse them out of the raw text. */
-                if (!chat_mode) n_ncalls = basi_parse_tool_calls(result.text, &ncalls);
-                if (n_ncalls > 0) {        /* one tool per turn for now (2a) */
-                    const char *nm = ncalls[0].name ? ncalls[0].name : "?";
-                    print_tool_activity(nm, ncalls[0].arguments);
-                    /* Structured dispatch: parsed JSON args go straight to the
-                       handlers, never round-tripped through a shell string. */
-                    tool_result = execute_tool_native(ncalls[0].name, ncalls[0].arguments);
-                    if (getenv("BASI_DEBUG_TOOLS"))
-                        fprintf(stderr, "[tool] name=%s args=%s\n  -> result=%.160s\n",
-                                nm, ncalls[0].arguments ? ncalls[0].arguments : "(null)",
-                                tool_result ? tool_result : "(null)");
-                    if (!tool_result) unknown_tool = strdup(nm);
-                    call_name = strdup(nm);
-                    call_env  = tool_call_envelope(ncalls[0].name, ncalls[0].arguments);
-                    have_call = true;
-                }
-            } else {
-                size_t tool_cmd_len;
-                const char *tc = extract_tool_call(result.text, &tool_cmd_len);
-                if (tc) {
-                    cmd_str = malloc(tool_cmd_len + 1);
-                    memcpy(cmd_str, tc, tool_cmd_len);
-                    cmd_str[tool_cmd_len] = '\0';
-                    have_call = true;
-                }
+            /* Structured tool calls come straight from the server (one per turn). */
+            if (n_ncalls > 0) {
+                const char *nm = ncalls[0].name ? ncalls[0].name : "?";
+                print_tool_activity(nm, ncalls[0].arguments);
+                /* Structured dispatch: parsed JSON args go straight to the
+                   handlers, never round-tripped through a shell string. */
+                tool_result = execute_tool_native(ncalls[0].name, ncalls[0].arguments);
+                if (getenv("BASI_DEBUG_TOOLS"))
+                    fprintf(stderr, "[tool] name=%s args=%s\n  -> result=%.160s\n",
+                            nm, ncalls[0].arguments ? ncalls[0].arguments : "(null)",
+                            tool_result ? tool_result : "(null)");
+                if (!tool_result) unknown_tool = strdup(nm);
+                call_name = strdup(nm);
+                call_env  = tool_call_envelope(ncalls[0].name, ncalls[0].arguments);
+                have_call = true;
             }
 
             if (have_call) {
@@ -3236,10 +3211,10 @@ static void run_agentic_turn(char *user_input,
         if (tool_iterations >= max_tool_iterations) {
             printf("\033[90m[Generating answer...]\033[0m\n");
             fflush(stdout);
-            if (g_tool_grammar) llama_sampler_reset(g_tool_grammar);
             generation_interrupted = 0;
             setup_sigint_handler();
-            GenerateResult final_result = generate(ctx, vocab, smpl, prompt, prompt_len);
+            GenerateResult final_result = generate_chat(messages, msg_count, NULL, NULL);
+            basi_srv_ctx_used = (int) final_result.prompt_tokens;
             reset_sigint_handler();
             session_prompt_tokens += final_result.prompt_tokens;
             session_gen_tokens    += final_result.gen_tokens;
@@ -3684,22 +3659,13 @@ int main(int argc, char **argv) {
         if (sys && *sys) ADD_MESSAGE("system", sys);
         ADD_MESSAGE("user", oneshot_prompt);
 
-        char *buf = malloc(FORMATTED_BUF_SZ);
-        int len = apply_template(model, messages, msg_count, true,
-                                 buf, FORMATTED_BUF_SZ);
-        if (len < 0) {
-            fprintf(stderr, "Error: Failed to apply chat template\n");
-            free(buf);
-            goto cleanup;
-        }
-
-        SAMPLER_TAIL();       /* --no-tools: no grammar, just finish the chain */
+        /* No tools are registered here, so the chat request advertises none — a
+           plain completion the server templates from these two messages. */
         generate_quiet = 1;  /* suppress streaming/decoration; we print result.text */
-        GenerateResult r = generate(ctx, vocab, smpl, buf, (size_t)len);
+        GenerateResult r = generate_chat(messages, msg_count, NULL, NULL);
         printf("%s\n", r.text ? r.text : "");
         fflush(stdout);
         free(r.text);
-        free(buf);
         goto cleanup;
     }
 
