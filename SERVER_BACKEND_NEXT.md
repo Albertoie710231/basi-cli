@@ -8,10 +8,12 @@ maintained, faster path. BASI's identity (reuse pillar — llama-independent —
 agent loop, tools, prompts, deterministic-first) lives ABOVE the generation layer,
 so the pivot sharpens "its own thing," doesn't dilute it.
 
-## STATE: the core works + refinement done. Branch `spec-decode-mtp`, latest `b15517a`.
+## STATE: the core works + refinement done. Branch `spec-decode-mtp`, latest `b382498`.
 Items 1/2/4/5/5b DONE+verified. Item 6 (drop libllama) IN PROGRESS: phases (a) chat
-client + (b)pt1 serialization DONE+verified; (b)pt2 wiring + (c) delete-native + (d)
-drop-link remaining (see §6). User greenlit the full server-only rewrite.
+client + (b)pt1 serialization + (b)pt2 agent-loop wiring DONE+verified (the full loop
+runs over /v1/chat/completions behind BASI_SERVER_CHAT=1). Remaining: (b) make it the
+default + deepsearch-over-chat; (c) delete-native; (d) drop-link (see §6). User
+greenlit the full server-only rewrite.
 
 **Launch-script feature (`5791c05`,`b15517a`):** the model picker now configures the
 llama-server launch (SPEC-DECODE + FLASH-ATTN sections, auto-following model MTP-ness)
@@ -131,17 +133,23 @@ Server logs → `/tmp/basi_srvgen.log`. Server binds `127.0.0.1:8181`.
      OpenAI JSON. Roles map: tool_call→assistant+tool_calls[] (synthetic `call_N`
      id); tool_result→role:"tool"+`tool_call_id`. Round-trip `BASI_SRV_CHAT_MSGTEST=1`
      verified: model ANSWERS FROM an injected tool_result (id-pairing templates right).
-   - ⬜ **(b) pt2 WIRING (next)** — the run_turn surgery. Add `generate_chat(messages,
-     msg_count, &tool_calls_out, &n_out)` in model.c: build msgs/tools JSON →
-     `srvchat_complete` with a display cb (reasoning→thinking box, content→md answer;
-     SIMPLER than SrvDisplay — reasoning is pre-separated, no `<think>` tag parsing) →
-     return content as GenerateResult.text + STRUCTURED tool_calls (convert SrvToolCall
-     →BasiToolCall, reuse the existing dispatch). In `run_turn` (main.c ~2857-3241),
-     when server-chat: SKIP apply_template + prev_len delta + `basi_parse_tool_calls`;
-     feed the structured tool_calls straight to the dispatch; take ctx-used from
-     `r->prompt_tokens` (drop `srv_update_ctx_used` tokenize). Gate on a flag first
-     (BASI_SERVER_CHAT) to keep the /completion path as fallback until proven, then
-     make default. deepsearch: point ds_generate at the same chat path.
+   - ✅ **(b) pt2 WIRING DONE** (`b382498`). `generate_chat(messages, msg_count,
+     &tc_out, &n_out)` in model.c: serialize → `srvchat_complete` (reasoning→thinking
+     box, content→md answer; no `<think>` parsing) → answer text + STRUCTURED
+     tool_calls (→BasiToolCall) + `prompt_tokens`. run_turn has a BASI_SERVER_CHAT
+     branch: calls generate_chat, ctx-used from usage, feeds structured calls to the
+     EXISTING native dispatch, skips apply_template grammar-reset + PEG parse.
+     **Qwen3.x quirk handled**: a brief answer sometimes lands entirely in
+     `reasoning_content` (content empty) — when no content + no tool_call, promote
+     reasoning to the answer & reveal it. Verified: "count .c files in src/" → round1
+     `bash find…|wc -l` executes, round2 "There are 21 .c files"; ctx honest 2.5k→3.4k.
+     Diagnostics kept: BASI_DEBUG_CHAT. **REMAINING in (b):** (i) make BASI_SERVER_CHAT
+     the DEFAULT once validated interactively (markdown path + multi-turn REPL);
+     (ii) deepsearch — ds_generate() still hits /completion via generate_server; it
+     clears g_tools so generate_chat would send no tools and the model would emit the
+     `<tool>` ReAct format in `content` (deepsearch parses that) — route ds to
+     generate_chat and confirm; (iii) legacy/non-native models in chat mode (today
+     the branch assumes tool-capable — fine for the target models).
    - ⬜ **(c) delete native path** — remove model.c generate() decode loop + samplers +
      the ThinkingState machine + SrvDisplay(/completion), deepsearch `dctx`, spec.cpp
      (dead-end), the `common_chat` grammar/parse/render in chat_tmpl.cpp (keep only the
