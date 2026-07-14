@@ -8,13 +8,16 @@ maintained, faster path. BASI's identity (reuse pillar — llama-independent —
 agent loop, tools, prompts, deterministic-first) lives ABOVE the generation layer,
 so the pivot sharpens "its own thing," doesn't dilute it.
 
-## STATE: server-only rewrite well underway. Branch `spec-decode-mtp`, latest `c22acf5`.
+## STATE: server-only rewrite well underway. Branch `spec-decode-mtp`, latest `f50ac68`.
 Items 1/2/4/5/5b DONE+verified. Item 6 (drop libllama) IN PROGRESS: (a) chat client +
-(b) agent-loop-over-chat DONE. **(c) native teardown UNDERWAY: chat+server are now the
-DEFAULT/mandatory path (no BASI_SERVER/BASI_SERVER_CHAT needed), spec.cpp deleted, and
-the 448-line in-process decode loop in generate() is GONE — generate() just delegates
-to the server.** Remaining (c): prune dead native-only main.c, remove the /completion
-path, remove common_chat, embed→HTTP. Then (d) drop the link. See §6.
+(b) agent-loop-over-chat DONE. **(c) native teardown MOSTLY DONE: chat+server are the
+DEFAULT/mandatory path (no env needed); spec.cpp + the 448-line in-process decode loop +
+the ENTIRE /completion path (generate/generate_server/SrvDisplay) are DELETED; ALL
+generation (agent loop, --no-tools, final-gen, summary, deepsearch) now flows through
+generate_chat → /v1/chat/completions.** model.c 1870→1108 lines; srvgen.c + srvchat.cpp
+are already libllama-free. Remaining (c): remove the DEAD run_turn renders + main.c
+native leftovers (sampler chain, ctx, g_tool_grammar) + common_chat + embed→HTTP. Then
+(d) drop the link. See §6 for the precise list.
 
 **Launch-script feature (`5791c05`,`b15517a`):** the model picker now configures the
 llama-server launch (SPEC-DECODE + FLASH-ATTN sections, auto-following model MTP-ness)
@@ -156,14 +159,36 @@ Server logs → `/tmp/basi_srvgen.log`. Server binds `127.0.0.1:8181`.
        - ✅ step2 (`918c7af`… `use_server=true`): server mode DEFAULT/mandatory (was BASI_NATIVE hatch, now removed) — every launch spawns llama-server.
        - ✅ step3 (`…`): deleted `src/spec.{c,h}` (parked native-MTP dead-end) + its self-test hook.
        - ✅ step4 (`c22acf5`): DELETED the in-process decode loop in generate() (~448 lines: tokenize→llama_decode→sampler loop, inline ThinkingState, batch/KV, per-token UTF-8/Ctrl+T). generate() is now a thin `return generate_server(prompt)` wrapper. Display helpers (draw/clear_thinking_box, utf8_seq_len, strip_thinking_dup) stay (used by SrvDisplay + ChatDisplay). Verified: chat tool-call + --no-tools both work.
-     REMAINING in (c): prune now-dead native-only main.c (the sampler chain create,
-     full-weight load branch, native ctx VRAM-retry — all unused since generate()
-     ignores smpl and use_server is always true); remove the /completion path
-     (generate_server + SrvDisplay + srvgen_complete) AFTER moving deepsearch / no-tools
-     `-p` / the tool-exhausted final-gen off `generate()`→chat; remove the `common_chat`
-     grammar/parse/render in chat_tmpl.cpp (keep the nlohmann serializers); route embed.c
-     → a SPAWNED embedder llama-server `--embedding` + `/embedding`; `llama_chat_message`
-     POD → local struct so headers need no llama.h.
+     MORE done (2026-07-14):
+       - ✅ step5 (`…`): deepsearch → generate_chat (no more apply_template/generate()/dctx-gen).
+       - ✅ step6 (`771d882`): moved --no-tools -p, tool-exhausted final-gen, and
+         summarize_head onto generate_chat; removed run_turn's BASI_SERVER_COMPLETION
+         branch + the legacy <tool>-extraction dispatch (server returns structured calls).
+       - ✅ step7 (`0f58144`): DELETED the whole /completion path — generate(),
+         generate_server(), the SrvDisplay STATE_* machine, strip_thinking_dup,
+         ThinkingState, utf8_seq_len. model.c 1422→1108. srvgen_complete kept (self-test,
+         libllama-free). generate_server was the last generation-path user of common_chat grammar.
+     REMAINING (c) — precise, all now DEAD code (chat is the only path):
+       - **run_turn dead renders**: 5 `apply_template(...)` sites (turn-start ~2936, in-loop
+         reclaim re-render ~3006, post-tool ~3145/3154, reprompt ~3192) + the delta_unsafe/
+         kv_resync_full/prev_len machinery + srv_update_ctx_used — all feed prompt/prompt_len
+         which nothing reads now (currently `(void)`-silenced). Remove them → basi_render_chat
+         becomes dead.
+       - **main.c native leftovers**: the sampler chain (llama_sampler_* + SAMPLER_TAIL),
+         g_tool_grammar + basi_tool_grammar_sampler, the ctx create + VRAM-retry, llama_n_ctx/
+         llama_get_memory (statusbar/`context_used_tokens` — replace with basi_srv_ctx_used +
+         a stored srv_ctx total), tokenize in srv_update_ctx_used (dead).
+       - **chat_tmpl.cpp**: drop common_chat grammar/parse/render (basi_render_chat,
+         basi_tool_grammar_sampler/_json, basi_parse_tool_calls, basi_thinking_tags,
+         basi_tools_active→just return 1) once the above stop calling them; KEEP the nlohmann
+         serializers (basi_messages_to_json/basi_tools_to_json).
+       - **deepsearch.c**: delete the now-unused dctx create + dsmpl/xsmpl samplers.
+       - **model load**: once nothing uses the vocab_only model/vocab, drop the load + ctx +
+         llama_backend. `llama_chat_message` POD {role,content} → local struct so headers need
+         no llama.h.
+       - **embed.c**: route to a SPAWNED embedder llama-server `--embedding` + `/embedding`.
+     Surface now: main.c 33, embed.c 23, chat_tmpl.cpp 21, deepsearch.c 16 symbols;
+     srvgen.c + srvchat.cpp already ZERO. Then (d) drop `-lllama -lllama-common -lggml*`.
    - ⬜ **(d) drop link** — remove `-lllama -lllama-common -lggml* -lvulkan` and the
      `-I$(LLAMA_DIR)/...` includes (keep a vendored nlohmann). Verify `ldd basi-cli`
      shows no libllama/libggml. ABI-coupling gotcha GONE.
