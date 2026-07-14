@@ -17,13 +17,28 @@ extern "C" {
 pid_t srvgen_spawn(const char *server_bin, const char *model_path, int ngl, int ctx,
                    const char *extra, int port, const char *logpath, int timeout_s);
 
+/* Sampling knobs for a /completion request, mirroring BASI's native sampler
+ * chain (penalties → min_p → temp → dist). A field set to its "omit" sentinel is
+ * left out of the request so the server uses its own default. NULL SrvSampling*
+ * => server defaults everywhere (greedy off). */
+typedef struct {
+    double temperature;    /* <0 → omit; 0 → greedy (argmax) */
+    double repeat_penalty; /* <=1 → omit */
+    int    repeat_last_n;  /* <0 → omit (window for repeat_penalty) */
+    double min_p;          /* <0 → omit */
+    int    top_k;          /* <=0 → omit */
+    double top_p;          /* <0 or >=1 → omit */
+    long   seed;           /* <0 → omit (random each request) */
+} SrvSampling;
+
 /* Stream one /completion. Calls emit(content_chunk, ud) per SSE chunk as tokens
  * arrive. Returns the full generated text (malloc'd; caller frees) or NULL.
- * Fills *tps (tok/s) and *n_out (tokens) if non-NULL. greedy!=0 => argmax. */
-/* grammar_fragment: caller-provided valid JSON spliced verbatim into the request
-   (e.g. basi_tool_grammar_json()'s output), or NULL. */
-char *srvgen_complete(int port, const char *prompt, int n_predict, double temp,
-                      int greedy, const char *grammar_fragment,
+ * Fills *tps (tok/s) and *n_out (tokens) if non-NULL.
+ * samp: sampling knobs (NULL => server defaults).
+ * grammar_fragment: caller-provided valid JSON spliced verbatim into the request
+ *   (e.g. basi_tool_grammar_json()'s output), or NULL. */
+char *srvgen_complete(int port, const char *prompt, int n_predict,
+                      const SrvSampling *samp, const char *grammar_fragment,
                       void (*emit)(const char *chunk, void *ud), void *ud,
                       double *tps, int *n_out);
 

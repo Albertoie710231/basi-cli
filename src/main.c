@@ -3515,6 +3515,18 @@ int main(int argc, char **argv) {
         if (rp) { float v = (float)atof(rp); if (v >= 1.0f && v <= 2.0f) repeat_pen = v; }
     }
     llama_sampler_chain_add(smpl, llama_sampler_init_penalties(256, repeat_pen, 0.0f, 0.0f));
+    /* Server-backed mode decodes on llama-server, not this chain — mirror the same
+       knobs into the /completion request so generation quality matches native.
+       (min_p 0.05 matches SAMPLER_TAIL; seed omitted when random.) */
+    if (use_server) {
+        basi_srv_sampling.temperature   = temp_override >= 0 ? temp_override : 0.4;
+        basi_srv_sampling.repeat_penalty = repeat_pen;
+        basi_srv_sampling.repeat_last_n  = 256;
+        basi_srv_sampling.min_p          = 0.05;
+        basi_srv_sampling.top_k          = top_k;
+        basi_srv_sampling.top_p          = top_p;
+        basi_srv_sampling.seed           = (cli_seed == LLAMA_DEFAULT_SEED) ? -1 : (long) cli_seed;
+    }
     /* The rest of the chain (min_p → temp → dist) is appended by SAMPLER_TAIL
        below, AFTER the tool-call grammar (when native tools are active) so the
        grammar masks invalid tokens before min_p/temp narrow the set. */

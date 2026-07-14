@@ -3,6 +3,7 @@
 
 #include <stddef.h>
 #include "llama.h"
+#include "srvgen.h"   /* SrvSampling (server-backed generation knobs) */
 
 /* One-shot init: registers the llama log callback + loads ggml backends. */
 void model_init(void);
@@ -46,6 +47,9 @@ typedef struct {
    deriving the tool grammar. */
 extern int basi_srv_port;
 extern const struct llama_model *basi_srv_model;
+/* Sampling knobs for the server /completion request (filled by main.c to mirror
+   the native sampler chain). */
+extern SrvSampling basi_srv_sampling;
 
 GenerateResult generate(
     struct llama_context *ctx,

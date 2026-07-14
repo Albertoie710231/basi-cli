@@ -103,6 +103,10 @@ typedef enum {
  * to derive the tool grammar. */
 int basi_srv_port = 0;
 const struct llama_model *basi_srv_model = NULL;
+/* Defaults mirror BASI's native sampler chain (main.c overwrites in server mode):
+   temp 0.4, repeat_penalty 1.1 over 256 tokens, min_p 0.05, top_k/top_p/seed off. */
+SrvSampling basi_srv_sampling = { .temperature = 0.4, .repeat_penalty = 1.1, .repeat_last_n = 256,
+                                  .min_p = 0.05, .top_k = 0, .top_p = 1.0, .seed = -1 };
 
 /* Remove <think>…</think> spans from a response (unless generate_keep_think).
  * Returns a malloc'd copy. */
@@ -125,29 +129,259 @@ static char *strip_thinking_dup(const char *s) {
     return sb_to_str(&out);
 }
 
-/* Stream each SSE content chunk to the terminal (markdown-rendered / quiet-aware). */
-static void srv_display_emit(const char *chunk, void *ud) {
-    int md = *(int *) ud;
-    if (generate_quiet) return;
-    if (md) md_feed(chunk, strlen(chunk));
-    else { fputs(chunk, stdout); fflush(stdout); }
+/* ── Server-path streaming display filter ────────────────────────────────────
+ * The server streams raw /completion content — thinking and tool-call markup
+ * included. This runs the SAME hide-thinking / hide-tool-markup state machine as
+ * native generate() over the SSE chunks, so the live display matches: the
+ * reasoning span collapses to a spinner box (or dim [thinking] text under
+ * Ctrl+T), native tool-call markup is suppressed, and answer text is
+ * markdown-rendered. Display only — the returned/stored text is the full
+ * accumulation srvgen_complete() builds independently (markup intact for the
+ * parser; strip_thinking_dup() drops the reasoning). */
+enum { SRV_OPEN_THINK = 1, SRV_OPEN_TOOLCALL = 2 };
+
+typedef struct {
+    ThinkingState state;
+    char   tag_buf[64];
+    size_t tag_len;
+    struct { const char *s; size_t len; int act; } openers[3];
+    int    n_openers;
+    char   think_open_buf[48], think_close_buf[48];
+    const char *think_open, *think_close;
+    size_t think_open_len, think_close_len;
+    int    md;
+    size_t spinner_frame;
+    double last_spinner;
+    bool   thinking_box_shown;
+    unsigned char utf8_buf[4];
+    size_t utf8_len;
+    bool   stdin_is_tty;
+} SrvDisplay;
+
+/* Reveal / tear down the thinking box (or its dim [thinking] header). */
+static void srv_think_open_ui(SrvDisplay *d) {
+    if (generate_quiet) { d->thinking_box_shown = true; return; }
+    if (show_thinking) { printf("\033[90m[thinking] "); fflush(stdout); }
+    else { draw_thinking_box(d->spinner_frame); d->last_spinner = time_now(); }
+    d->thinking_box_shown = true;
+}
+static void srv_think_close_ui(SrvDisplay *d) {
+    if (!d->thinking_box_shown) return;
+    if (!generate_quiet) { if (show_thinking) printf("\033[0m\n"); else clear_thinking_box(); fflush(stdout); }
+    d->thinking_box_shown = false;
+}
+
+/* Emit answer text: through the markdown renderer, or raw with a colour reset. */
+static void srv_emit_normal(SrvDisplay *d, const char *p, size_t n) {
+    if (n == 0) return;
+    if (d->md) md_feed(p, n);
+    else if (!generate_quiet) { printf("\033[0m"); fwrite(p, 1, n, stdout); fflush(stdout); }
+}
+
+static void srv_display_init(SrvDisplay *d, const char *prompt, size_t prompt_len) {
+    memset(d, 0, sizeof *d);
+    d->state = STATE_NORMAL;
+    d->md = (generate_markdown && !generate_quiet) ? 1 : 0;
+    d->stdin_is_tty = isatty(STDIN_FILENO);
+
+    /* Reasoning delimiters from THIS model's template (falls back to <think>). */
+    d->think_open = "<think>"; d->think_close = "</think>";
+    const char *o = NULL, *c = NULL;
+    if (basi_thinking_tags(&o, &c) && o && c &&
+        strlen(o) > 0 && strlen(o) < sizeof d->think_open_buf &&
+        strlen(c) > 0 && strlen(c) < sizeof d->think_close_buf) {
+        strcpy(d->think_open_buf,  o); d->think_open  = d->think_open_buf;
+        strcpy(d->think_close_buf, c); d->think_close = d->think_close_buf;
+    }
+    d->think_open_len  = strlen(d->think_open);
+    d->think_close_len = strlen(d->think_close);
+
+    d->openers[d->n_openers].s = d->think_open; d->openers[d->n_openers].len = d->think_open_len;
+    d->openers[d->n_openers].act = SRV_OPEN_THINK; d->n_openers++;
+    if (generate_native_tools) {
+        d->openers[d->n_openers].s = "<tool_call>";  d->openers[d->n_openers].len = 11; d->openers[d->n_openers].act = SRV_OPEN_TOOLCALL; d->n_openers++;
+        d->openers[d->n_openers].s = "<|tool_call>"; d->openers[d->n_openers].len = 12; d->openers[d->n_openers].act = SRV_OPEN_TOOLCALL; d->n_openers++;
+    }
+
+    /* Forced-open thinking: Qwen3.x-style templates inject the opening think tag
+       into the PROMPT, so the model streams only the reasoning CONTENT and then
+       the close tag. If the rendered prompt ends with the open tag, start INSIDE
+       the thinking block (exactly as if we'd just matched it). */
+    if (d->think_open_len > 0 && prompt) {
+        size_t pl = prompt_len;
+        while (pl > 0 && (prompt[pl-1]=='\n' || prompt[pl-1]=='\r' ||
+                          prompt[pl-1]==' '  || prompt[pl-1]=='\t')) pl--;
+        if (pl >= d->think_open_len &&
+            memcmp(prompt + pl - d->think_open_len, d->think_open, d->think_open_len) == 0) {
+            d->state = STATE_THINKING;
+            srv_think_open_ui(d);
+        }
+    }
+}
+
+/* srvgen_complete() emit callback: run one SSE content chunk through the state
+   machine. ud is the SrvDisplay*. */
+static void srv_display_feed(const char *chunk, void *ud) {
+    SrvDisplay *d = (SrvDisplay *) ud;
+    size_t n = strlen(chunk);
+
+    /* Ctrl+T toggles the thinking display (box <-> dim text), like native. Only
+       on an interactive TTY (a pipe would steal the next prompt's bytes). */
+    if (!generate_quiet && d->stdin_is_tty) {
+        struct pollfd pfd = { .fd = STDIN_FILENO, .events = POLLIN };
+        if (poll(&pfd, 1, 0) > 0 && (pfd.revents & POLLIN)) {
+            unsigned char key;
+            if (read(STDIN_FILENO, &key, 1) == 1 && key == 0x14) {   /* Ctrl+T */
+                show_thinking = !show_thinking;
+                if (d->state == STATE_THINKING || d->state == STATE_MAYBE_CLOSE) {
+                    if (show_thinking) {
+                        if (d->thinking_box_shown) { clear_thinking_box(); }
+                        printf("\033[90m[thinking] "); fflush(stdout);
+                        d->thinking_box_shown = true;
+                    } else {
+                        printf("\033[0m\n");
+                        draw_thinking_box(d->spinner_frame);
+                        d->thinking_box_shown = true;
+                        d->last_spinner = time_now();
+                    }
+                }
+            }
+        }
+    }
+
+    size_t piece_start = 0;
+    for (size_t idx = 0; idx < n; idx++) {
+        char ch = chunk[idx];
+        switch (d->state) {
+        case STATE_NORMAL:
+            if (ch == '<') {
+                if (idx > piece_start) srv_emit_normal(d, chunk + piece_start, idx - piece_start);
+                d->state = STATE_MAYBE_OPEN;
+                d->tag_len = 0;
+                d->tag_buf[d->tag_len++] = ch;
+                piece_start = idx + 1;
+            }
+            break;
+
+        case STATE_MAYBE_OPEN: {
+            if (d->tag_len < sizeof d->tag_buf) d->tag_buf[d->tag_len++] = ch;
+            int matched = 0; bool alive = false;
+            for (int oi = 0; oi < d->n_openers; oi++) {
+                if (d->tag_len <= d->openers[oi].len &&
+                    memcmp(d->tag_buf, d->openers[oi].s, d->tag_len) == 0) {
+                    alive = true;
+                    if (d->tag_len == d->openers[oi].len) { matched = d->openers[oi].act; break; }
+                }
+            }
+            if (matched == SRV_OPEN_THINK) {
+                d->state = STATE_THINKING; d->tag_len = 0; piece_start = idx + 1;
+                srv_think_open_ui(d);
+            } else if (matched == SRV_OPEN_TOOLCALL) {
+                if (d->md) md_end();   /* close the answer before the hidden markup */
+                d->state = STATE_SUPPRESS; d->tag_len = 0; piece_start = idx + 1;
+            } else if (!alive) {
+                srv_emit_normal(d, d->tag_buf, d->tag_len);
+                d->state = STATE_NORMAL; d->tag_len = 0; piece_start = idx + 1;
+            }
+            /* else: still a viable prefix of some opener — keep buffering */
+            break;
+        }
+
+        case STATE_SUPPRESS:
+            /* Native tool-call markup: kept in the returned text (parser needs
+               it), never displayed. Stays hidden until generation ends. */
+            piece_start = idx + 1;
+            break;
+
+        case STATE_THINKING:
+            if (ch == '<') {
+                d->state = STATE_MAYBE_CLOSE; d->tag_len = 0; d->tag_buf[d->tag_len++] = ch;
+            } else {
+                if (show_thinking) { if (!generate_quiet) { printf("\033[90m%c", ch); fflush(stdout); } }
+                else {
+                    double now = time_now();
+                    if (now - d->last_spinner > 0.08) {
+                        d->spinner_frame++; draw_thinking_box(d->spinner_frame); d->last_spinner = now;
+                    }
+                }
+            }
+            piece_start = idx + 1;
+            break;
+
+        case STATE_MAYBE_CLOSE:
+            if (d->tag_len < sizeof d->tag_buf) d->tag_buf[d->tag_len++] = ch;
+            if (d->tag_len <= d->think_close_len && d->tag_buf[d->tag_len-1] == d->think_close[d->tag_len-1]) {
+                if (d->tag_len == d->think_close_len) {
+                    d->state = STATE_NORMAL; d->tag_len = 0; piece_start = idx + 1;
+                    srv_think_close_ui(d);
+                }
+            } else {
+                /* '<…' inside the reasoning, not the close tag — keep it hidden */
+                if (show_thinking && !generate_quiet) {
+                    printf("\033[90m"); fwrite(d->tag_buf, 1, d->tag_len, stdout); fflush(stdout);
+                }
+                d->state = STATE_THINKING; d->tag_len = 0; piece_start = idx + 1;
+            }
+            break;
+        }
+    }
+
+    /* Flush the normal-state tail, holding back only a trailing incomplete UTF-8
+       sequence so a chunk boundary can't split a multibyte char. Server chunks
+       are normally already whole-UTF-8, so utf8_len stays 0 in practice. */
+    if (d->state == STATE_NORMAL && piece_start < n) {
+        const unsigned char *slice = (const unsigned char *) chunk + piece_start;
+        size_t slice_len = n - piece_start;
+
+        /* Complete a sequence left dangling from the previous chunk first. */
+        if (d->utf8_len > 0) {
+            size_t need = utf8_seq_len(d->utf8_buf[0]);
+            while (d->utf8_len < need && slice_len > 0) { d->utf8_buf[d->utf8_len++] = *slice++; slice_len--; }
+            if (d->utf8_len == need) { srv_emit_normal(d, (const char *) d->utf8_buf, need); d->utf8_len = 0; }
+            else return;   /* still incomplete — wait for the next chunk */
+        }
+
+        size_t boundary = 0, pos = 0;
+        while (pos < slice_len) {
+            size_t slen = utf8_seq_len(slice[pos]);
+            if (pos + slen <= slice_len) { boundary = pos + slen; pos += slen; }
+            else break;
+        }
+        if (boundary > 0) srv_emit_normal(d, (const char *) slice, boundary);
+        if (boundary < slice_len) {
+            size_t rem = slice_len - boundary;
+            if (rem > sizeof d->utf8_buf) rem = sizeof d->utf8_buf;   /* never overflow */
+            memcpy(d->utf8_buf, slice + boundary, rem);
+            d->utf8_len = rem;
+        }
+    }
+}
+
+/* Flush any buffered UTF-8 and close an open thinking box at end of stream. */
+static void srv_display_finish(SrvDisplay *d) {
+    if (d->utf8_len > 0) { srv_emit_normal(d, (const char *) d->utf8_buf, d->utf8_len); d->utf8_len = 0; }
+    if (d->thinking_box_shown) srv_think_close_ui(d);
 }
 
 static GenerateResult generate_server(const char *prompt) {
     GenerateResult res = { NULL, 0, 0, 0.0, 0.0 };
-    const int md = (generate_markdown && !generate_quiet) ? 1 : 0;
 
     char *frag = basi_srv_model ? basi_tool_grammar_json(basi_srv_model) : NULL;
 
     long cap = 0; { const char *e = getenv("BASI_MAX_TOKENS"); if (e && *e) cap = atol(e); }
     int n_predict = cap > 0 ? (int) cap : -1;
 
-    if (md) md_begin();
+    SrvDisplay disp;
+    srv_display_init(&disp, prompt, strlen(prompt));
+
+    if (disp.md) md_begin();
     double t0 = time_now();
     double tps = 0; int ntok = 0;
-    char *full = srvgen_complete(basi_srv_port, prompt, n_predict, 0.4, /*greedy*/ 0,
-                                 frag, srv_display_emit, (void *) &md, &tps, &ntok);
-    if (md) md_end();
+    char *full = srvgen_complete(basi_srv_port, prompt, n_predict, &basi_srv_sampling,
+                                 frag, srv_display_feed, &disp, &tps, &ntok);
+    srv_display_finish(&disp);
+    if (disp.md) md_end();
+    if (!generate_quiet) { printf("\033[0m\n"); fflush(stdout); }
     free(frag);
 
     res.gen_time_s = time_now() - t0;

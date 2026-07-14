@@ -90,8 +90,8 @@ pid_t srvgen_spawn(const char *server_bin, const char *model_path, int ngl, int 
     return -1;
 }
 
-char *srvgen_complete(int port, const char *prompt, int n_predict, double temp,
-                      int greedy, const char *grammar_fragment,
+char *srvgen_complete(int port, const char *prompt, int n_predict,
+                      const SrvSampling *samp, const char *grammar_fragment,
                       void (*emit)(const char *chunk, void *ud), void *ud,
                       double *tps, int *n_out) {
     char *esc = json_escape(prompt);
@@ -102,12 +102,26 @@ char *srvgen_complete(int port, const char *prompt, int n_predict, double temp,
     int rfd = mkstemp(reqpath);
     if (rfd < 0) { free(esc); return NULL; }
     FILE *rf = fdopen(rfd, "w");
-    fprintf(rf, "{\"prompt\":\"%s\",\"n_predict\":%d,\"temperature\":%.3f,%s",
-            esc, n_predict, temp, greedy ? "\"top_k\":1," : "");
+    fprintf(rf, "{\"prompt\":\"%s\",\"n_predict\":%d", esc, n_predict);
+    /* Sampling knobs mirroring BASI's native chain; each omitted at its sentinel
+       so the server falls back to its own default. temperature==0 => greedy, and
+       we also pin top_k:1 so a sampler tail can't reintroduce randomness. */
+    if (samp) {
+        if (samp->temperature >= 0)   fprintf(rf, ",\"temperature\":%.3f", samp->temperature);
+        if (samp->temperature == 0.0) fprintf(rf, ",\"top_k\":1");
+        else if (samp->top_k > 0)     fprintf(rf, ",\"top_k\":%d", samp->top_k);
+        if (samp->repeat_penalty > 1.0) {
+            fprintf(rf, ",\"repeat_penalty\":%.3f", samp->repeat_penalty);
+            if (samp->repeat_last_n >= 0) fprintf(rf, ",\"repeat_last_n\":%d", samp->repeat_last_n);
+        }
+        if (samp->min_p >= 0)                       fprintf(rf, ",\"min_p\":%.4f", samp->min_p);
+        if (samp->top_p >= 0 && samp->top_p < 1.0)  fprintf(rf, ",\"top_p\":%.4f", samp->top_p);
+        if (samp->seed >= 0)                        fprintf(rf, ",\"seed\":%ld", samp->seed);
+    }
     /* grammar_fragment is caller-provided valid JSON, spliced verbatim, e.g.
        "grammar":"…","grammar_lazy":true,"grammar_triggers":[…]  */
-    if (grammar_fragment && *grammar_fragment) fprintf(rf, "%s,", grammar_fragment);
-    fprintf(rf, "\"cache_prompt\":true,\"stream\":true}");
+    if (grammar_fragment && *grammar_fragment) fprintf(rf, ",%s", grammar_fragment);
+    fprintf(rf, ",\"cache_prompt\":true,\"stream\":true}");
     fclose(rf);
     free(esc);
 
@@ -199,7 +213,9 @@ void srvgen_selftest(const char *model_path, int ngl, int ctx) {
     }
 
     double tps = 0; int n = 0;
-    char *txt = srvgen_complete(port, prompt, n_predict, 0.0, 1, frag, print_emit, NULL, &tps, &n);
+    SrvSampling greedy = { .temperature = 0.0, .repeat_penalty = 0, .repeat_last_n = -1,
+                           .min_p = -1, .top_k = 0, .top_p = -1, .seed = -1 };
+    char *txt = srvgen_complete(port, prompt, n_predict, &greedy, frag, print_emit, NULL, &tps, &n);
     free(frag);
     fprintf(stderr, "\n---\n[srv] %d tokens, %.2f tok/s\n", n, tps);
 
