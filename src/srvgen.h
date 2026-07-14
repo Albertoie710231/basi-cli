@@ -17,6 +17,37 @@ extern "C" {
 pid_t srvgen_spawn(const char *server_bin, const char *model_path, int ngl, int ctx,
                    const char *extra, int port, const char *logpath, int timeout_s);
 
+/* The llama-server launch configuration the model menu edits and BASI runs from.
+ * Since generation is delegated to llama-server, "how to run the model" IS this
+ * command — BASI writes it to a standalone, editable shell script and execs it. */
+typedef struct {
+    const char *server_bin;       /* llama-server binary */
+    const char *model_path;
+    int         ngl;              /* -ngl */
+    int         ctx;              /* -c   */
+    const char *host;             /* --host (default 127.0.0.1) */
+    int         port;             /* --port (BASI connects here) */
+    const char *spec_type;        /* --spec-type (e.g. "draft-mtp"); NULL/"" = off */
+    int         spec_nmax;        /* --spec-draft-n-max */
+    int         flash_attn;       /* -fa on */
+    int         jinja;            /* --jinja (needed for the chat/tools endpoints) */
+    const char *reasoning_format; /* --reasoning-format (e.g. "auto"); NULL = omit */
+} SrvLaunch;
+
+/* Write a standalone, runnable llama-server launch script to `path` (creating the
+ * parent dir). The script carries a "# BASI-MODEL: <path>" marker so BASI can tell
+ * a stale/other-model script from a user-edited one for the same model. Returns 0
+ * on success, -1 on error. */
+int srvgen_write_launch_script(const SrvLaunch *cfg, const char *path);
+
+/* If `path` exists and its "# BASI-MODEL:" marker equals model_path, return 1
+ * (reuse the user's script as-is); else 0 (missing / stale / different model). */
+int srvgen_script_matches(const char *path, const char *model_path);
+
+/* Spawn llama-server by exec'ing a launch script (`bash path`), then poll /health
+ * on `port`. Same return contract as srvgen_spawn. */
+pid_t srvgen_spawn_script(const char *path, int port, const char *logpath, int timeout_s);
+
 /* Sampling knobs for a /completion request, mirroring BASI's native sampler
  * chain (penalties → min_p → temp → dist). A field set to its "omit" sentinel is
  * left out of the request so the server uses its own default. NULL SrvSampling*

@@ -3544,18 +3544,32 @@ int main(int argc, char **argv) {
     if (use_server) {
         const char *sbin = getenv("BASI_SERVER_BIN");
         if (!sbin || !*sbin) sbin = "/home/alberto/llama.cpp/build_vulkan/bin/llama-server";
-        char extra[128] = "";
         const char *spec = getenv("BASI_SPEC");
-        if (spec && *spec) {
-            int nmax = 1; const char *e = getenv("BASI_SPEC_NMAX"); if (e && *e) nmax = atoi(e);
-            snprintf(extra, sizeof extra, "-fa on --spec-type %s --spec-draft-n-max %d", spec, nmax);
-        }
+        int spec_nmax = 1;
+        { const char *e = getenv("BASI_SPEC_NMAX"); if (e && *e) spec_nmax = atoi(e); }
         int srv_ctx = ctx_override > 0 ? ctx_override : CONTEXT_SIZE;
+
+        /* "How to run llama-server for this model" IS the config now, so BASI keeps
+           it as a standalone, editable script (.basi/run-llama-server.sh) and execs
+           it. Reuse the user's script when it targets THIS model (respecting edits);
+           regenerate when it's missing or for a different model (e.g. after /model). */
+        const char *script = ".basi/run-llama-server.sh";
+        SrvLaunch L = {
+            .server_bin = sbin, .model_path = model_path, .ngl = n_gpu_layers,
+            .ctx = srv_ctx, .host = "127.0.0.1", .port = 8181,
+            .spec_type = (spec && *spec) ? spec : NULL, .spec_nmax = spec_nmax,
+            .flash_attn = (spec && *spec) ? 1 : 0, .jinja = 1, .reasoning_format = "auto",
+        };
+        if (srvgen_script_matches(script, model_path)) {
+            fprintf(stderr, "\033[90m[server mode] using launch script %s (edit it to change flags)\033[0m\n", script);
+        } else {
+            if (srvgen_write_launch_script(&L, script) == 0)
+                fprintf(stderr, "\033[90m[server mode] wrote launch script %s\033[0m\n", script);
+        }
         fprintf(stderr, "\033[90m[server mode] spawning llama-server (holds the weights)…\033[0m\n");
-        g_srv_pid = srvgen_spawn(sbin, model_path, n_gpu_layers, srv_ctx,
-                                 extra[0] ? extra : NULL, 8181, "/tmp/basi_srvgen.log", 300);
+        g_srv_pid = srvgen_spawn_script(script, 8181, "/tmp/basi_srvgen.log", 300);
         if (g_srv_pid < 0) {
-            fprintf(stderr, "Error: llama-server failed to start (see /tmp/basi_srvgen.log)\n");
+            fprintf(stderr, "Error: llama-server failed to start (see /tmp/basi_srvgen.log and %s)\n", script);
             llama_model_free(model);
             return 1;
         }
