@@ -8,13 +8,13 @@ maintained, faster path. BASI's identity (reuse pillar — llama-independent —
 agent loop, tools, prompts, deterministic-first) lives ABOVE the generation layer,
 so the pivot sharpens "its own thing," doesn't dilute it.
 
-## STATE: server-only rewrite well underway. Branch `spec-decode-mtp`, latest `b3bde9e`.
+## STATE: server-only rewrite well underway. Branch `spec-decode-mtp`, latest `e3670bb`.
 Items 1/2/4/5/5b DONE+verified. Item 6 (drop libllama) IN PROGRESS: (a) chat client +
 (b) agent-loop-over-chat DONE. **(c) native teardown MOSTLY DONE: chat+server are the
 DEFAULT/mandatory path (no env needed); spec.cpp + the 448-line in-process decode loop +
 the ENTIRE /completion path (generate/generate_server/SrvDisplay) are DELETED; ALL
 generation (agent loop, --no-tools, final-gen, summary, deepsearch) now flows through
-generate_chat → /v1/chat/completions.** model.c 1870→~1050 lines. **common_chat GUTTED
+generate_chat → /v1/chat/completions.** **main.c now calls ZERO llama functions (model+ctx load deleted).** common_chat GUTTED
 (chat_tmpl.cpp nlohmann-only), sampler chain + all dead renders removed, deepsearch
 dctx removed — chat_tmpl.cpp + deepsearch.c are now function-libllama-free.** Remaining
 (c): main.c model+ctx load (swap statusbar off llama_n_ctx), model.c ggml gguf-reading,
@@ -177,24 +177,27 @@ Server logs → `/tmp/basi_srvgen.log`. Server binds `127.0.0.1:8181`.
      tools_active; native_tools hardcoded 1; removed deepsearch's dead dctx + samplers
      (now function-libllama-free). Verified at each step (chat tool loops + multi-turn
      recall + deepsearch).
-     REMAINING (c) — the last function-level libllama users:
-       - **main.c** (~11 fns): the vocab_only MODEL LOAD (llama_model_load_from_file/
-         default_params/get_vocab/free) + CTX (llama_init_from_model/free/n_ctx/
-         get_memory/memory_seq_pos_max/memory_clear/context_default_params). To drop:
-         make `context_used_tokens` return basi_srv_ctx_used unconditionally; store the
-         server ctx size in a global and swap `llama_n_ctx(ctx)`→it (statusbar +
-         format_context_meter); make kv_resync_full just reset prev_len (drop
-         llama_memory_clear); then delete the model+ctx load entirely (nothing uses
-         model/vocab/ctx after — basi_srv_model was only for the deleted grammar).
-       - **model.c** (3 fns): model_init (ggml_backend_load_all + llama_log_set) + the
-         picker's read_gguf_arch (ggml_dtype_bytes_per_elem, VRAM estimate). The picker
-         reads GGUF metadata off disk directly — reimplement the dtype-size lookup as a
-         static table to drop ggml, and model_init becomes unnecessary once no model loads.
-       - **embed.c** (15 fns, NET-NEW WORK): route to a SPAWNED embedder llama-server
-         (`--embedding`) + `/embedding` HTTP. The one piece that's new code, not deletion.
+     ✅ **main.c DONE** (steps 12–13, `e3670bb`): ctx accounting moved off the local
+     ctx (context_used_tokens→basi_srv_ctx_used, new basi_srv_ctx_total replaces every
+     llama_n_ctx, kv_resync just resets prev_len); **deleted the vocab_only model load +
+     ctx create entirely** — model/vocab/ctx are NULL locals now. **main.c calls ZERO
+     llama functions.** Verified: full launch with no in-process load runs the tool loop
+     + ctx meter.
+     REMAINING (c) — the last function-level libllama, all in the embed path:
+       - **embed.c** (15 fns, NET-NEW — the gate): route to a SPAWNED embedder
+         llama-server (jina/bge `--embedding` on a 2nd port, e.g. 8182) + a small
+         `/embedding` HTTP client (mirror srvgen_spawn_script + a curl POST parsing the
+         float array). embed.c already has resolve_embed_model_path() + embed_init/
+         embed_text/embed_dim — reimplement those over HTTP. This is the only remaining
+         in-process model load, so it's what still forces `model_init` (ggml backends).
+       - **model.c** (3 fns): once embed.c no longer loads a model, model_init
+         (ggml_backend_load_all + llama_log_set) is unnecessary → delete its call + body.
+         The picker's read_gguf_arch uses ggml_dtype_bytes_per_elem — reimplement as a
+         static dtype-size table (GGUF type enum → bytes) to drop the last ggml symbol.
        - `llama_chat_message` POD {role,content} → a local struct so headers drop llama.h.
-     Surface now: main.c 19, embed.c 23, model.c 6, deepsearch.c 4 (TYPES only),
-     chat_tmpl.cpp 2 (TYPE only); srvgen.c + srvchat.cpp ZERO. Then (d) drop the link.
+     Surface now: main.c 0 fns, embed.c 15, model.c 3, deepsearch.c 0 (TYPES only),
+     chat_tmpl.cpp 0 (TYPE only); srvgen + srvchat ZERO. Then (d) drop the link — the
+     ENTIRE remaining libllama surface is the embedder + its ggml backends.
    - ⬜ **(d) drop link** — remove `-lllama -lllama-common -lggml* -lvulkan` and the
      `-I$(LLAMA_DIR)/...` includes (keep a vendored nlohmann). Verify `ldd basi-cli`
      shows no libllama/libggml. ABI-coupling gotcha GONE.
