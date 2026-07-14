@@ -2974,6 +2974,9 @@ static void run_agentic_turn(char *user_input,
         }
         char *prompt = formatted_buf + prev_len;
         size_t prompt_len = (size_t)new_len - prev_len;
+        (void) prompt; (void) prompt_len;   /* chat path uses messages; these renders
+                                               are now dead — removed in the next step
+                                               along with common_chat/apply_template. */
 
         /* Tool execution loop. The per-turn cap defaults to 40 — multi-step work
            on a large/unfamiliar repo (navigate→grep→read→edit→test→fix) needs many
