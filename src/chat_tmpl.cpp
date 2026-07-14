@@ -104,6 +104,80 @@ extern "C" void basi_set_tools(const BasiToolDef *defs, int n) {
    restore the prior state exactly. */
 extern "C" int basi_tools_registered(void) { return (int) g_tools.size(); }
 
+// ── OpenAI-format serialization for the /v1/chat/completions path (item 6) ──
+// These turn BASI's message array + registered tools into the JSON the server's
+// chat endpoint expects, so the server can do templating + grammar + parsing.
+// nlohmann-only (no common_chat/llama beyond the POD llama_chat_message), so they
+// survive when the in-process templating engine is removed.
+
+// Registered tools → OpenAI `tools` array (malloc'd JSON string, caller frees), or
+// NULL if none. parameters is stored as a JSON string; parse it back to an object.
+extern "C" char *basi_tools_to_json(void) {
+    if (g_tools.empty()) return nullptr;
+    try {
+        nlohmann::ordered_json arr = nlohmann::ordered_json::array();
+        for (const auto &t : g_tools) {
+            nlohmann::ordered_json fn;
+            fn["name"]        = t.name;
+            fn["description"] = t.description;
+            try { fn["parameters"] = nlohmann::ordered_json::parse(t.parameters); }
+            catch (...) { fn["parameters"] = nlohmann::ordered_json::object(); }
+            arr.push_back({ {"type", "function"}, {"function", std::move(fn)} });
+        }
+        return strdup(arr.dump().c_str());
+    } catch (...) { return nullptr; }
+}
+
+// BASI messages → OpenAI `messages` array (malloc'd JSON string, caller frees).
+// The custom roles map as: tool_call → assistant with tool_calls[] (synthetic
+// call_N id); tool_result → tool with tool_call_id = the preceding call's id.
+extern "C" char *basi_messages_to_json(const struct llama_chat_message *msgs, int n_msgs) {
+    try {
+        nlohmann::ordered_json arr = nlohmann::ordered_json::array();
+        int call_seq = 0;                 // ids assigned to tool_calls in order
+        std::string last_call_id;         // most recent call id, for pairing a result
+        for (int i = 0; i < n_msgs; i++) {
+            const char *role    = msgs[i].role    ? msgs[i].role    : "";
+            const char *content = msgs[i].content ? msgs[i].content : "";
+            if (strcmp(role, "tool_call") == 0) {
+                // content = {"name":..., "arguments":<json>}
+                nlohmann::ordered_json m;
+                m["role"] = "assistant";
+                m["content"] = nullptr;
+                char idbuf[32]; snprintf(idbuf, sizeof idbuf, "call_%d", call_seq++);
+                last_call_id = idbuf;
+                std::string name, args = "{}";
+                try {
+                    auto j = nlohmann::ordered_json::parse(content);
+                    if (j.contains("name")) name = j["name"].get<std::string>();
+                    if (j.contains("arguments"))
+                        args = j["arguments"].is_string() ? j["arguments"].get<std::string>()
+                                                          : j["arguments"].dump();
+                } catch (...) {}
+                m["tool_calls"] = nlohmann::ordered_json::array({
+                    { {"id", idbuf}, {"type", "function"},
+                      {"function", { {"name", name}, {"arguments", args} }} } });
+                arr.push_back(std::move(m));
+            } else if (strcmp(role, "tool_result") == 0) {
+                // content = {"name":..., "content":...}
+                nlohmann::ordered_json m;
+                m["role"] = "tool";
+                if (!last_call_id.empty()) m["tool_call_id"] = last_call_id;
+                std::string body = content;
+                try {
+                    auto j = nlohmann::ordered_json::parse(content);
+                    if (j.contains("content")) body = j["content"].get<std::string>();
+                } catch (...) {}
+                m["content"] = body;
+                arr.push_back(std::move(m));
+            } else {
+                arr.push_back({ {"role", role}, {"content", content} });
+            }
+        }
+        return strdup(arr.dump().c_str());
+    } catch (...) { return nullptr; }
+}
+
 extern "C" int basi_tools_active(const struct llama_model *model) {
     if (g_tools.empty()) return 0;
     try {

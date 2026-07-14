@@ -3424,6 +3424,41 @@ int main(int argc, char **argv) {
         return 0;
     }
 
+    /* Item 6 phase (b) round-trip: serialize a mock conversation that already
+       contains a tool_call + tool_result via basi_messages_to_json (OpenAI format,
+       synthetic call ids), send it through the chat client, and check the model
+       ANSWERS from the tool result — proving the message serialization + id
+       pairing template correctly server-side. */
+    if (getenv("BASI_SRV_CHAT_MSGTEST") && model_path) {
+        const char *sbin = getenv("BASI_SERVER_BIN");
+        if (!sbin || !*sbin) sbin = "/home/alberto/llama.cpp/build_vulkan/bin/llama-server";
+        int n; const BasiToolDef *defs = basi_tool_defs(&n); basi_set_tools(defs, n);
+        pid_t pid = srvgen_spawn(sbin, model_path, n_gpu_layers, 4096,
+                                 "--jinja --reasoning-format auto", 8181, "/tmp/basi_srvgen.log", 300);
+        if (pid < 0) { fprintf(stderr, "[msgtest] server spawn FAILED\n"); return 1; }
+        struct llama_chat_message m[4] = {
+            { "system",      "You are a helpful assistant. Answer concisely." },
+            { "user",        "What files are in the current directory? Use bash." },
+            { "tool_call",   "{\"name\":\"bash\",\"arguments\":{\"command\":\"ls\"}}" },
+            { "tool_result", "{\"name\":\"bash\",\"content\":\"README.md  main.c  secret_unicorn_9f3.txt\"}" },
+        };
+        char *mj = basi_messages_to_json(m, 4);
+        char *tj = basi_tools_to_json();
+        fprintf(stderr, "[msgtest] messages JSON:\n%s\n[msgtest] tools JSON: %.80s...\n", mj, tj);
+        SrvSampling samp = { .temperature = 0.0, .repeat_penalty = 1.1, .repeat_last_n = 256,
+                             .min_p = 0.05, .top_k = 0, .top_p = 1.0, .seed = -1 };
+        SrvChatResult *r = srvchat_complete(8181, mj, tj, &samp, 120, NULL, NULL, NULL);
+        if (r) {
+            fprintf(stderr, "[msgtest] finish=%s prompt_tokens=%d tool_calls=%d\n[msgtest] ANSWER: %s\n",
+                    r->finish_reason ? r->finish_reason : "?", r->prompt_tokens, r->n_tool_calls,
+                    r->content ? r->content : "(none)");
+            srvchat_free(r);
+        } else fprintf(stderr, "[msgtest] request FAILED\n");
+        free(mj); free(tj);
+        srvgen_kill(pid);
+        return 0;
+    }
+
     /* In --no-tools mode stdout must carry only the completion, so load chatter
      * goes to stderr. */
     fprintf(no_tools ? stderr : stdout, "BASI-CLI - Loading model...\n");

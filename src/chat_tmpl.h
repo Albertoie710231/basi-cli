@@ -35,6 +35,13 @@ void basi_set_tools(const BasiToolDef *defs, int n);
    sub-generation can clear the schemas and restore the prior state via this. */
 int  basi_tools_registered(void);
 
+/* Serialize the registered tools / a message array into the OpenAI JSON the
+   server's /v1/chat/completions endpoint expects (item 6, pure-HTTP path).
+   Both return a malloc'd string (caller frees); basi_tools_to_json returns NULL
+   when no tools are registered. */
+char *basi_tools_to_json(void);
+char *basi_messages_to_json(const struct llama_chat_message *msgs, int n_msgs);
+
 /* 1 if tools are registered AND this model's template supports tool calls
    (i.e. common_chat resolves a non-content-only format); else 0 → caller
    uses the legacy <tool> prose path. */
