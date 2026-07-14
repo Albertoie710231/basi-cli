@@ -40,6 +40,7 @@
 #include "slashmenu.h"
 #include "spec.h"
 #include "srvgen.h"
+#include "srvchat.h"
 
 /* MAX_TOKENS, CONTEXT_SIZE → globals.h */
 #define MAX_FILE_TOKENS     2000
@@ -3411,6 +3412,15 @@ int main(int argc, char **argv) {
        Proves the Pi-style pivot + gets MTP spec-decode for free. Default-off. */
     if (getenv("BASI_SERVER_SELFTEST") && model_path) {
         srvgen_selftest(model_path, n_gpu_layers, ctx_override > 0 ? ctx_override : CONTEXT_SIZE);
+        return 0;
+    }
+
+    /* Item 6 phase (a): BASI_SRV_CHAT_SELFTEST=1 spawns a server and drives the
+       /v1/chat/completions client (messages+tools → structured tool_calls +
+       separated reasoning + usage), WITHOUT loading any model in-process. Proves
+       the pure-HTTP path that will let BASI drop the libllama link. */
+    if (getenv("BASI_SRV_CHAT_SELFTEST") && model_path) {
+        srvchat_selftest(model_path, n_gpu_layers, ctx_override > 0 ? ctx_override : CONTEXT_SIZE);
         return 0;
     }
 
