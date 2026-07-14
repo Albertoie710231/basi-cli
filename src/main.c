@@ -3338,6 +3338,7 @@ int main(int argc, char **argv) {
     static char default_model[1024];
     int ctx_override = 0;
     float temp_override = -1;
+    int picker_spec = -1, picker_fa = -1;   /* server launch flags from the picker (-1 = not set) */
     bool loaded_from_default = false;   /* model came from the saved-default file */
     /* --pick (from /model): force the picker BEFORE any model is loaded, so its
        VRAM probe / auto-fit see the whole GPU free (the previous model was
@@ -3353,6 +3354,8 @@ int main(int argc, char **argv) {
             if (!ngl_set) n_gpu_layers = cfg.gpu_layers;
             ctx_override  = cfg.ctx_size;
             temp_override = cfg.temperature;
+            picker_spec   = cfg.spec_draft_mtp;
+            picker_fa     = cfg.flash_attn;
             save_default_model(model_path, n_gpu_layers, cfg.ctx_size);
         }
     }
@@ -3385,6 +3388,8 @@ int main(int argc, char **argv) {
         if (!ngl_set) n_gpu_layers = cfg.gpu_layers;
         ctx_override = cfg.ctx_size;
         temp_override = cfg.temperature;
+        picker_spec  = cfg.spec_draft_mtp;
+        picker_fa    = cfg.flash_attn;
         /* An explicit pick always (re)writes the default — including repairing a
            stale file that pointed at a since-deleted model. */
         save_default_model(model_path, n_gpu_layers, cfg.ctx_size);
@@ -3544,10 +3549,20 @@ int main(int argc, char **argv) {
     if (use_server) {
         const char *sbin = getenv("BASI_SERVER_BIN");
         if (!sbin || !*sbin) sbin = "/home/alberto/llama.cpp/build_vulkan/bin/llama-server";
-        const char *spec = getenv("BASI_SPEC");
         int spec_nmax = 1;
         { const char *e = getenv("BASI_SPEC_NMAX"); if (e && *e) spec_nmax = atoi(e); }
         int srv_ctx = ctx_override > 0 ? ctx_override : CONTEXT_SIZE;
+
+        /* Spec-decode selection, in precedence order: explicit BASI_SPEC env wins;
+           else the picker's choice; else auto-enable draft-mtp for an MTP model
+           (its head is exactly for this). Flash-attn follows the picker, else spec. */
+        const char *spec_env = getenv("BASI_SPEC");
+        int model_is_mtp = (strstr(model_path, "MTP") || strstr(model_path, "mtp")) ? 1 : 0;
+        const char *spec_type = NULL;
+        if (spec_env && *spec_env)      spec_type = spec_env;
+        else if (picker_spec == 1)      spec_type = "draft-mtp";
+        else if (picker_spec < 0 && model_is_mtp) spec_type = "draft-mtp";
+        int fa_on = (picker_fa >= 0) ? picker_fa : (spec_type != NULL);
 
         /* "How to run llama-server for this model" IS the config now, so BASI keeps
            it as a standalone, editable script (.basi/run-llama-server.sh) and execs
@@ -3557,8 +3572,8 @@ int main(int argc, char **argv) {
         SrvLaunch L = {
             .server_bin = sbin, .model_path = model_path, .ngl = n_gpu_layers,
             .ctx = srv_ctx, .host = "127.0.0.1", .port = 8181,
-            .spec_type = (spec && *spec) ? spec : NULL, .spec_nmax = spec_nmax,
-            .flash_attn = (spec && *spec) ? 1 : 0, .jinja = 1, .reasoning_format = "auto",
+            .spec_type = spec_type, .spec_nmax = spec_nmax,
+            .flash_attn = fa_on, .jinja = 1, .reasoning_format = "auto",
         };
         if (srvgen_script_matches(script, model_path)) {
             fprintf(stderr, "\033[90m[server mode] using launch script %s (edit it to change flags)\033[0m\n", script);

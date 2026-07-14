@@ -1434,7 +1434,7 @@ static HwInfo hw_probe_settled(void) {
  * Returns filled LaunchConfig, or model_path=NULL on cancel.
  */
 LaunchConfig pick_model(void) {
-    LaunchConfig cfg = { NULL, 99, CONTEXT_SIZE, 0.4f };
+    LaunchConfig cfg = { NULL, 99, CONTEXT_SIZE, 0.4f, 0, 0 };
 
     /* Build search dirs */
     init_model_search_dirs();
@@ -1478,12 +1478,19 @@ LaunchConfig pick_model(void) {
     HwInfo hw = hw_probe_settled();
 
     /* Menu state */
-    enum { SECTION_MODEL, SECTION_GPU, SECTION_CTX, SECTION_TEMP, SECTION_LAUNCH, SECTION_COUNT };
+    enum { SECTION_MODEL, SECTION_GPU, SECTION_CTX, SECTION_TEMP,
+           SECTION_SPEC, SECTION_FA, SECTION_LAUNCH, SECTION_COUNT };
     int section = SECTION_MODEL;
     int model_sel = 0;
     int gpu_setting = GPU_LAYER_AUTO;  /* -1 = auto, else absolute layer count */
     int ctx_val = CTX_DEFAULT;     /* free slider value */
     int temp_idx = 4;              /* default: 0.4 */
+    /* llama-server launch flags (baked into .basi/run-llama-server.sh). Until the
+       user toggles them, they auto-follow the selected model's MTP-ness (an MTP
+       head gives lossless spec-decode); spec is forced off for a non-MTP model
+       where draft-mtp has nothing to draft. */
+    int spec_on = 0, fa_on = 0;
+    int spec_touched = 0, fa_touched = 0;
 
     while (1) {
         printf("\033[2J\033[H");
@@ -1616,6 +1623,24 @@ LaunchConfig pick_model(void) {
         if (section == SECTION_TEMP) printf("  \033[90m← →\033[0m");
         printf("\033[0m\n");
 
+        /* llama-server launch flags — these become the .basi/run-llama-server.sh
+           command. Spec-decode needs an MTP head, so it's n/a for non-MTP models. */
+        int cur_mtp = (strstr(models[model_sel], "MTP") || strstr(models[model_sel], "mtp")) ? 1 : 0;
+        if (!spec_touched) spec_on = cur_mtp;   /* auto-follow model until toggled */
+        if (!fa_touched)   fa_on   = cur_mtp;
+        if (!cur_mtp) spec_on = 0;              /* draft-mtp needs an MTP head */
+        printf("%s SPEC-DECODE   \033[1m%s\033[0m",
+               section == SECTION_SPEC ? "\033[1;33m▸" : "  \033[90m",
+               !cur_mtp ? "n/a (no MTP head)" : (spec_on ? "draft-mtp (n-max 1)" : "off"));
+        if (section == SECTION_SPEC && cur_mtp) printf("  \033[90m← →\033[0m");
+        printf("\033[0m\n");
+
+        printf("%s FLASH-ATTN    \033[1m%s\033[0m",
+               section == SECTION_FA ? "\033[1;33m▸" : "  \033[90m",
+               fa_on ? "on" : "off");
+        if (section == SECTION_FA) printf("  \033[90m← →\033[0m");
+        printf("\033[0m\n");
+
         printf("\n");
 
         /* Launch button */
@@ -1651,6 +1676,8 @@ LaunchConfig pick_model(void) {
                 cfg.gpu_layers = gpu_effective;
                 cfg.ctx_size = ctx_val;
                 cfg.temperature = temp_opts[temp_idx];
+                cfg.spec_draft_mtp = spec_on;
+                cfg.flash_attn = fa_on;
                 break;
             } else {
                 /* Enter on setting goes to next section */
@@ -1684,6 +1711,8 @@ LaunchConfig pick_model(void) {
                         if (ctx_val > mc) ctx_val = mc;
                     }
                     if (section == SECTION_TEMP && temp_idx < N_TEMP_OPTS - 1) temp_idx++;
+                    if (section == SECTION_SPEC && cur_mtp) { spec_on = 1; spec_touched = 1; }
+                    if (section == SECTION_FA) { fa_on = 1; fa_touched = 1; }
                     break;
                 case 'D': /* Left */
                     if (section == SECTION_GPU && gpu_setting > GPU_LAYER_AUTO) gpu_setting--;
@@ -1692,6 +1721,8 @@ LaunchConfig pick_model(void) {
                         if (ctx_val < CTX_MIN) ctx_val = CTX_MIN;
                     }
                     if (section == SECTION_TEMP && temp_idx > 0) temp_idx--;
+                    if (section == SECTION_SPEC) { spec_on = 0; spec_touched = 1; }
+                    if (section == SECTION_FA) { fa_on = 0; fa_touched = 1; }
                     break;
                 }
             }

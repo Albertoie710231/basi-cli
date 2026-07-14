@@ -14,6 +14,8 @@ typedef struct {
     int   gpu_layers;
     int   ctx_size;
     float temperature;
+    int   spec_draft_mtp;  /* 1 = launch llama-server with --spec-type draft-mtp (MTP models) */
+    int   flash_attn;      /* 1 = -fa on */
 } LaunchConfig;
 
 LaunchConfig pick_model(void);
