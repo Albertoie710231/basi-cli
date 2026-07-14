@@ -64,8 +64,15 @@ Server logs → `/tmp/basi_srvgen.log`. Server binds `127.0.0.1:8181`.
 2. ~~**Sampling parity**~~ ✅ DONE `eaab47b` (see above).
 3. **Embeddings** — reassessed (see above): only meaningful for item 6. Deprioritized;
    embed.c already works in server mode via its own in-process embedder.
-4. **deepsearch** — `ds_generate()` currently uses in-process ctx/sampler; route to srvgen.
-5. **Lifecycle / model-switch** — partially done:
+4. ~~**deepsearch**~~ ✅ DONE (`2d2fb4b`, `a6f5d04`). ds_generate() already routes through
+   generate()→generate_server(), so it runs server-backed. Two fixes: (a) `basi_srv_suppress_grammar`
+   keeps the main tool grammar out of deepsearch's rounds/synthesis (native deepsearch's
+   sampler never had it); (b) deepsearch clears the main tool schemas for its own renders
+   (`basi_tools_registered()` save/restore) so a native-tools model emits deepsearch's
+   `<tool>` ReAct format instead of `<tool_call>`/`<function=>` — was "no action" every
+   round in BOTH native+server before. Verified: full 3-round web_search/web_fetch loop
+   runs over the server; native fixed too (no regression).
+5. **Lifecycle / model-switch** — DONE:
    - ✅ **Interactive REPL context accounting** (`<next commit>`). ctx is a valid but
      empty vocab_only context in server mode (no crash), but the local KV never fills
      so the meter read `0/33k 0%`, compaction NEVER fired, and the model's
@@ -76,14 +83,41 @@ Server logs → `/tmp/basi_srvgen.log`. Server binds `127.0.0.1:8181`.
      (which prefix-caches the FULL prompt itself), losing history for non-thinking
      models — server mode now always feeds the full prompt. Verified: meter grows
      (2.5k→2.6k), turn-2 recalled "42" from turn-1, compaction triggers at used=2529.
-   - ⬜ **`/model` switch** still re-execs (spawns a fresh process → fresh server).
-     Could instead restart just the server in-process. Low priority — re-exec works.
+   - ✅ **`/model` switch** (`4ee6ddf`). Re-exec via execv skips atexit(kill_srv), so the
+     old llama-server was orphaned and the new process couldn't rebind :8181. Fixed:
+     kill_srv() before execv. Verified (tmux): 9B→27B switch kills the old server, one
+     server left (the new one) — no orphan/bind conflict. (Re-exec is kept; it's the
+     clean way to release VRAM. Same-model /model still short-circuits, no re-exec.)
    - Note: `summarize_head()` (COMPACT_SUMMARY/HYBRID only, NOT the default RETRIEVE)
      still decodes into the local vocab_only ctx and would break in server mode. Only
      matters if someone sets BASI_COMPACT=summary; route it through srvgen when addressed.
-6. **Drop the libllama link** once the above are done → kills the ABI-coupling gotcha
-   for good. BASI would still link a *small* piece for vocab_only tokenization/template
-   (or move templating to the server chat endpoint and drop it entirely).
+6. **Drop the libllama link** — endgame. **FEASIBILITY ASSESSED 2026-07-14 (endpoint
+   pre-check PASSED against llama-server 8182, Qwen3.5-9B):** every libllama use maps
+   to a working server HTTP endpoint —
+   - templating (`common_chat`/`apply_template`) → **`/apply-template`** — returns the
+     IDENTICAL rendered prompt incl. forced-open `<think>`; with a `tools` array it
+     injects the same `# Tools … <tools>{…}</tools>` block BASI builds.
+   - tokenization (ctx meter, `srv_update_ctx_used`) → **`/tokenize`** / `/detokenize`.
+   - tool grammar + `common_chat_parse` → **`/v1/chat/completions` with `tools`**: the
+     server derives the grammar, applies it, AND returns STRUCTURED `tool_calls`
+     (`{"name":"bash","arguments":"{\"command\":\"ls\"}"}`) — replaces
+     basi_tool_grammar_json + grammar splicing + the PEG parser in one call.
+   - n_ctx / chat_template / bos/eos → **`/props`**.
+   - embeddings → `/embedding` (embed.c is already self-contained in-process).
+
+   **Scope: a real rearchitecture, not an edit.** ~half the current libllama surface
+   is the NATIVE (non-server) generate() path — `llama_decode`/batch/samplers/
+   `llama_get_memory` in model.c + deepsearch's own `dctx`. Dropping libllama means
+   committing to **server-only** (delete the native path) and turning templating/
+   tokenization/grammar/parse into HTTP calls. Suggested phasing:
+     (a) route `apply_template`/tokenization through the server endpoints behind the
+         existing vocab_only handle (still linked, but usage centralized);
+     (b) switch tool handling to `/v1/chat/completions`-with-tools so the server owns
+         grammar+parse (removes chat_tmpl.cpp's grammar code);
+     (c) delete the native generate()/sampler/ctx path (server becomes mandatory);
+     (d) drop `-lllama -lllama-common -lggml*` from the link → ABI gotcha gone.
+   Needs a product call (native in-process mode goes away). NOT started — endpoint
+   evidence gathered; recommend greenlight before the multi-step (b)/(c) work.
 
 ## GOTCHAS / NOTES
 - Branch `spec-decode-mtp` also carries the **PARKED native-MTP attempt** (`src/spec.{c,h}`,
