@@ -8,10 +8,17 @@ maintained, faster path. BASI's identity (reuse pillar — llama-independent —
 agent loop, tools, prompts, deterministic-first) lives ABOVE the generation layer,
 so the pivot sharpens "its own thing," doesn't dilute it.
 
-## STATE: the core works + refinement done. Branch `spec-decode-mtp`, latest `a8fcc5b`.
+## STATE: the core works + refinement done. Branch `spec-decode-mtp`, latest `b15517a`.
 Items 1/2/4/5/5b DONE+verified. Item 6 (drop libllama) IN PROGRESS: phases (a) chat
 client + (b)pt1 serialization DONE+verified; (b)pt2 wiring + (c) delete-native + (d)
 drop-link remaining (see §6). User greenlit the full server-only rewrite.
+
+**Launch-script feature (`5791c05`,`b15517a`):** the model picker now configures the
+llama-server launch (SPEC-DECODE + FLASH-ATTN sections, auto-following model MTP-ness)
+and BASI writes/execs an editable `.basi/run-llama-server.sh` (gitignored, `# BASI-MODEL:`
+marker → reuse-respecting-edits vs regenerate-on-model-change). Precedence: BASI_SPEC env
+> picker > auto-detect "MTP" in the filename. `srvgen_{write_launch_script,script_matches,
+spawn_script}` + `SrvLaunch`.
 
 **2026-07-14 session added (committed `eaab47b`):**
 - **Item 1 DONE — display fidelity.** `SrvDisplay` streaming state machine in
