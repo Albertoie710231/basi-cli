@@ -3556,14 +3556,13 @@ int main(int argc, char **argv) {
     }
 
     /* Native tool-calling (phase 2a): register the tool set, then ask whether
-       THIS model's template supports tool calls. If so, the model emits its
-       own trained <tool_call> JSON and we parse it; otherwise we fall back to
-       the legacy <tool>-prose path. The system prompt is slimmed to match. */
+       the server templates them and returns STRUCTURED tool_calls. Server-only, so
+       tools are always "native" (the /v1/chat/completions path owns the format). */
     int tool_n = 0;
     const BasiToolDef *tool_defs = basi_tool_defs(&tool_n);
     basi_set_tools(tool_defs, tool_n);
-    int native_tools = basi_tools_active(model);
-    generate_native_tools = native_tools;   /* hide raw tool-call markup from the live stream */
+    int native_tools = 1;
+    generate_native_tools = native_tools;
     /* Render the answer stream as markdown, but only for the interactive REPL on
        a real terminal — -p/one-shot and piped output stay raw and parseable.
        Disable with BASI_MARKDOWN=0. */
