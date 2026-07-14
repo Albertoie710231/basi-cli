@@ -2188,6 +2188,13 @@ static void try_model_switch(const char *arg, char **argv, int argc,
     nv[k] = NULL;
     fflush(stdout);
 
+    /* Server mode: execv() replaces the image WITHOUT running atexit(kill_srv), so
+       the spawned llama-server would be orphaned and the re-exec'd process could
+       not rebind :8181 (address in use → new server fails to start). Tear it down
+       now; the child spawns a fresh server for the new model. No-op if not in
+       server mode (g_srv_pid == 0). */
+    kill_srv();
+
     execv("/proc/self/exe", nv);        /* Linux: re-run this binary */
     execv(argv[0], nv);                 /* fallback */
 
