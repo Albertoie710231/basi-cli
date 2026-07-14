@@ -3488,11 +3488,11 @@ int main(int argc, char **argv) {
 
     model_init();
 
-    /* Server-backed generation is the default now: the weights live in the spawned
-       llama-server, so BASI loads only the vocab/metadata (cheap) — for its own
-       templating, tokenization and tool-grammar derivation. The legacy in-process
-       path is reachable during the teardown via BASI_NATIVE=1 (loads full weights). */
-    const bool use_server = getenv("BASI_NATIVE") == NULL;
+    /* Server-backed generation only: the weights live in the spawned llama-server,
+       so BASI loads only the vocab/metadata (cheap) — for its own templating,
+       tokenization and tool-grammar derivation. (The in-process decode path has
+       been removed; generate() now always delegates to the server.) */
+    const bool use_server = true;
     struct llama_model_params model_params = llama_model_default_params();
     model_params.n_gpu_layers = n_gpu_layers;
     model_params.vocab_only   = use_server;
