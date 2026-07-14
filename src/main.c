@@ -192,11 +192,6 @@ volatile sig_atomic_t generate_keep_think = 0;
 volatile sig_atomic_t generate_native_tools = 0;
 volatile sig_atomic_t generate_markdown = 0;
 
-/* Tool-call grammar sampler (phase 2b): built once when native tools are active,
-   inserted into the sampler chain, and reset before each generation (it is lazy
-   and stateful — without a reset it would carry a prior turn's trigger state).
-   NULL when the model's format has no tool grammar or tools are inactive. */
-static struct llama_sampler *g_tool_grammar = NULL;
 
 /* Server-backed mode: the spawned llama-server holding the weights, killed on
    exit so a 30 GB process never leaks. */
@@ -3497,41 +3492,22 @@ int main(int argc, char **argv) {
         fprintf(stderr, "\033[90m[server mode] ready — generation delegated to llama-server\033[0m\n");
     }
 
-    /* Create sampler chain */
-    struct llama_sampler *smpl = llama_sampler_chain_init(llama_sampler_chain_default_params());
-    /* Repetition penalty — damps the degenerate repeat-loop collapse seen in long
-       agentic sessions (a small model emits a malformed token, then spirals into
-       "XXXX…" until it overruns the context). Added FIRST so it shapes the logits
-       before min_p/temp. Mild by default (1.1 over the last 256 tokens, no
-       freq/presence component); tune with BASI_REPEAT_PENALTY (1.0 disables). */
+    /* Sampling knobs for the server /v1/chat/completions request (generation runs
+       on llama-server, not in-process — there is no local sampler chain anymore).
+       Repetition penalty damps the degenerate repeat-loop collapse; tune with
+       BASI_REPEAT_PENALTY. */
     float repeat_pen = 1.1f;
     {
         const char *rp = getenv("BASI_REPEAT_PENALTY");
         if (rp) { float v = (float)atof(rp); if (v >= 1.0f && v <= 2.0f) repeat_pen = v; }
     }
-    llama_sampler_chain_add(smpl, llama_sampler_init_penalties(256, repeat_pen, 0.0f, 0.0f));
-    /* Server-backed mode decodes on llama-server, not this chain — mirror the same
-       knobs into the /completion request so generation quality matches native.
-       (min_p 0.05 matches SAMPLER_TAIL; seed omitted when random.) */
-    if (use_server) {
-        basi_srv_sampling.temperature   = temp_override >= 0 ? temp_override : 0.4;
-        basi_srv_sampling.repeat_penalty = repeat_pen;
-        basi_srv_sampling.repeat_last_n  = 256;
-        basi_srv_sampling.min_p          = 0.05;
-        basi_srv_sampling.top_k          = top_k;
-        basi_srv_sampling.top_p          = top_p;
-        basi_srv_sampling.seed           = (cli_seed == LLAMA_DEFAULT_SEED) ? -1 : (long) cli_seed;
-    }
-    /* The rest of the chain (min_p → temp → dist) is appended by SAMPLER_TAIL
-       below, AFTER the tool-call grammar (when native tools are active) so the
-       grammar masks invalid tokens before min_p/temp narrow the set. */
-    #define SAMPLER_TAIL() do { \
-        if (top_k > 0)    llama_sampler_chain_add(smpl, llama_sampler_init_top_k(top_k)); \
-        if (top_p < 1.0f) llama_sampler_chain_add(smpl, llama_sampler_init_top_p(top_p, 1)); \
-        llama_sampler_chain_add(smpl, llama_sampler_init_min_p(0.05f, 1)); \
-        llama_sampler_chain_add(smpl, llama_sampler_init_temp(temp_override >= 0 ? temp_override : 0.4f)); \
-        llama_sampler_chain_add(smpl, llama_sampler_init_dist(cli_seed)); \
-    } while (0)
+    basi_srv_sampling.temperature    = temp_override >= 0 ? temp_override : 0.4;
+    basi_srv_sampling.repeat_penalty = repeat_pen;
+    basi_srv_sampling.repeat_last_n  = 256;
+    basi_srv_sampling.min_p          = 0.05;
+    basi_srv_sampling.top_k          = top_k;
+    basi_srv_sampling.top_p          = top_p;
+    basi_srv_sampling.seed           = (cli_seed == LLAMA_DEFAULT_SEED) ? -1 : (long) cli_seed;
 
     if (!no_tools && !oneshot_prompt) {
         print_startup_banner(model_path, (int)llama_n_ctx(ctx), n_gpu_layers);
@@ -3604,23 +3580,13 @@ int main(int argc, char **argv) {
     fflush(stdout);
     if (!native_tools) basi_set_tools(NULL, 0);   /* don't advertise tools the model can't format */
 
-    /* Phase 2b: constrain decoding to valid tool-call JSON when the model speaks
-       native function-calling. Stops a small model drifting off-format after a
-       few rounds (emitting malformed <tool_call> the PEG parser rejects, which
-       ends the agentic loop). The grammar is LAZY — free text and thinking are
-       unaffected; it only forces valid JSON once a tool call begins. Inserted
-       into the chain BEFORE the min_p/temp/dist tail so it masks first. */
+    /* Tool-call grammar is now derived + applied server-side (llama-server owns it
+       for /v1/chat/completions when we send `tools`), so there is no in-process
+       grammar sampler to build here. */
     if (native_tools) {
-        g_tool_grammar = basi_tool_grammar_sampler(model);
-        if (g_tool_grammar) {
-            llama_sampler_chain_add(smpl, g_tool_grammar);
-            printf("\033[90m[Tool grammar: constrained decoding active]\033[0m\n");
-        } else {
-            printf("\033[90m[Tool grammar: none for this format — unconstrained]\033[0m\n");
-        }
+        printf("\033[90m[Tool grammar: constrained decoding active (server-side)]\033[0m\n");
         fflush(stdout);
     }
-    SAMPLER_TAIL();
 
     /* The date is injected per-turn (see the REPL loop) so it stays fresh on
        long-lived / resumed sessions, not stamped once here. */
@@ -3726,7 +3692,7 @@ int main(int argc, char **argv) {
             continue;
         }
 
-        run_agentic_turn(user_input, model, vocab, ctx, smpl, native_tools,
+        run_agentic_turn(user_input, model, vocab, ctx, NULL /*smpl: server-side*/, native_tools,
                          formatted_buf, &messages, &msg_count, &msg_cap,
                          session_fp, &prev_len,
                          &session_prompt_tokens, &session_gen_tokens);
@@ -3745,7 +3711,6 @@ cleanup:
     free(messages);
     history_free_all();
 
-    llama_sampler_free(smpl);
     llama_free(ctx);
     llama_model_free(model);
 
