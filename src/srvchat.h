@@ -42,6 +42,11 @@ SrvChatResult *srvchat_complete(int port, const char *messages_json, const char 
 
 void srvchat_free(SrvChatResult *r);
 
+/* POST one text to a llama-server /embedding endpoint (spawned with --embedding).
+ * Writes up to max_dim floats of the pooled embedding into out and returns the
+ * count written (the embedding dimension), or -1 on transport/parse failure. */
+int srvchat_embed(int port, const char *text, float *out, int max_dim);
+
 /* Self-test (BASI_SRV_CHAT_SELFTEST=1): spawn a server, send one message + a bash
  * tool, stream it, print structured content/reasoning/tool_calls/usage, tear down. */
 void srvchat_selftest(const char *model_path, int ngl, int ctx);

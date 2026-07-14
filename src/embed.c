@@ -10,18 +10,22 @@
 #include <dirent.h>
 #include <errno.h>
 
-#include "llama.h"
+#include <sys/types.h>
 
 #include "util.h"
 #include "globals.h"
 #include "kb.h"
 #include "embed.h"
+#include "srvgen.h"    /* spawn/kill the embedder llama-server */
+#include "srvchat.h"   /* srvchat_embed — the /embedding HTTP client */
 
-/* ── Static state ──────────────────────────────────────────────────── */
+/* ── Static state ──────────────────────────────────────────────────── *
+ * The retrieval embedder runs as its OWN spawned llama-server (--embedding) on a
+ * dedicated port; embed_text() POSTs to its /embedding endpoint. No in-process
+ * model — BASI links no libllama. */
 
-static struct llama_model   *embed_model = NULL;
-static struct llama_context *embed_ctx   = NULL;
-static const struct llama_vocab *embed_vocab = NULL;
+static pid_t  embed_pid     = 0;      /* the embedder llama-server, or 0 */
+static int    embed_port    = 8183;   /* separate from the main chat server (8181) */
 static int    embed_dim_v   = -1;
 static int    embed_n_ctx   = 8192;
 static char   embed_err[512] = "";
@@ -37,13 +41,13 @@ static void set_err(const char *fmt, ...) {
 
 const char *embed_last_error(void) { return embed_err[0] ? embed_err : "ok"; }
 
-static enum llama_pooling_type pooling_from_env(void) {
+/* Pooling passed to the embedder server's --pooling flag. Default "last" (Jina v5
+   / Qwen3); override with BASI_EMBED_POOLING=mean|cls|last. */
+static const char *pooling_from_env(void) {
     const char *p = getenv("BASI_EMBED_POOLING");
-    if (!p || !*p) return LLAMA_POOLING_TYPE_LAST;   /* Jina v5 / Qwen3 default */
-    if (strcmp(p, "mean") == 0) return LLAMA_POOLING_TYPE_MEAN;
-    if (strcmp(p, "cls")  == 0) return LLAMA_POOLING_TYPE_CLS;
-    if (strcmp(p, "last") == 0) return LLAMA_POOLING_TYPE_LAST;
-    return LLAMA_POOLING_TYPE_LAST;
+    if (p && (strcmp(p, "mean") == 0 || strcmp(p, "cls") == 0 || strcmp(p, "last") == 0))
+        return p;
+    return "last";
 }
 
 /* Score a model/repo/file name for "embedding-model-ness". Returns -1 if it
@@ -193,64 +197,47 @@ static void l2_normalize(float *v, int n) {
 /* ── Public: init / shutdown / dim / embed_text ────────────────────── */
 
 int embed_init(void) {
-    if (embed_model) return 0;
+    if (embed_pid > 0) return 0;   /* embedder server already up */
 
     char *path = resolve_embed_model_path();
-    if (!path) return -1;
+    if (!path) return -1;          /* set_err done by resolver */
 
-    struct llama_model_params mp = llama_model_default_params();
-    mp.n_gpu_layers = 99;     /* embedding models are small; fit on GPU */
-    embed_model = llama_model_load_from_file(path, mp);
-    if (!embed_model) {
-        set_err("failed to load embedding model from %s", path);
-        free(path);
-        return -1;
-    }
+    const char *sbin = getenv("BASI_SERVER_BIN");
+    if (!sbin || !*sbin) sbin = "/home/alberto/llama.cpp/build_vulkan/bin/llama-server";
+
+    char extra[128];
+    snprintf(extra, sizeof extra, "--embedding --pooling %s", pooling_from_env());
+
+    embed_pid = srvgen_spawn(sbin, path, 99 /*small model → all on GPU*/, embed_n_ctx,
+                             extra, embed_port, "/tmp/basi_embed_srv.log", 180);
     free(path);
-
-    embed_vocab = llama_model_get_vocab(embed_model);
-    if (!embed_vocab) {
-        set_err("embedding model has no vocab");
-        llama_model_free(embed_model);
-        embed_model = NULL;
-        return -1;
-    }
-    embed_dim_v = llama_model_n_embd(embed_model);
-    if (embed_dim_v <= 0) {
-        set_err("embedding model n_embd is %d (expected > 0)", embed_dim_v);
-        llama_model_free(embed_model);
-        embed_model = NULL;
+    if (embed_pid < 0) {
+        embed_pid = 0;
+        set_err("failed to spawn embedder llama-server (see /tmp/basi_embed_srv.log)");
         return -1;
     }
 
-    struct llama_context_params cp = llama_context_default_params();
-    cp.n_ctx        = embed_n_ctx;
-    cp.n_batch      = embed_n_ctx;
-    cp.n_ubatch     = embed_n_ctx;
-    cp.embeddings   = true;
-    cp.pooling_type = pooling_from_env();
-    cp.attention_type = LLAMA_ATTENTION_TYPE_UNSPECIFIED;
-    embed_ctx = llama_init_from_model(embed_model, cp);
-    if (!embed_ctx) {
-        set_err("failed to create embedding context");
-        llama_model_free(embed_model);
-        embed_model = NULL;
+    /* Probe once to learn the embedding dimension (the RAG/reuse vector width). */
+    static float probe[8192];
+    int d = srvchat_embed(embed_port, "probe", probe, (int)(sizeof probe / sizeof *probe));
+    if (d <= 0) {
+        srvgen_kill(embed_pid); embed_pid = 0;
+        set_err("embedder /embedding probe failed");
         return -1;
     }
+    embed_dim_v = d;
     return 0;
 }
 
 int embed_dim(void) { return embed_dim_v; }
 
 void embed_shutdown(void) {
-    if (embed_ctx)   { llama_free(embed_ctx); embed_ctx = NULL; }
-    if (embed_model) { llama_model_free(embed_model); embed_model = NULL; }
-    embed_vocab = NULL;
+    if (embed_pid > 0) { srvgen_kill(embed_pid); embed_pid = 0; }
     embed_dim_v = -1;
 }
 
 int embed_text(const char *text, float *out) {
-    if (!embed_ctx || !embed_vocab) {
+    if (embed_pid <= 0) {
         set_err("embed_text called before embed_init succeeded");
         return -1;
     }
@@ -258,66 +245,20 @@ int embed_text(const char *text, float *out) {
         set_err("embed_text: NULL argument");
         return -1;
     }
-
-    int text_len = (int)strlen(text);
-    if (text_len == 0) {
+    if (text[0] == '\0') {                      /* empty text → zero vector */
         for (int i = 0; i < embed_dim_v; i++) out[i] = 0.0f;
         return 0;
     }
 
-    /* Tokenize. First call returns negative count = -needed. */
-    int n_tok = -llama_tokenize(embed_vocab, text, text_len,
-                                NULL, 0, true, true);
-    if (n_tok <= 0) {
-        set_err("tokenize returned %d for text length %d", n_tok, text_len);
+    int d = srvchat_embed(embed_port, text, out, embed_dim_v);
+    if (d <= 0) {
+        set_err("embedder /embedding request failed");
         return -1;
     }
-    if (n_tok > embed_n_ctx) {
-        /* Truncate by taking only the first n_ctx tokens — re-tokenize with
-         * a buffer that only holds n_ctx slots so llama_tokenize gives us
-         * the prefix. The extra text is discarded; chunks should be sized
-         * so this rarely triggers. */
-        n_tok = embed_n_ctx;
-    }
-    llama_token *tokens = malloc((size_t)n_tok * sizeof(llama_token));
-    int got = llama_tokenize(embed_vocab, text, text_len,
-                             tokens, n_tok, true, true);
-    if (got < 0) got = -got;
-    if (got > n_tok) got = n_tok;
-
-    /* Build batch with logits flag set on every token (so pooling works). */
-    struct llama_batch batch = llama_batch_init(n_tok, 0, 1);
-    for (int i = 0; i < got; i++) {
-        batch.token[batch.n_tokens] = tokens[i];
-        batch.pos[batch.n_tokens]   = i;
-        batch.n_seq_id[batch.n_tokens] = 1;
-        batch.seq_id[batch.n_tokens][0] = 0;
-        batch.logits[batch.n_tokens] = 1;
-        batch.n_tokens++;
-    }
-
-    llama_memory_clear(llama_get_memory(embed_ctx), true);
-    int rc = llama_decode(embed_ctx, batch);
-    if (rc < 0) {
-        set_err("llama_decode failed (rc=%d)", rc);
-        llama_batch_free(batch);
-        free(tokens);
-        return -1;
-    }
-
-    const float *embd = llama_get_embeddings_seq(embed_ctx, 0);
-    if (!embd) {
-        set_err("llama_get_embeddings_seq returned NULL "
-                "(pooling_type may be NONE)");
-        llama_batch_free(batch);
-        free(tokens);
-        return -1;
-    }
-    for (int i = 0; i < embed_dim_v; i++) out[i] = embd[i];
+    for (int i = d; i < embed_dim_v; i++) out[i] = 0.0f;   /* pad if short (shouldn't happen) */
+    /* The server L2-normalizes (--embd-normalize 2 default); re-normalize for an
+       exact unit vector regardless (idempotent) and to match the old contract. */
     l2_normalize(out, embed_dim_v);
-
-    llama_batch_free(batch);
-    free(tokens);
     return 0;
 }
 
@@ -362,7 +303,7 @@ static char *slice_dup(const char *s, size_t len) {
 }
 
 /* Heading line? Returns level (1..6) if so and writes the heading text
- * slice via *out_text/*out_len; 0 otherwise. */
+ * slice via out_text/out_len; 0 otherwise. */
 static int heading_line(const char *p, size_t len,
                         const char **out_text, size_t *out_len) {
     if (len == 0 || *p != '#') return 0;

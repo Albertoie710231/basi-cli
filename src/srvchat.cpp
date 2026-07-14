@@ -173,6 +173,53 @@ extern "C" void srvchat_free(SrvChatResult *r) {
     free(r);
 }
 
+/* ── /embedding client ───────────────────────────────────────────────────── */
+
+extern "C" int srvchat_embed(int port, const char *text, float *out, int max_dim) {
+    if (!text || !out || max_dim <= 0) return -1;
+
+    std::string body;
+    try { nlohmann::json req; req["content"] = text; body = req.dump(); }
+    catch (...) { return -1; }
+
+    char reqpath[] = "/tmp/basi_srvemb_XXXXXX";
+    int rfd = mkstemp(reqpath);
+    if (rfd < 0) return -1;
+    { FILE *rf = fdopen(rfd, "w"); if (!rf) { close(rfd); unlink(reqpath); return -1; }
+      fwrite(body.data(), 1, body.size(), rf); fclose(rf); }
+
+    char cmd[512];
+    snprintf(cmd, sizeof cmd,
+        "curl -s -X POST http://127.0.0.1:%d/embedding "
+        "-H 'Content-Type: application/json' --data-binary @%s", port, reqpath);
+
+    FILE *p = popen(cmd, "r");
+    if (!p) { unlink(reqpath); return -1; }
+    std::string resp;
+    { char buf[8192]; size_t n; while ((n = fread(buf, 1, sizeof buf, p)) > 0) resp.append(buf, n); }
+    pclose(p);
+    unlink(reqpath);
+
+    try {
+        nlohmann::json d = nlohmann::json::parse(resp);
+        // Response is [{"index":0,"embedding":[...] or [[...]]}] (native) or
+        // {"embedding":[...]} — locate the float vector, flattening one nesting level.
+        const nlohmann::json *emb = nullptr;
+        if (d.is_array() && !d.empty() && d[0].is_object() && d[0].contains("embedding"))
+            emb = &d[0]["embedding"];
+        else if (d.is_object() && d.contains("embedding"))
+            emb = &d["embedding"];
+        if (!emb || !emb->is_array() || emb->empty()) return -1;
+        const nlohmann::json *vec = emb;
+        if ((*emb)[0].is_array()) vec = &(*emb)[0];   // "embedding":[[...]] → row 0
+        if (!vec->is_array()) return -1;
+        int n = (int) vec->size();
+        if (n > max_dim) n = max_dim;
+        for (int i = 0; i < n; i++) out[i] = (*vec)[i].get<float>();
+        return n;
+    } catch (...) { return -1; }
+}
+
 /* ── self-test ──────────────────────────────────────────────────────────── */
 
 static void st_content(const char *c, void *) { fputs(c, stdout); fflush(stdout); }
