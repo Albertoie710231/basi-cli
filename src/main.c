@@ -3019,7 +3019,11 @@ static void run_agentic_turn(char *user_input,
                STRUCTURED tool calls — so we skip the rendered prompt, the grammar
                reset, and the PEG parse. The prompt/delta above is still built (its
                cost goes away in phase c); we just don't use it here. */
-            const bool chat_mode = (basi_srv_port > 0 && getenv("BASI_SERVER_CHAT") != NULL);
+            /* Server mode drives generation through /v1/chat/completions by default
+               now (the server owns templating + grammar + tool parsing). The old
+               /completion path is still reachable during the teardown via
+               BASI_SERVER_COMPLETION=1. */
+            const bool chat_mode = (basi_srv_port > 0 && getenv("BASI_SERVER_COMPLETION") == NULL);
             BasiToolCall *ncalls = NULL;
             int n_ncalls = 0;
             GenerateResult result;
