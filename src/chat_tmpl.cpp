@@ -99,6 +99,11 @@ extern "C" void basi_set_tools(const BasiToolDef *defs, int n) {
     }
 }
 
+/* How many tools are currently advertised to the model (g_tools size). Lets a
+   self-contained sub-generation (deepsearch, summary) clear the schemas and then
+   restore the prior state exactly. */
+extern "C" int basi_tools_registered(void) { return (int) g_tools.size(); }
+
 extern "C" int basi_tools_active(const struct llama_model *model) {
     if (g_tools.empty()) return 0;
     try {

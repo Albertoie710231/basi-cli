@@ -31,6 +31,10 @@ typedef struct {
    copied, so they must outlive use (static literals are fine). */
 void basi_set_tools(const BasiToolDef *defs, int n);
 
+/* Number of tools currently advertised to the model. A self-contained
+   sub-generation can clear the schemas and restore the prior state via this. */
+int  basi_tools_registered(void);
+
 /* 1 if tools are registered AND this model's template supports tool calls
    (i.e. common_chat resolves a non-content-only format); else 0 → caller
    uses the legacy <tool> prose path. */

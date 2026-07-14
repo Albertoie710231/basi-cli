@@ -11,6 +11,8 @@
 
 #include "util.h"
 #include "globals.h"
+#include "chat_tmpl.h"   /* basi_set_tools / basi_tools_registered */
+#include "tooldefs.h"    /* basi_tool_defs (restore after deepsearch) */
 #include "model.h"
 #include "web.h"
 #include "kb.h"
@@ -295,6 +297,15 @@ char *execute_deep_search(struct llama_model *model,
     int prev_suppress_grammar = basi_srv_suppress_grammar;
     basi_srv_suppress_grammar = 1;
 
+    /* Clear the main tool schemas for deepsearch's own renders. deepsearch is a
+       self-contained sub-agent whose system prompt already teaches the <tool>
+       ReAct format; leaving the native schemas advertised makes a native-tools
+       model emit its trained <tool_call>/<function=> format instead, which
+       extract_tool_call (legacy <tool>...</tool>) can't parse → "no action" every
+       round. Same pattern as the summary sub-generation in main.c. Restored below. */
+    int prev_tool_n = basi_tools_registered();
+    basi_set_tools(NULL, 0);
+
     struct sigaction old_sa, sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = ds_sigint;
@@ -471,6 +482,7 @@ char *execute_deep_search(struct llama_model *model,
     generate_quiet = prev_quiet;
     generate_keep_think = prev_keep_think;
     basi_srv_suppress_grammar = prev_suppress_grammar;
+    if (prev_tool_n > 0) { int n; const BasiToolDef *d = basi_tool_defs(&n); basi_set_tools(d, n); }
     for (size_t i = 0; i < nmsg; i++) free((void *)msgs[i].content);
     free(msgs);
     free(fmt_buf);
