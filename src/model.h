@@ -41,6 +41,12 @@ typedef struct {
     double gen_time_s;
 } GenerateResult;
 
+/* Server-backed generation: when basi_srv_port>0, generate() delegates to a
+   spawned llama-server (set by main.c). basi_srv_model = a vocab_only handle for
+   deriving the tool grammar. */
+extern int basi_srv_port;
+extern const struct llama_model *basi_srv_model;
+
 GenerateResult generate(
     struct llama_context *ctx,
     const struct llama_vocab *vocab,

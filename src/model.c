@@ -20,6 +20,7 @@
 #include "hwinfo.h"
 #include "chat_tmpl.h"
 #include "md.h"
+#include "srvgen.h"
 
 void model_init(void) {
     extern void log_callback(enum ggml_log_level level, const char *text, void *user_data);
@@ -95,6 +96,67 @@ typedef enum {
 /* ── Generate response ─────────────────────────────────────────────── */
 
 
+/* ── Server-backed generation (Pi-style) ─────────────────────────────────────
+ * When basi_srv_port>0, generate() delegates token generation to a spawned
+ * llama-server over its /completion SSE stream instead of decoding in-process.
+ * Set by main.c after srvgen_spawn(). basi_srv_model is a vocab_only handle used
+ * to derive the tool grammar. */
+int basi_srv_port = 0;
+const struct llama_model *basi_srv_model = NULL;
+
+/* Remove <think>…</think> spans from a response (unless generate_keep_think).
+ * Returns a malloc'd copy. */
+static char *strip_thinking_dup(const char *s) {
+    if (generate_keep_think) return strdup(s);
+    const char *open = "<think>", *close = "</think>";
+    const char *o = NULL, *c = NULL;
+    if (basi_thinking_tags(&o, &c) && o && c && *o && *c) { open = o; close = c; }
+    size_t olen = strlen(open), clen = strlen(close);
+    StringBuf out; sb_init(&out);
+    const char *p = s;
+    while (*p) {
+        const char *t = strstr(p, open);
+        if (!t) { sb_append_str(&out, p); break; }
+        sb_append(&out, p, (size_t)(t - p));
+        const char *e = strstr(t + olen, close);
+        if (!e) break;                 /* unterminated → drop the trailing think */
+        p = e + clen;
+    }
+    return sb_to_str(&out);
+}
+
+/* Stream each SSE content chunk to the terminal (markdown-rendered / quiet-aware). */
+static void srv_display_emit(const char *chunk, void *ud) {
+    int md = *(int *) ud;
+    if (generate_quiet) return;
+    if (md) md_feed(chunk, strlen(chunk));
+    else { fputs(chunk, stdout); fflush(stdout); }
+}
+
+static GenerateResult generate_server(const char *prompt) {
+    GenerateResult res = { NULL, 0, 0, 0.0, 0.0 };
+    const int md = (generate_markdown && !generate_quiet) ? 1 : 0;
+
+    char *frag = basi_srv_model ? basi_tool_grammar_json(basi_srv_model) : NULL;
+
+    long cap = 0; { const char *e = getenv("BASI_MAX_TOKENS"); if (e && *e) cap = atol(e); }
+    int n_predict = cap > 0 ? (int) cap : -1;
+
+    if (md) md_begin();
+    double t0 = time_now();
+    double tps = 0; int ntok = 0;
+    char *full = srvgen_complete(basi_srv_port, prompt, n_predict, 0.4, /*greedy*/ 0,
+                                 frag, srv_display_emit, (void *) &md, &tps, &ntok);
+    if (md) md_end();
+    free(frag);
+
+    res.gen_time_s = time_now() - t0;
+    res.gen_tokens = (size_t) ntok;
+    res.text = full ? strip_thinking_dup(full) : strdup("[server generation failed]");
+    free(full);
+    return res;
+}
+
 GenerateResult generate(
     struct llama_context *ctx,
     const struct llama_vocab *vocab,
@@ -102,6 +164,8 @@ GenerateResult generate(
     const char *prompt,
     size_t prompt_len)
 {
+    if (basi_srv_port > 0) return generate_server(prompt);
+
     GenerateResult res = { NULL, 0, 0, 0.0, 0.0 };
     StringBuf response;
     sb_init(&response);

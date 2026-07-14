@@ -20,8 +20,10 @@ pid_t srvgen_spawn(const char *server_bin, const char *model_path, int ngl, int 
 /* Stream one /completion. Calls emit(content_chunk, ud) per SSE chunk as tokens
  * arrive. Returns the full generated text (malloc'd; caller frees) or NULL.
  * Fills *tps (tok/s) and *n_out (tokens) if non-NULL. greedy!=0 => argmax. */
+/* grammar_fragment: caller-provided valid JSON spliced verbatim into the request
+   (e.g. basi_tool_grammar_json()'s output), or NULL. */
 char *srvgen_complete(int port, const char *prompt, int n_predict, double temp,
-                      int greedy, const char *grammar,
+                      int greedy, const char *grammar_fragment,
                       void (*emit)(const char *chunk, void *ud), void *ud,
                       double *tps, int *n_out);
 

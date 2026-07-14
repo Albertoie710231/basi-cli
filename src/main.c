@@ -198,6 +198,11 @@ volatile sig_atomic_t generate_markdown = 0;
    NULL when the model's format has no tool grammar or tools are inactive. */
 static struct llama_sampler *g_tool_grammar = NULL;
 
+/* Server-backed mode: the spawned llama-server holding the weights, killed on
+   exit so a 30 GB process never leaks. */
+static pid_t g_srv_pid = 0;
+static void kill_srv(void) { if (g_srv_pid > 0) { srvgen_kill(g_srv_pid); g_srv_pid = 0; } }
+
 static void sigint_handler(int sig) {
     (void)sig;
     generation_interrupted = 1;
@@ -3387,9 +3392,13 @@ int main(int argc, char **argv) {
 
     model_init();
 
-    /* Load model */
+    /* Load model. In server-backed mode (BASI_SERVER) the weights live in the
+       spawned llama-server, so BASI loads only the vocab/metadata (cheap) — used
+       for its own templating, tokenization and tool-grammar derivation. */
+    const bool use_server = getenv("BASI_SERVER") != NULL;
     struct llama_model_params model_params = llama_model_default_params();
     model_params.n_gpu_layers = n_gpu_layers;
+    model_params.vocab_only   = use_server;
 
     struct llama_model *model = llama_model_load_from_file(model_path, model_params);
     if (!model) {
@@ -3449,10 +3458,37 @@ int main(int argc, char **argv) {
                 ctx_params.n_ctx, requested_ctx);
         }
     }
-    if (!ctx) {
+    if (!ctx && !use_server) {
         fprintf(stderr, "Error: Failed to create context (out of VRAM even at minimum size)\n");
         llama_model_free(model);
         return 1;
+    }
+
+    /* Server-backed mode: spawn the llama-server that holds the weights + does
+       generation, and route generate() to it. BASI keeps only the vocab_only
+       model handle (for templating/grammar/tokenization). */
+    if (use_server) {
+        const char *sbin = getenv("BASI_SERVER_BIN");
+        if (!sbin || !*sbin) sbin = "/home/alberto/llama.cpp/build_vulkan/bin/llama-server";
+        char extra[128] = "";
+        const char *spec = getenv("BASI_SPEC");
+        if (spec && *spec) {
+            int nmax = 1; const char *e = getenv("BASI_SPEC_NMAX"); if (e && *e) nmax = atoi(e);
+            snprintf(extra, sizeof extra, "-fa on --spec-type %s --spec-draft-n-max %d", spec, nmax);
+        }
+        int srv_ctx = ctx_override > 0 ? ctx_override : CONTEXT_SIZE;
+        fprintf(stderr, "\033[90m[server mode] spawning llama-server (holds the weights)…\033[0m\n");
+        g_srv_pid = srvgen_spawn(sbin, model_path, n_gpu_layers, srv_ctx,
+                                 extra[0] ? extra : NULL, 8181, "/tmp/basi_srvgen.log", 300);
+        if (g_srv_pid < 0) {
+            fprintf(stderr, "Error: llama-server failed to start (see /tmp/basi_srvgen.log)\n");
+            llama_model_free(model);
+            return 1;
+        }
+        atexit(kill_srv);
+        basi_srv_port  = 8181;
+        basi_srv_model = model;
+        fprintf(stderr, "\033[90m[server mode] ready — generation delegated to llama-server\033[0m\n");
     }
 
     /* Hidden spec-decode self-test (BASI_SPEC_SELFTEST=1): plain-greedy vs
