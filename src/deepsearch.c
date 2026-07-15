@@ -7,7 +7,7 @@
 #include <signal.h>
 #include <time.h>
 
-#include "llama.h"
+#include "basi_types.h"
 
 #include "util.h"
 #include "globals.h"
@@ -31,7 +31,7 @@
    bulky thing — raw page text — never enters the chat), so the history stays
    small and fits a 32k context many rounds deep.
 
-   Runs in its OWN isolated llama_context built from the loaded model, so it
+   Runs server-backed via generate_chat (its own message history), so it
    never perturbs the chat session's KV cache (precedent: src/embed.c). Tools:
    web_search / web_fetch / docs_search / docs_get. Actions use BASI's native
    <tool>…</tool> convention; the final answer is <answer>…</answer>.
@@ -142,7 +142,7 @@ static char *trim(char *s) {
 
 /* Appends a turn, TAKING OWNERSHIP of `content` (already malloc'd). `role` is a
    string literal ("system"/"user"/"assistant"), not owned. */
-static void msgs_add(struct llama_chat_message **m, size_t *n, size_t *cap,
+static void msgs_add(BasiMsg **m, size_t *n, size_t *cap,
                      const char *role, char *content) {
     if (*n >= *cap) {
         *cap = *cap ? *cap * 2 : 16;
@@ -158,7 +158,7 @@ static void msgs_add(struct llama_chat_message **m, size_t *n, size_t *cap,
    own <tool>…</tool> / <answer> ReAct format in the content (or, if it lands in the
    reasoning stream, generate_chat promotes that to the text) — which the loop below
    parses. Returns malloc'd model output (caller frees). */
-static char *ds_generate(const struct llama_chat_message *msgs, size_t nmsg) {
+static char *ds_generate(const BasiMsg *msgs, size_t nmsg) {
     GenerateResult r = generate_chat(msgs, nmsg, NULL, NULL);
     return r.text;
 }
@@ -193,7 +193,7 @@ static char *distill_result(const char *question, const char *raw) {
                       "Be faithful and compact; if nothing is relevant, say so.");
     free(capped);
 
-    struct llama_chat_message xm[2];
+    BasiMsg xm[2];
     xm[0].role = "system"; xm[0].content = (char *)EXTRACTOR_SYSTEM;
     xm[1].role = "user";   xm[1].content = x.data;
     char *distilled = ds_generate(xm, 2);
@@ -210,10 +210,8 @@ static void ds_sigint(int sig) { (void)sig; generation_interrupted = 1; }
 
 /* ── main entry ─────────────────────────────────────────────────────── */
 
-char *execute_deep_search(struct llama_model *model,
-                          const struct llama_vocab *vocab,
-                          const char *question) {
-    if (!model || !vocab || !question || !question[0])
+char *execute_deep_search(const char *question) {
+    if (!question || !question[0])
         return strdup("Error: deep_search requires a question.");
 
     int max_rounds = DEEPSEARCH_MAX_ROUNDS;
@@ -267,7 +265,7 @@ char *execute_deep_search(struct llama_model *model,
     fflush(stdout);
 
     /* The research chat: system, question, then assistant(action)/user(result). */
-    struct llama_chat_message *msgs = NULL;
+    BasiMsg *msgs = NULL;
     size_t nmsg = 0, capmsg = 0;
     msgs_add(&msgs, &nmsg, &capmsg, "system", strdup(system_prompt));
     msgs_add(&msgs, &nmsg, &capmsg, "user",   strdup(question));

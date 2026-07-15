@@ -9,7 +9,7 @@
 #include <termios.h>
 #include <errno.h>
 
-#include "llama.h"
+#include "basi_types.h"
 
 #include "util.h"
 #include "session.h"
@@ -263,7 +263,7 @@ char *session_picker(const char *dir) {
  * contents (each is a fresh strdup'd buffer). */
 void session_load_into(
     const char *path,
-    struct llama_chat_message **messages,
+    BasiMsg **messages,
     size_t *msg_count,
     size_t *msg_cap,
     int n_ctx)
@@ -317,7 +317,7 @@ void session_load_into(
         if (*msg_count >= *msg_cap) {
             *msg_cap = *msg_cap ? *msg_cap * 2 : 16;
             *messages = realloc(*messages,
-                *msg_cap * sizeof(struct llama_chat_message));
+                *msg_cap * sizeof(BasiMsg));
         }
         (*messages)[*msg_count].role = role_lit;
         (*messages)[*msg_count].content = contents[i];

@@ -1,5 +1,9 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
+
+/* sentinel: no --seed given → let the server pick a random seed */
+#define BASI_DEFAULT_SEED 0xFFFFFFFFu
 #include <string.h>
 #include <stdbool.h>
 #include <signal.h>
@@ -18,7 +22,7 @@
 #include <sys/utsname.h>
 #include <sys/ioctl.h>
 
-#include "llama.h"
+#include "basi_types.h"
 
 #include "util.h"
 #include "globals.h"
@@ -1296,7 +1300,7 @@ static Cli parse_args(int argc, char **argv) {
         .deepsearch_q = NULL, .prompt = NULL, .no_tools = false,
         .system_override = NULL, .cli_ctx = 0, .cli_temp = -1.0f,
         .cli_top_k = 0, .cli_top_p = 1.0f,
-        .cli_seed = LLAMA_DEFAULT_SEED, .bypass = false, .resume_path = NULL,
+        .cli_seed = BASI_DEFAULT_SEED, .bypass = false, .resume_path = NULL,
         .pick = false, .want_exit = false, .exit_code = 0,
     };
     for (int i = 1; i < argc; i++) {
@@ -1467,13 +1471,13 @@ static void build_system_prompt(char *buf, size_t sz, bool native_tools,
  * of the content, and mirror non-system turns into the session file. Backs the
  * ADD_MESSAGE macro in main() and is called directly by the extracted REPL
  * helpers (which hold the state by pointer). */
-static void repl_add_message(struct llama_chat_message **messages,
+static void repl_add_message(BasiMsg **messages,
                              size_t *msg_count, size_t *msg_cap,
                              FILE *session_fp,
                              const char *role, const char *content) {
     if (*msg_count >= *msg_cap) {
         *msg_cap = *msg_cap ? *msg_cap * 2 : 16;
-        *messages = realloc(*messages, *msg_cap * sizeof(struct llama_chat_message));
+        *messages = realloc(*messages, *msg_cap * sizeof(BasiMsg));
     }
     (*messages)[*msg_count].role    = role;
     (*messages)[*msg_count].content = strdup(content);
@@ -1497,8 +1501,7 @@ static void repl_add_message(struct llama_chat_message **messages,
 static int basi_srv_ctx_used  = 0;
 static int basi_srv_ctx_total = 0;
 
-static int context_used_tokens(struct llama_context *ctx) {
-    (void) ctx;                 /* generation is server-side; the local ctx is gone */
+static int context_used_tokens(void) {
     return basi_srv_ctx_used;
 }
 
@@ -1513,8 +1516,8 @@ static void fmt_token_count(char *buf, size_t n, int t) {
  * basi_srv_ctx_total — the context the llama-server was launched with. Colour is
  * the at-a-glance warning: green < 70%, amber 70-89%, red >= 90%. Trailing reset
  * returns to the caller's dim style. */
-static void format_context_meter(struct llama_context *ctx, char *out, size_t n) {
-    int used  = context_used_tokens(ctx);
+static void format_context_meter(char *out, size_t n) {
+    int used  = context_used_tokens();
     int total = basi_srv_ctx_total;
     int pct   = total > 0 ? (int)((100.0 * used) / total) : 0;
     char u[16], t[16];
@@ -1542,7 +1545,6 @@ static struct {
     bool   suspended;          /* torn down for a shell-out, resume afterwards */
     bool   hooks_installed;    /* atexit + signal handlers registered once */
     int    rows, cols;
-    struct llama_context *ctx; /* for the live ctx meter */
     char   model_tag[32];
 } g_bar = {0};
 
@@ -1584,7 +1586,7 @@ static void statusbar_compose(char *out, size_t outsz) {
 
     /* ctx meter — always shown, colour-graded like the footer */
     {
-        int used  = context_used_tokens(g_bar.ctx);
+        int used  = context_used_tokens();
         int total = basi_srv_ctx_total;
         int pct   = total > 0 ? (int)((100.0 * used) / total) : 0;
         char u[16], t[16];
@@ -1719,9 +1721,8 @@ static void statusbar_install_hooks(void) {
     sigaction(SIGWINCH, &wa, NULL);
 }
 
-static void statusbar_enable(struct llama_context *ctx, const char *model_tag) {
+static void statusbar_enable(const char *model_tag) {
     if (!isatty(STDOUT_FILENO) || !isatty(STDIN_FILENO)) return;
-    g_bar.ctx = ctx;
     snprintf(g_bar.model_tag, sizeof g_bar.model_tag, "%s", model_tag ? model_tag : "");
     statusbar_install_hooks();
     statusbar_setup_terminal();
@@ -2088,8 +2089,7 @@ static bool ci_contains(const char *hay, const char *needle) {
 
 static void try_model_switch(const char *arg, char **argv, int argc,
                              const char *cur_model, int cur_ngl,
-                             const char *session_path,
-                             struct llama_context *ctx) {
+                             const char *session_path) {
     char *new_path = NULL;              /* set for a named / substring switch */
     int   new_ngl  = cur_ngl;
     bool  use_picker = false;
@@ -2187,7 +2187,7 @@ static void try_model_switch(const char *arg, char **argv, int argc,
     perror("/model: exec");             /* only reached if exec failed */
     free(nv);
     free(new_path);
-    { char tag[32]; derive_model_tag(cur_model, tag, sizeof tag); statusbar_enable(ctx, tag); }
+    { char tag[32]; derive_model_tag(cur_model, tag, sizeof tag); statusbar_enable(tag); }
     fflush(stdout);
 }
 
@@ -2195,8 +2195,7 @@ static void try_model_switch(const char *arg, char **argv, int argc,
  * After any mutation of the message history, reset prev_len. The local KV is gone
  * (the server prefix-caches the full prompt itself), so there's nothing to clear —
  * this is now just prev_len bookkeeping. Shared by /clear, deepsearch-return, reclaim. */
-static void kv_resync_full(struct llama_context *ctx, size_t *prev_len) {
-    (void) ctx;
+static void kv_resync_full(size_t *prev_len) {
     *prev_len = 0;
 }
 
@@ -2235,7 +2234,7 @@ static const char *SUMMARY_TEMPLATE =
 
 /* Serialize a message range [start,end) into a plain transcript for the summary
  * input. Tool results were already capped at add time (MAX_TOOL_RESULT_SZ). */
-static char *serialize_messages(struct llama_chat_message *m, size_t start, size_t end) {
+static char *serialize_messages(BasiMsg *m, size_t start, size_t end) {
     StringBuf sb; sb_init(&sb);
     for (size_t i = start; i < end; i++) {
         const char *role = m[i].role ? m[i].role : "";
@@ -2269,11 +2268,9 @@ static char *build_checkpoint(const char *summary) {
  * de-advertised for the render so the schemas don't bloat the prompt or tempt a
  * tool call. Leaves the KV cleared; the caller resyncs. Returns malloc'd summary
  * text, or NULL on failure (caller falls back to a plain drop). */
-static char *summarize_head(struct llama_model *model, const struct llama_vocab *vocab,
-                            struct llama_context *ctx, struct llama_sampler *smpl,
-                            bool native_tools, char *formatted_buf,
+static char *summarize_head(bool native_tools, char *formatted_buf,
                             const char *prev_checkpoint, const char *head_text) {
-    (void) model; (void) vocab; (void) ctx; (void) smpl; (void) formatted_buf;  /* server templates now */
+    (void) formatted_buf;   /* unused: server templates from messages */
     StringBuf up; sb_init(&up);
     if (prev_checkpoint && *prev_checkpoint) {
         sb_append_str(&up, "Update the existing checkpoint using the new transcript: keep "
@@ -2289,7 +2286,7 @@ static char *summarize_head(struct llama_model *model, const struct llama_vocab 
     sb_append_str(&up, "\n</transcript>");
     char *user_content = sb_to_str(&up);
 
-    struct llama_chat_message tmp[2];
+    BasiMsg tmp[2];
     tmp[0].role = "system"; tmp[0].content = SUMMARY_SYS;
     tmp[1].role = "user";   tmp[1].content = user_content;
 
@@ -2312,18 +2309,16 @@ static char *summarize_head(struct llama_model *model, const struct llama_vocab 
  * (phase-1 behaviour) so the session still survives. Returns true if it compacted.
  * Must be called BEFORE rendering the current turn. */
 static bool reclaim_context_if_needed(
-        struct llama_model *model, const struct llama_vocab *vocab,
-        struct llama_context *ctx, struct llama_sampler *smpl,
         bool native_tools, char *formatted_buf,
-        struct llama_chat_message **messages_p, size_t *msg_count_p,
+        BasiMsg **messages_p, size_t *msg_count_p,
         size_t *prev_len_p) {
     int total = basi_srv_ctx_total;
     /* RESERVE: headroom left free for the incoming turn + its answer. ~4k on a
        full local ctx, scaled down so it never swallows a small ctx whole. */
     int reserve = total / 4 < 4096 ? total / 4 : 4096;
-    int used = context_used_tokens(ctx);
+    int used = context_used_tokens();
 
-    struct llama_chat_message *m = *messages_p;
+    BasiMsg *m = *messages_p;
     size_t mc = *msg_count_p;
 
     /* Account for the turn we are ABOUT to decode: the just-added user message
@@ -2397,7 +2392,7 @@ static bool reclaim_context_if_needed(
     bool ok = false;
     if (want_summary) {
         char *head_text = serialize_messages(m, pinned, keep_from);
-        summary = summarize_head(model, vocab, ctx, smpl, native_tools, formatted_buf,
+        summary = summarize_head(native_tools, formatted_buf,
                                  has_summary ? m[1].content : NULL, head_text);
         free(head_text);
         if (getenv("BASI_DEBUG_RECLAIM"))
@@ -2412,17 +2407,17 @@ static bool reclaim_context_if_needed(
         if (has_summary) free((void *)m[1].content);    /* replace the old summary in place */
         m[1].role = "user";
         m[1].content = cp;
-        memmove(&m[2], &m[keep_from], R * sizeof(struct llama_chat_message));
+        memmove(&m[2], &m[keep_from], R * sizeof(BasiMsg));
         *msg_count_p = 2 + R;
     } else {
         /* No checkpoint (retrieve/off, or summary failed): keep system [+ any
            existing summary] + recent. */
-        memmove(&m[pinned], &m[keep_from], R * sizeof(struct llama_chat_message));
+        memmove(&m[pinned], &m[keep_from], R * sizeof(BasiMsg));
         *msg_count_p = pinned + R;
     }
     free(summary);
 
-    kv_resync_full(ctx, prev_len_p);
+    kv_resync_full(prev_len_p);
     printf("\033[33m[Compacted: kept %zu recent message%s%s%s]\033[0m\n",
            R, R == 1 ? "" : "s",
            ok ? ", summary anchored" : "",
@@ -2439,9 +2434,7 @@ static bool reclaim_context_if_needed(
  * frees it. State the commands mutate is passed by pointer; the macro
  * aliases keep the moved body verbatim. */
 static void handle_slash_command(char *user_input,
-        struct llama_model *model, const struct llama_vocab *vocab,
-        struct llama_context *ctx,
-        struct llama_chat_message **messages_p, size_t *msg_count_p,
+        BasiMsg **messages_p, size_t *msg_count_p,
         size_t *msg_cap_p, FILE *session_fp, size_t *prev_len_p,
         size_t session_prompt_tokens, size_t session_gen_tokens) {
     #define messages  (*messages_p)
@@ -2486,7 +2479,7 @@ static void handle_slash_command(char *user_input,
             if (strcmp(user_input, "/clear") == 0) {
                 for (size_t i = 1; i < msg_count; i++) free((void*)messages[i].content);
                 msg_count = 1;
-                kv_resync_full(ctx, prev_len_p);
+                kv_resync_full(prev_len_p);
                 mem_clear();    /* drop retrieval memory too */
                 printf("\033[90m[Cleared conversation history (system prompt kept)]\033[0m\n");
                 fflush(stdout);
@@ -2497,7 +2490,7 @@ static void handle_slash_command(char *user_input,
                 printf("\033[90m[Session: %zu prompt tokens, %zu generated tokens, %zu total]\033[0m\n",
                        session_prompt_tokens, session_gen_tokens,
                        session_prompt_tokens + session_gen_tokens);
-                int used  = context_used_tokens(ctx);
+                int used  = context_used_tokens();
                 int total = basi_srv_ctx_total;
                 int pct   = total > 0 ? (int)((100.0 * used) / total) : 0;
                 printf("\033[90m[Context: %d/%d tokens in window (%d%%), %d free]\033[0m\n",
@@ -2678,7 +2671,7 @@ static void handle_slash_command(char *user_input,
                     return;
                 }
                 char *q_copy = strdup(q);
-                char *answer = execute_deep_search(model, vocab, q_copy);
+                char *answer = execute_deep_search(q_copy);
                 printf("\n%s\n\n", answer ? answer : "(no answer)");
                 fflush(stdout);
                 /* Record the exchange so follow-up turns have context. The
@@ -2687,7 +2680,7 @@ static void handle_slash_command(char *user_input,
                  * (like /clear) so the next turn cleanly re-decodes everything. */
                 ADD_MESSAGE("user", q_copy);
                 ADD_MESSAGE("assistant", answer ? answer : "(no answer)");
-                kv_resync_full(ctx, prev_len_p);
+                kv_resync_full(prev_len_p);
                 free(q_copy);
                 free(answer);
                 free(user_input);
@@ -2838,10 +2831,8 @@ static void handle_slash_command(char *user_input,
  * answer. State that outlives the turn is passed by pointer; user_input is
  * borrowed (the caller frees it). */
 static void run_agentic_turn(char *user_input,
-        struct llama_model *model, const struct llama_vocab *vocab,
-        struct llama_context *ctx, struct llama_sampler *smpl,
         bool native_tools, char *formatted_buf,
-        struct llama_chat_message **messages_p, size_t *msg_count_p,
+        BasiMsg **messages_p, size_t *msg_count_p,
         size_t *msg_cap_p, FILE *session_fp, size_t *prev_len_p,
         size_t *session_prompt_tokens_p, size_t *session_gen_tokens_p) {
     #define messages  (*messages_p)
@@ -2881,7 +2872,7 @@ static void run_agentic_turn(char *user_input,
            Summarizes the oldest turns into an anchored checkpoint (system prompt
            pinned) and resyncs the KV, so the render below re-decodes the compacted
            history once instead of hitting the [Context limit reached] wall. */
-        reclaim_context_if_needed(model, vocab, ctx, smpl, native_tools, formatted_buf,
+        reclaim_context_if_needed(native_tools, formatted_buf,
                                   messages_p, msg_count_p, prev_len_p);
 
         /* retrieve/hybrid: pull the top-k dropped turns most relevant to THIS query
@@ -2942,7 +2933,7 @@ static void run_agentic_turn(char *user_input,
                overflows. Compaction rewrites the message array; generate_chat()
                re-serializes it next iteration, so no re-render is needed here. */
             if (tool_iterations > 1)
-                reclaim_context_if_needed(model, vocab, ctx, smpl, native_tools,
+                reclaim_context_if_needed(native_tools,
                                           formatted_buf, messages_p, msg_count_p, prev_len_p);
 
             /* Server-chat path (item 6b, opt-in via BASI_SERVER_CHAT): the server
@@ -2970,7 +2961,7 @@ static void run_agentic_turn(char *user_input,
             double gen_tps = result.gen_time_s > 0
                 ? result.gen_tokens / result.gen_time_s : 0;
             char meter[80];
-            format_context_meter(ctx, meter, sizeof meter);
+            format_context_meter(meter, sizeof meter);
             printf("\033[90m[ Prompt: %.1f t/s | Generation: %.1f t/s | %s ]\033[0m\n",
                    prompt_tps, gen_tps, meter);
             fflush(stdout);
@@ -3030,7 +3021,7 @@ static void run_agentic_turn(char *user_input,
                 /* context_used_tokens() reads the server's tracked prompt count in
                    server mode, or the local KV otherwise — so the budget hint the
                    model sees is honest in both. */
-                int used = context_used_tokens(ctx);
+                int used = context_used_tokens();
                 int remaining = basi_srv_ctx_total - used;
 
                 if (native_tools) {
@@ -3130,7 +3121,7 @@ static void run_agentic_turn(char *user_input,
             double gen_tps = final_result.gen_time_s > 0
                 ? final_result.gen_tokens / final_result.gen_time_s : 0;
             char meter[80];
-            format_context_meter(ctx, meter, sizeof meter);
+            format_context_meter(meter, sizeof meter);
             printf("\033[90m[ Generation: %.1f t/s | %s ]\033[0m\n", gen_tps, meter);
             fflush(stdout);
             statusbar_draw();   /* refresh the pinned ctx meter after this turn */
@@ -3336,7 +3327,7 @@ int main(int argc, char **argv) {
         pid_t pid = srvgen_spawn(sbin, model_path, n_gpu_layers, 4096,
                                  "--jinja --reasoning-format auto", 8181, "/tmp/basi_srvgen.log", 300);
         if (pid < 0) { fprintf(stderr, "[msgtest] server spawn FAILED\n"); return 1; }
-        struct llama_chat_message m[4] = {
+        BasiMsg m[4] = {
             { "system",      "You are a helpful assistant. Answer concisely." },
             { "user",        "What files are in the current directory? Use bash." },
             { "tool_call",   "{\"name\":\"bash\",\"arguments\":{\"command\":\"ls\"}}" },
@@ -3369,9 +3360,6 @@ int main(int argc, char **argv) {
        model/vocab/ctx handles stay NULL (retained only in the signatures of
        functions that no longer touch them). */
     const bool use_server = true;
-    struct llama_model *model = NULL;
-    const struct llama_vocab *vocab = NULL;
-    struct llama_context *ctx = NULL;
 
     /* In one-shot deep-research shrink the server context to free VRAM. */
     if (oneshot_deepsearch_q) ctx_override = 4096;
@@ -3439,7 +3427,7 @@ int main(int argc, char **argv) {
     basi_srv_sampling.min_p          = 0.05;
     basi_srv_sampling.top_k          = top_k;
     basi_srv_sampling.top_p          = top_p;
-    basi_srv_sampling.seed           = (cli_seed == LLAMA_DEFAULT_SEED) ? -1 : (long) cli_seed;
+    basi_srv_sampling.seed           = (cli_seed == BASI_DEFAULT_SEED) ? -1 : (long) cli_seed;
 
     if (!no_tools && !oneshot_prompt) {
         print_startup_banner(model_path, basi_srv_ctx_total, n_gpu_layers);
@@ -3448,7 +3436,7 @@ int main(int argc, char **argv) {
     }
 
     /* Chat messages (dynamic array) */
-    struct llama_chat_message *messages = NULL;
+    BasiMsg *messages = NULL;
     size_t msg_count = 0;
     size_t msg_cap   = 0;
 
@@ -3528,7 +3516,7 @@ int main(int argc, char **argv) {
     /* Non-interactive deep research: run it, print the answer, and exit —
        skipping the session picker and the REPL entirely. */
     if (oneshot_deepsearch_q) {
-        char *ans = execute_deep_search(model, vocab, oneshot_deepsearch_q);
+        char *ans = execute_deep_search(oneshot_deepsearch_q);
         printf("\n%s\n", ans ? ans : "(no answer)");
         fflush(stdout);
         free(ans);
@@ -3582,7 +3570,7 @@ int main(int argc, char **argv) {
     if (!oneshot_prompt) {
         char model_tag[32];
         derive_model_tag(model_path, model_tag, sizeof model_tag);
-        statusbar_enable(ctx, model_tag);
+        statusbar_enable(model_tag);
     }
 
     /* REPL loop (or a single injected turn in -p one-shot mode) */
@@ -3613,17 +3601,17 @@ int main(int argc, char **argv) {
                 const char *marg = user_input + 6;
                 while (*marg == ' ') marg++;
                 try_model_switch(marg, argv, argc, model_path, n_gpu_layers,
-                                 session_path, ctx);
+                                 session_path);
                 free(user_input);
                 continue;
             }
-            handle_slash_command(user_input, model, vocab, ctx,
+            handle_slash_command(user_input,
                                  &messages, &msg_count, &msg_cap, session_fp,
                                  &prev_len, session_prompt_tokens, session_gen_tokens);
             continue;
         }
 
-        run_agentic_turn(user_input, model, vocab, ctx, NULL /*smpl: server-side*/, native_tools,
+        run_agentic_turn(user_input, native_tools,
                          formatted_buf, &messages, &msg_count, &msg_cap,
                          session_fp, &prev_len,
                          &session_prompt_tokens, &session_gen_tokens);

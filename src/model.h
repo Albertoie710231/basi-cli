@@ -2,7 +2,7 @@
 #define BASI_MODEL_H
 
 #include <stddef.h>
-#include "llama.h"
+#include "basi_types.h"
 #include "srvgen.h"   /* SrvSampling (server-backed generation knobs) */
 
 /* One-shot init: registers the llama log callback + loads ggml backends. */
@@ -38,7 +38,6 @@ typedef struct {
    spawned llama-server (set by main.c). basi_srv_model = a vocab_only handle for
    deriving the tool grammar. */
 extern int basi_srv_port;
-extern const struct llama_model *basi_srv_model;
 /* Sampling knobs for the server /completion request (filled by main.c to mirror
    the native sampler chain). */
 extern SrvSampling basi_srv_sampling;
@@ -51,7 +50,7 @@ extern int basi_srv_suppress_grammar;
    prompt token count (res.prompt_tokens) and fills tc_out/n_tc_out with the
    STRUCTURED tool calls (caller frees via basi_free_tool_calls). */
 struct BasiToolCall;
-GenerateResult generate_chat(const struct llama_chat_message *messages, size_t msg_count,
+GenerateResult generate_chat(const BasiMsg *messages, size_t msg_count,
                              struct BasiToolCall **tc_out, int *n_tc_out);
 
 /* Locate a "<tool>...</tool>" tag in the model's output text.

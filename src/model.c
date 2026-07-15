@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <string.h>
 #include <stdbool.h>
 #include <unistd.h>
@@ -11,7 +12,7 @@
 #include <time.h>
 #include <errno.h>
 
-#include "llama.h"
+#include "basi_types.h"
 
 #include "util.h"
 #include "globals.h"
@@ -78,7 +79,6 @@ static void clear_thinking_box(void) {
  * Set by main.c after srvgen_spawn(). basi_srv_model is a vocab_only handle used
  * to derive the tool grammar. */
 int basi_srv_port = 0;
-const struct llama_model *basi_srv_model = NULL;
 /* Defaults mirror BASI's native sampler chain (main.c overwrites in server mode):
    temp 0.4, repeat_penalty 1.1 over 256 tokens, min_p 0.05, top_k/top_p/seed off. */
 SrvSampling basi_srv_sampling = { .temperature = 0.4, .repeat_penalty = 1.1, .repeat_last_n = 256,
@@ -135,7 +135,7 @@ static void chat_on_content(const char *chunk, void *ud) {
  * JSON, streams /v1/chat/completions, and returns the answer text plus STRUCTURED
  * tool calls in tc_out/n_tc_out (caller frees via basi_free_tool_calls).
  * res.prompt_tokens carries the server's exact prompt count for ctx accounting. */
-GenerateResult generate_chat(const struct llama_chat_message *messages, size_t msg_count,
+GenerateResult generate_chat(const BasiMsg *messages, size_t msg_count,
                              BasiToolCall **tc_out, int *n_tc_out) {
     GenerateResult res = { NULL, 0, 0, 0.0, 0.0 };
     if (tc_out) *tc_out = NULL;

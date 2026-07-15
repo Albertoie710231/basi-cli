@@ -2,7 +2,7 @@
 // Generation, templating, tool-call grammar and parsing all happen server-side
 // now, so the in-process common_chat engine is gone — only the tool registry and
 // these nlohmann serializers remain. No llama_/common_chat FUNCTIONS are called
-// here (llama_chat_message is a POD used for its fields only), so this translation
+// here (BasiMsg is a POD used for its fields only), so this translation
 // unit links ZERO libllama symbols.
 #include <cstdlib>
 #include <cstring>
@@ -11,7 +11,7 @@
 #include <vector>
 #include <utility>
 
-#include "llama.h"            // llama_chat_message (POD {role, content}) — type only
+#include "basi_types.h"            // BasiMsg (POD {role, content}) — type only
 #include "nlohmann/json.hpp"
 #include "chat_tmpl.h"
 
@@ -55,7 +55,7 @@ extern "C" char *basi_tools_to_json(void) {
 // BASI messages → OpenAI `messages` array (malloc'd JSON string, caller frees).
 // The custom roles map as: tool_call → assistant with tool_calls[] (synthetic
 // call_N id); tool_result → tool with tool_call_id = the preceding call's id.
-extern "C" char *basi_messages_to_json(const struct llama_chat_message *msgs, int n_msgs) {
+extern "C" char *basi_messages_to_json(const BasiMsg *msgs, int n_msgs) {
     try {
         nlohmann::ordered_json arr = nlohmann::ordered_json::array();
         int call_seq = 0;                 // ids assigned to tool_calls in order

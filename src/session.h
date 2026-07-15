@@ -4,7 +4,7 @@
 #include <stdio.h>
 #include <stddef.h>
 
-#include "llama.h"
+#include "basi_types.h"
 
 /* Returns malloc'd path: ~/.local/share/basi-cli/projects/<encoded-cwd>/
  * with the directory created. NULL on failure. */
@@ -20,7 +20,7 @@ char *session_picker(const char *dir);
 /* Resume from a saved session log: append user/assistant turns into the
  * given llama chat-message buffer (up to a 30%-of-context char budget). */
 void session_load_into(const char *path,
-                       struct llama_chat_message **messages,
+                       BasiMsg **messages,
                        size_t *msg_count,
                        size_t *msg_cap,
                        int n_ctx);

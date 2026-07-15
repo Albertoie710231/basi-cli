@@ -3,7 +3,7 @@
 
 #include <stddef.h>
 #include <stdbool.h>
-#include "llama.h"
+#include "basi_types.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -40,7 +40,7 @@ int  basi_tools_registered(void);
    Both return a malloc'd string (caller frees); basi_tools_to_json returns NULL
    when no tools are registered. */
 char *basi_tools_to_json(void);
-char *basi_messages_to_json(const struct llama_chat_message *msgs, int n_msgs);
+char *basi_messages_to_json(const BasiMsg *msgs, int n_msgs);
 
 /* Free a tool-call array (name/arguments strdup'd by the caller side). */
 void basi_free_tool_calls(BasiToolCall *calls, int n);
