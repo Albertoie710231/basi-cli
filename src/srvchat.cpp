@@ -85,7 +85,7 @@ extern "C" SrvChatResult *srvchat_complete(
     std::string content, reasoning, finish;
     std::vector<AccTool> tools;
     int prompt_tokens = 0, completion_tokens = 0;
-    double tps = 0;
+    double tps = 0, prompt_tps = 0;
 
     char *line = nullptr; size_t cap = 0; ssize_t len;
     while ((len = getline(&line, &cap, p)) != -1) {
@@ -130,8 +130,10 @@ extern "C" SrvChatResult *srvchat_complete(
             prompt_tokens     = d["usage"].value("prompt_tokens", 0);
             completion_tokens = d["usage"].value("completion_tokens", 0);
         }
-        if (d.contains("timings") && d["timings"].is_object())
-            tps = d["timings"].value("predicted_per_second", 0.0);
+        if (d.contains("timings") && d["timings"].is_object()) {
+            tps        = d["timings"].value("predicted_per_second", 0.0);
+            prompt_tps = d["timings"].value("prompt_per_second", 0.0);
+        }
     }
     free(line);
     pclose(p);
@@ -145,6 +147,7 @@ extern "C" SrvChatResult *srvchat_complete(
     res->prompt_tokens = prompt_tokens;
     res->completion_tokens = completion_tokens;
     res->tps = tps;
+    res->prompt_tps = prompt_tps;
     if (!tools.empty()) {
         res->tool_calls = (SrvToolCall *) calloc(tools.size(), sizeof(SrvToolCall));
         if (res->tool_calls) {

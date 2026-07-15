@@ -194,6 +194,9 @@ GenerateResult generate_chat(const BasiMsg *messages, size_t msg_count,
     res.prompt_tokens = (size_t) r->prompt_tokens;
     res.gen_tokens    = (size_t) r->completion_tokens;
     res.gen_time_s    = (r->tps > 0) ? r->completion_tokens / r->tps : (time_now() - t0);
+    /* Meter shows prompt_tokens/prompt_time_s; pick prompt_time_s so it reconstructs
+       the server's reported prefill rate (0 when fully cache-hit → "Prompt: 0.0"). */
+    res.prompt_time_s = (r->prompt_tps > 0) ? r->prompt_tokens / r->prompt_tps : 0.0;
 
     if (r->n_tool_calls > 0 && tc_out) {
         BasiToolCall *arr = calloc((size_t) r->n_tool_calls, sizeof(BasiToolCall));

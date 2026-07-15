@@ -25,7 +25,8 @@ typedef struct {
     int          n_tool_calls;
     int          prompt_tokens;   /* from usage (0 if absent) */
     int          completion_tokens;
-    double       tps;             /* predicted tokens/sec from timings (0 if absent) */
+    double       tps;             /* predicted (generation) tokens/sec from timings (0 if absent) */
+    double       prompt_tps;      /* prompt (prefill) tokens/sec from timings (0 if absent/cached) */
     char        *finish_reason;   /* "stop" | "tool_calls" | "length" | ... (malloc'd, may be NULL) */
 } SrvChatResult;
 
