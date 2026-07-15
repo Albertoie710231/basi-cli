@@ -5,7 +5,6 @@
 #include "basi_types.h"
 #include "srvgen.h"   /* SrvSampling (server-backed generation knobs) */
 
-/* One-shot init: registers the llama log callback + loads ggml backends. */
 
 /* ── Launch config (returned by interactive picker) ────────────────── */
 typedef struct {
