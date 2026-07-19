@@ -44,7 +44,6 @@
 #include "slashmenu.h"
 #include "srvgen.h"
 #include "srvchat.h"
-#include "toolidx.h"
 
 /* MAX_TOKENS, CONTEXT_SIZE → globals.h */
 #define MAX_FILE_TOKENS     2000
@@ -735,98 +734,6 @@ static char *read_small_file(const char *filepath) {
  * the top and the pass/fail summary at the bottom. Line-aware (keeps at most
  * head_lines + tail_lines lines) with a hard byte ceiling. Edits in place (the
  * result is always shorter). Returns bytes dropped (0 = left unchanged). */
-/* ── Retrieve-don't-stuff (BASI_TOOL_RETRIEVE=1) ─────────────────────────
- * Instead of pasting a large tool result into context (and destroying its middle
- * via truncate_tool_result), index it and inject only the chunks relevant to the
- * task. Measured motivation: ~70% of a 21-tool-call research run was PREFILLING
- * tool output, and generation decayed 27.0 -> 18.8 t/s as context grew.
- *
- * Default OFF. This trades a GUARANTEED cost for a PROBABILISTIC one — today the
- * model reliably sees head+tail; after this it sees head + whatever retrieval
- * surfaced, and a miss degrades the answer silently. Opt-in until measured. */
-#define TOOL_RETRIEVE_HEAD_LINES 30      /* verbatim prefix: what did we fetch? */
-/* k=3 measured on a 73 KB bash result with a buried needle (Qwen3.5-9B):
- *   OFF (truncate) ctx 5.9k, needle LOST     k=1 ctx 4.7k, found
- *   k=3            ctx 5.6k, found           k=5 ctx 7.4k, found
- * k>=5 injects more than the 8 KB truncation cap and makes context BIGGER, which
- * defeats the point; k<=3 beats truncation on context AND recovers the fact
- * truncation destroys. 3 keeps redundancy against a retrieval miss. */
-#define TOOL_RETRIEVE_K           3
-#define TOOL_RETRIEVE_THRESHOLD   0.25f  /* needle scored 0.63 vs ~0.13 noise */
-
-static bool tool_retrieve_enabled(void) {
-    const char *e = getenv("BASI_TOOL_RETRIEVE");
-    return e && *e && atoi(e) != 0;
-}
-
-/* Returns a malloc'd replacement for `result`, or NULL to keep the normal
- * truncate-and-paste path. NULL is returned whenever retrieval cannot be trusted
- * (too small to bother, indexing failed, or nothing cleared the threshold) —
- * pasting head+tail is always better than handing the model almost nothing. */
-static char *tool_result_retrieve(const char *tool, const char *args,
-                                  const char *user_input, const char *result,
-                                  int *out_rid) {
-    if (out_rid) *out_rid = -1;
-    if (!result) return NULL;
-    size_t len = strlen(result);
-    if (len < TOOLIDX_MIN_INDEX) return NULL;
-
-    int rid = -1;
-    int nch = toolidx_add(tool, args, result, &rid);
-    if (nch <= 0) return NULL;
-    /* Reported even when we fall back below: the chunks exist either way, and the
-       caller should still tell the model they are addressable. */
-    if (out_rid) *out_rid = rid;
-
-    /* Query = what the user is trying to do + what this call asked for. The task
-       alone is too vague across a long turn; the args alone lose the goal. */
-    StringBuf q; sb_init(&q);
-    if (user_input) { sb_append_str(&q, user_input); sb_append_str(&q, " "); }
-    if (args)       sb_append_str(&q, args);
-    char *query = sb_to_str(&q);
-
-    float thr = TOOL_RETRIEVE_THRESHOLD;
-    { const char *e = getenv("BASI_TOOL_RETRIEVE_THRESHOLD"); if (e && *e) thr = (float) atof(e); }
-    int k = TOOL_RETRIEVE_K;
-    { const char *e = getenv("BASI_TOOL_RETRIEVE_K"); if (e && *e && atoi(e) > 0) k = atoi(e); }
-    if (k > 16) k = 16;
-
-    const char *hits[16]; int ids[16]; float sc[16];
-    int got = toolidx_retrieve(query, k, thr, hits, ids, sc);
-    free(query);
-    if (got <= 0) return NULL;              /* nothing relevant — fall back */
-
-    /* Head stays verbatim so the model can tell WHAT it fetched; retrieved
-       fragments alone read as context-free rubble. */
-    size_t head_end = 0;
-    { int nl = 0;
-      for (size_t i = 0; i < len && nl < TOOL_RETRIEVE_HEAD_LINES; i++)
-          if (result[i] == '\n') { nl++; head_end = i + 1; } }
-    if (head_end == 0 || head_end > len) head_end = len < 2048 ? len : 2048;
-    while (head_end > 0 && ((unsigned char) result[head_end] & 0xC0) == 0x80) head_end--;
-
-    StringBuf out; sb_init(&out);
-    sb_append(&out, result, head_end);
-
-    char note[256];
-    int first = 0, last = 0;
-    toolidx_result_span(rid, &first, &last);
-    snprintf(note, sizeof note,
-        "\n[... %zu bytes indexed as chunks %d-%d; showing the %d most relevant below. "
-        "Use result_fetch(<id>) for any other chunk. ...]\n",
-        len - head_end, first, last, got);
-    sb_append_str(&out, note);
-
-    for (int i = 0; i < got; i++) {
-        char hdr[96];
-        snprintf(hdr, sizeof hdr, "\n--- chunk %d (relevance %.2f) ---\n", ids[i], sc[i]);
-        sb_append_str(&out, hdr);
-        sb_append_str(&out, hits[i]);
-        sb_append_str(&out, "\n");
-    }
-    return sb_to_str(&out);
-}
-
 static size_t truncate_tool_result(char *s, int head_lines, int tail_lines,
                                    size_t max_bytes) {
     size_t len = strlen(s);
@@ -1219,8 +1126,7 @@ static char *execute_tool_native(const char *name, const char *args_json) {
     bool direct = strcmp(name, "read") == 0  || strcmp(name, "head") == 0 ||
                   strcmp(name, "tail") == 0  || strcmp(name, "grep") == 0 ||
                   strcmp(name, "wc")   == 0  || strcmp(name, "web_search") == 0 ||
-                  strcmp(name, "web_fetch") == 0 || strcmp(name, "readfile") == 0 ||
-                  strcmp(name, "result_fetch") == 0;
+                  strcmp(name, "web_fetch") == 0 || strcmp(name, "readfile") == 0;
 
     if (!direct) {
         char *cmd = basi_build_command(name, args_json);
@@ -1243,26 +1149,6 @@ static char *execute_tool_native(const char *name, const char *args_json) {
         spike_calls++;
     }
 
-    if (strcmp(name, "result_fetch") == 0) {
-        /* Makes the chunk ids in the "[... indexed as chunks A-B ...]" note real:
-           the model can pull any part of a large result that retrieval did not
-           surface, instead of the middle being gone for good. */
-        long id = jx_get_int(args_json, "id");
-        size_t have = toolidx_count();
-        if (have == 0)
-            return strdup("Error: no indexed tool results yet (nothing to fetch).");
-        if (id < 0 || (size_t) id >= have) {
-            char *m = malloc(160);
-            snprintf(m, 160, "Error: no chunk %ld. Valid chunk ids are 0-%zu.", id, have - 1);
-            return m;
-        }
-        const char *chunk = toolidx_get((int) id);
-        if (!chunk) return strdup("Error: chunk unavailable.");
-        char *out = malloc(strlen(chunk) + 64);
-        if (!out) return strdup("Error: out of memory.");
-        sprintf(out, "--- chunk %ld ---\n%s\n", id, chunk);
-        return out;
-    }
     if (strcmp(name, "read") == 0) {
         char *file = jx_get_string(args_json, "file");
         if (!file) return strdup("Error: read requires a file path");
@@ -2433,70 +2319,6 @@ static char *summarize_head(bool native_tools, char *formatted_buf,
  * KV resync are deterministic. If summarization fails it falls back to a plain drop
  * (phase-1 behaviour) so the session still survives. Returns true if it compacted.
  * Must be called BEFORE rendering the current turn. */
-/* ── Evict old tool-result BODIES (BASI_TOOL_EVICT=1) ────────────────────
- * The measured problem: a 22-tool-call research turn reached 35k tokens not
- * because any single result was huge — they are already capped at 8000 bytes —
- * but because 22 capped results ACCUMULATE, and every one is re-prefilled every
- * turn at ~40 t/s. reclaim_context_if_needed only fires at ~94% of context
- * (used > total - 4096), so on a 66k context it never ran at all: both M4 arms
- * peaked at 53% and 83% with zero compaction.
- *
- * So: once context crosses a much lower watermark, replace the BODY of all but
- * the most recent tool results with a short stub naming their chunk range in
- * toolidx. The message itself stays (deleting it would break the
- * tool_call/tool_result pairing that chat templates require), and the content is
- * still reachable — the model calls result_fetch(<id>). This is the accumulation
- * term, which per-result retrieval could not touch.
- *
- * Rewriting old messages invalidates the cached prefix, so this costs ONE full
- * re-prefill of the (now smaller) history. That only pays off across many
- * subsequent turns, which is why it fires on a watermark rather than per
- * iteration. Default OFF. */
-#define TOOL_EVICT_MIN_BODY 2000   /* below this, a stub saves nothing worth a resync */
-
-static int evict_old_tool_results(BasiMsg *m, size_t mc, int keep_recent) {
-    /* Locate tool_result messages, newest last. */
-    int idx[256]; int n = 0;
-    for (size_t i = 0; i < mc && n < 256; i++)
-        if (m[i].role && strcmp(m[i].role, "tool_result") == 0) idx[n++] = (int) i;
-    if (n <= keep_recent) return 0;
-
-    int evicted = 0;
-    for (int k = 0; k < n - keep_recent; k++) {
-        int i = idx[k];
-        const char *env = m[i].content;
-        if (!env) continue;
-        char *body = jx_get_string(env, "content");
-        if (!body) continue;
-        if (strlen(body) < TOOL_EVICT_MIN_BODY) { free(body); continue; }
-        /* Already a stub from a previous eviction? Leave it alone. */
-        if (strstr(body, "[result evicted")) { free(body); continue; }
-
-        char *name = jx_get_string(env, "name");
-        int rid = -1;
-        int nch = toolidx_add(name ? name : "tool", NULL, body, &rid);
-        char stub[224];
-        int first = 0, last = 0;
-        if (nch > 0 && toolidx_result_span(rid, &first, &last) > 0)
-            snprintf(stub, sizeof stub,
-                "[result evicted to save context — %zu bytes indexed as chunks %d-%d; "
-                "call result_fetch(<id>) to read any part]", strlen(body), first, last);
-        else
-            snprintf(stub, sizeof stub,
-                "[result evicted to save context — %zu bytes dropped]", strlen(body));
-
-        char *new_env = tool_result_envelope(name ? name : "tool", stub);
-        if (new_env) {
-            free((void *) m[i].content);
-            m[i].content = new_env;
-            evicted++;
-        }
-        free(name);
-        free(body);
-    }
-    return evicted;
-}
-
 static bool reclaim_context_if_needed(
         bool native_tools, char *formatted_buf,
         BasiMsg **messages_p, size_t *msg_count_p,
@@ -3107,21 +2929,6 @@ static void run_agentic_turn(char *user_input,
            editing). Overridable via BASI_MAX_TOOL_ITERS. */
         int tool_iterations = 0;
         int consec_parse_fail = 0;     /* consecutive unparseable tool-call outputs */
-        /* Proactive tool-result eviction (see evict_old_tool_results). keep<0 = off. */
-        int  last_evict_iter = -1000;  /* amortize: resyncs are not free */
-        int  tool_evict_keep = -1, tool_evict_pct = 50, tool_evict_every = 5;
-        {
-            const char *e = getenv("BASI_TOOL_EVICT");
-            if (e && *e && atoi(e) != 0) {
-                tool_evict_keep = 3;                    /* newest N kept verbatim */
-                const char *k = getenv("BASI_TOOL_EVICT_KEEP");
-                if (k && *k && atoi(k) >= 0) tool_evict_keep = atoi(k);
-                const char *w = getenv("BASI_TOOL_EVICT_AT");
-                if (w && *w && atoi(w) > 0 && atoi(w) < 100) tool_evict_pct = atoi(w);
-                const char *ev = getenv("BASI_TOOL_EVICT_EVERY");
-                if (ev && *ev && atoi(ev) > 0) tool_evict_every = atoi(ev);
-            }
-        }
         int max_tool_iterations = 40;
         {
             const char *mi = getenv("BASI_MAX_TOOL_ITERS");
@@ -3139,29 +2946,6 @@ static void run_agentic_turn(char *user_input,
             if (tool_iterations > 1)
                 reclaim_context_if_needed(native_tools,
                                           formatted_buf, messages_p, msg_count_p, prev_len_p);
-
-            /* Proactive tool-result eviction, well below reclaim's ~94% wall.
-               Fires ONCE per crossing of the watermark: rewriting history costs a
-               full re-prefill, so doing it per iteration would lose more than it
-               saves. Default OFF (BASI_TOOL_EVICT=1). */
-            if (tool_evict_keep >= 0 && basi_srv_ctx_total > 0 &&
-                tool_iterations - last_evict_iter >= tool_evict_every) {
-                int used_now = context_used_tokens();
-                int mark = basi_srv_ctx_total * tool_evict_pct / 100;
-                if (used_now >= mark) {
-                    int ev = evict_old_tool_results(messages, msg_count, tool_evict_keep);
-                    if (ev > 0) {
-                        /* Only stamp on a REAL eviction, so a no-op scan does not
-                           push the next opportunity out by tool_evict_every. */
-                        last_evict_iter = tool_iterations;
-                        kv_resync_full(prev_len_p);
-                        if (!generate_quiet)
-                            fprintf(stderr, "\033[90m[evict] %d old tool result(s) -> chunk stubs "
-                                    "at %d/%d tokens (%d%% watermark)\033[0m\n",
-                                    ev, used_now, basi_srv_ctx_total, tool_evict_pct);
-                    }
-                }
-            }
 
             /* Server-chat path (item 6b, opt-in via BASI_SERVER_CHAT): the server
                templates from the message array, owns the tool grammar, and returns
@@ -3203,7 +2987,6 @@ static void run_agentic_turn(char *user_input,
             char *tool_result = NULL;      /* native path computes this directly */
             char *call_env = NULL;         /* native: structured assistant tool-call envelope */
             char *call_name = NULL;        /* native: tool name, for the result envelope */
-            char *call_args = NULL;        /* native: args, for the retrieval query (ncalls is freed below) */
             bool have_call = false;
 
             /* Structured tool calls come straight from the server (one per turn). */
@@ -3219,7 +3002,6 @@ static void run_agentic_turn(char *user_input,
                             tool_result ? tool_result : "(null)");
                 if (!tool_result) unknown_tool = strdup(nm);
                 call_name = strdup(nm);
-                call_args = ncalls[0].arguments ? strdup(ncalls[0].arguments) : NULL;
                 call_env  = tool_call_envelope(ncalls[0].name, ncalls[0].arguments);
                 have_call = true;
             }
@@ -3242,45 +3024,9 @@ static void run_agentic_turn(char *user_input,
                 /* Truncate tool result if too large — line-aware, head+tail.
                    The dim "└ <summary>" sub-line reports the outcome (and any
                    trim) directly under the activity header. */
-                size_t dropped = 0;
-                char *retrieved = NULL;
-                int   idx_rid = -1;
-                if (tool_retrieve_enabled())
-                    retrieved = tool_result_retrieve(call_name, call_args, user_input,
-                                                     tool_result, &idx_rid);
-                if (retrieved) {
-                    size_t before = strlen(tool_result), after = strlen(retrieved);
-                    dropped = before > after ? before - after : 0;
-                    free(tool_result);
-                    tool_result = retrieved;
-                } else {
-                    dropped = truncate_tool_result(tool_result,
-                            TOOL_RESULT_HEAD_LINES, TOOL_RESULT_TAIL_LINES,
-                            TOOL_RESULT_MAX_BYTES);
-                    /* Fallback path: retrieval surfaced nothing, so the middle was
-                       truncated away as before — but it WAS indexed, so say so.
-                       Otherwise the dropped text is unreachable and the model has
-                       no idea it could ask for it. */
-                    if (idx_rid >= 0 && dropped > 0) {
-                        int first = 0, last = 0;
-                        if (toolidx_result_span(idx_rid, &first, &last) > 0) {
-                            char note[192];
-                            snprintf(note, sizeof note,
-                                "\n[The truncated middle is indexed as chunks %d-%d — "
-                                "call result_fetch(<id>) to read any of it.]\n", first, last);
-                            size_t nl = strlen(tool_result) + strlen(note) + 1;
-                            char *joined = malloc(nl);
-                            if (joined) {
-                                snprintf(joined, nl, "%s%s", tool_result, note);
-                                free(tool_result);
-                                tool_result = joined;
-                                if (getenv("BASI_DEBUG_TOOLS"))
-                                    fprintf(stderr, "[toolidx] retrieval found nothing; "
-                                            "truncated but advertised chunks %d-%d\n", first, last);
-                            }
-                        }
-                    }
-                }
+                size_t dropped = truncate_tool_result(tool_result,
+                        TOOL_RESULT_HEAD_LINES, TOOL_RESULT_TAIL_LINES,
+                        TOOL_RESULT_MAX_BYTES);
                 print_tool_result_line(tool_result, dropped);
 
                 /* context_used_tokens() reads the server's tracked prompt count in
@@ -3330,7 +3076,6 @@ static void run_agentic_turn(char *user_input,
                 }
                 free(call_env);     /* native built it; NULL (safe) on legacy */
                 free(call_name);
-                free(call_args);
                 free(tool_result);
 
                 /* The tool call + result were appended to `messages`; generate_chat()
@@ -3586,13 +3331,6 @@ int main(int argc, char **argv) {
        no chat model — it only exercises the embedder. */
     if (getenv("BASI_EMBED_BATCH_SELFTEST")) {
         embed_batch_selftest();
-        return 0;
-    }
-
-    /* M1: BASI_TOOLIDX_SELFTEST=1 indexes a synthetic tool result and checks that
-       retrieval surfaces a buried needle — the question the whole layer rests on. */
-    if (getenv("BASI_TOOLIDX_SELFTEST")) {
-        toolidx_selftest();
         return 0;
     }
 
