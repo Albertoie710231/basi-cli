@@ -764,7 +764,9 @@ static bool tool_retrieve_enabled(void) {
  * (too small to bother, indexing failed, or nothing cleared the threshold) —
  * pasting head+tail is always better than handing the model almost nothing. */
 static char *tool_result_retrieve(const char *tool, const char *args,
-                                  const char *user_input, const char *result) {
+                                  const char *user_input, const char *result,
+                                  int *out_rid) {
+    if (out_rid) *out_rid = -1;
     if (!result) return NULL;
     size_t len = strlen(result);
     if (len < TOOLIDX_MIN_INDEX) return NULL;
@@ -772,6 +774,9 @@ static char *tool_result_retrieve(const char *tool, const char *args,
     int rid = -1;
     int nch = toolidx_add(tool, args, result, &rid);
     if (nch <= 0) return NULL;
+    /* Reported even when we fall back below: the chunks exist either way, and the
+       caller should still tell the model they are addressable. */
+    if (out_rid) *out_rid = rid;
 
     /* Query = what the user is trying to do + what this call asked for. The task
        alone is too vague across a long turn; the args alone lose the goal. */
@@ -1214,7 +1219,8 @@ static char *execute_tool_native(const char *name, const char *args_json) {
     bool direct = strcmp(name, "read") == 0  || strcmp(name, "head") == 0 ||
                   strcmp(name, "tail") == 0  || strcmp(name, "grep") == 0 ||
                   strcmp(name, "wc")   == 0  || strcmp(name, "web_search") == 0 ||
-                  strcmp(name, "web_fetch") == 0 || strcmp(name, "readfile") == 0;
+                  strcmp(name, "web_fetch") == 0 || strcmp(name, "readfile") == 0 ||
+                  strcmp(name, "result_fetch") == 0;
 
     if (!direct) {
         char *cmd = basi_build_command(name, args_json);
@@ -1237,6 +1243,26 @@ static char *execute_tool_native(const char *name, const char *args_json) {
         spike_calls++;
     }
 
+    if (strcmp(name, "result_fetch") == 0) {
+        /* Makes the chunk ids in the "[... indexed as chunks A-B ...]" note real:
+           the model can pull any part of a large result that retrieval did not
+           surface, instead of the middle being gone for good. */
+        long id = jx_get_int(args_json, "id");
+        size_t have = toolidx_count();
+        if (have == 0)
+            return strdup("Error: no indexed tool results yet (nothing to fetch).");
+        if (id < 0 || (size_t) id >= have) {
+            char *m = malloc(160);
+            snprintf(m, 160, "Error: no chunk %ld. Valid chunk ids are 0-%zu.", id, have - 1);
+            return m;
+        }
+        const char *chunk = toolidx_get((int) id);
+        if (!chunk) return strdup("Error: chunk unavailable.");
+        char *out = malloc(strlen(chunk) + 64);
+        if (!out) return strdup("Error: out of memory.");
+        sprintf(out, "--- chunk %ld ---\n%s\n", id, chunk);
+        return out;
+    }
     if (strcmp(name, "read") == 0) {
         char *file = jx_get_string(args_json, "file");
         if (!file) return strdup("Error: read requires a file path");
@@ -3116,8 +3142,10 @@ static void run_agentic_turn(char *user_input,
                    trim) directly under the activity header. */
                 size_t dropped = 0;
                 char *retrieved = NULL;
+                int   idx_rid = -1;
                 if (tool_retrieve_enabled())
-                    retrieved = tool_result_retrieve(call_name, call_args, user_input, tool_result);
+                    retrieved = tool_result_retrieve(call_name, call_args, user_input,
+                                                     tool_result, &idx_rid);
                 if (retrieved) {
                     size_t before = strlen(tool_result), after = strlen(retrieved);
                     dropped = before > after ? before - after : 0;
@@ -3127,6 +3155,29 @@ static void run_agentic_turn(char *user_input,
                     dropped = truncate_tool_result(tool_result,
                             TOOL_RESULT_HEAD_LINES, TOOL_RESULT_TAIL_LINES,
                             TOOL_RESULT_MAX_BYTES);
+                    /* Fallback path: retrieval surfaced nothing, so the middle was
+                       truncated away as before — but it WAS indexed, so say so.
+                       Otherwise the dropped text is unreachable and the model has
+                       no idea it could ask for it. */
+                    if (idx_rid >= 0 && dropped > 0) {
+                        int first = 0, last = 0;
+                        if (toolidx_result_span(idx_rid, &first, &last) > 0) {
+                            char note[192];
+                            snprintf(note, sizeof note,
+                                "\n[The truncated middle is indexed as chunks %d-%d — "
+                                "call result_fetch(<id>) to read any of it.]\n", first, last);
+                            size_t nl = strlen(tool_result) + strlen(note) + 1;
+                            char *joined = malloc(nl);
+                            if (joined) {
+                                snprintf(joined, nl, "%s%s", tool_result, note);
+                                free(tool_result);
+                                tool_result = joined;
+                                if (getenv("BASI_DEBUG_TOOLS"))
+                                    fprintf(stderr, "[toolidx] retrieval found nothing; "
+                                            "truncated but advertised chunks %d-%d\n", first, last);
+                            }
+                        }
+                    }
                 }
                 print_tool_result_line(tool_result, dropped);
 

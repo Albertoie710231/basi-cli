@@ -59,10 +59,20 @@ static const BasiToolDef TOOLS[] = {
       OBJ(STR("body", "The full spike document"), "[\"body\"]") },
     { "plan_verify", "Run the verify clause of every Implementation Plan row (active phase), or one row by id.",
       OBJ(STR("id", "Optional row id, e.g. 1.2"), "[]") },
+    /* MUST STAY LAST — basi_tool_defs() hides it by shortening the count when
+       tool-result retrieval is off, where it could only ever fail. */
+    { "result_fetch", "Fetch one chunk of an earlier large tool result by its id, as shown in a '[... indexed as chunks A-B ...]' note.",
+      OBJ(INT("id", "Chunk id from the indexed-chunks note"), "[\"id\"]") },
 };
 
 const BasiToolDef *basi_tool_defs(int *n) {
-    if (n) *n = (int)(sizeof(TOOLS) / sizeof(TOOLS[0]));
+    int total = (int)(sizeof(TOOLS) / sizeof(TOOLS[0]));
+    /* result_fetch is the last entry and only makes sense when large tool results
+       are being indexed (BASI_TOOL_RETRIEVE=1). Advertising it otherwise spends
+       prompt tokens, in every request, on a tool that has nothing to fetch. */
+    const char *e = getenv("BASI_TOOL_RETRIEVE");
+    if (!(e && *e && atoi(e) != 0)) total--;
+    if (n) *n = total;
     return TOOLS;
 }
 
