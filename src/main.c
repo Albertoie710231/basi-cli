@@ -3431,9 +3431,37 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "Error: BASI_ATTACH set but no healthy llama-server on 127.0.0.1:%d\n", aport);
                 return 1;
             }
-            basi_srv_port      = aport;
-            basi_srv_ctx_total = srv_ctx;
-            fprintf(stderr, "\033[90m[server mode] attached to running llama-server on :%d (no spawn / no teardown)\033[0m\n", aport);
+            basi_srv_port = aport;
+
+            /* The attached server's context is a property of THAT server, not of our
+               saved defaults. Ask it. Without this we budgeted against the `ctx=` in
+               ~/.config/basi-cli/default-model, which can belong to a completely
+               different model — it held ctx=2048 from an old Qwen3-0.6B entry, so
+               attach runs against a 32k server compacted continuously and every
+               measurement taken through them was distorted. */
+            char pc[200];
+            snprintf(pc, sizeof pc,
+                     "curl -sf --max-time 5 http://127.0.0.1:%d/props", aport);
+            char *props = run_command(pc, 64 * 1024);
+            long n_ctx = props ? jx_get_int(props, "default_generation_settings.n_ctx") : -1;
+            free(props);
+
+            if (n_ctx > 0) {
+                if (cli_ctx > 0 && cli_ctx <= n_ctx) {
+                    basi_srv_ctx_total = cli_ctx;      /* explicit -c narrows it on purpose */
+                } else {
+                    if (cli_ctx > n_ctx)
+                        fprintf(stderr, "\033[33m[server mode] -c %d exceeds the server's "
+                                        "n_ctx %ld; using %ld\033[0m\n", cli_ctx, n_ctx, n_ctx);
+                    basi_srv_ctx_total = (int) n_ctx;
+                }
+            } else {
+                basi_srv_ctx_total = srv_ctx;
+                fprintf(stderr, "\033[33m[server mode] could not read n_ctx from /props; "
+                                "assuming %d — pass -c to be sure\033[0m\n", srv_ctx);
+            }
+            fprintf(stderr, "\033[90m[server mode] attached to running llama-server on :%d, "
+                            "ctx %d (no spawn / no teardown)\033[0m\n", aport, basi_srv_ctx_total);
         } else {
 
         /* Spec-decode selection, in precedence order: explicit BASI_SPEC env wins;
