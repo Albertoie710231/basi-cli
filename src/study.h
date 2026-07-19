@@ -110,6 +110,24 @@ char *study_run_slug(const char *slug, StudyProgressFn progress, void *ud);
 /* Tool entry point: validate + write .basi/studies/<slug>.md. */
 char *execute_study_write(const char *body);
 
+/* ── The outer loop ────────────────────────────────────────────────────
+ * hypothesis -> experiment -> verdict -> next hypothesis, unattended and
+ * bounded. Round N's artifact is written by the model from round N-1's
+ * COMPUTED verdict; running it and judging it stay deterministic.
+ *
+ * The loop executes model-authored shell commands with no human watching, so
+ * new arms are constrained by `allow_commands:` in the seed's frontmatter (a
+ * comma-separated list of permitted command prefixes) and may not contain
+ * shell chaining metacharacters. `unsafe` lifts both checks.
+ */
+typedef struct {
+    int  max_rounds;
+    int  port;         /* llama-server port for hypothesis generation */
+    bool unsafe;       /* skip the arm-command allowlist */
+} StudyLoopOpts;
+
+char *study_loop(const char *seed_slug, const StudyLoopOpts *opts);
+
 /* CLI: basi-cli study <run|list|show> ... */
 int cmd_study(int argc, char **argv);
 
