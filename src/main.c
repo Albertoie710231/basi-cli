@@ -3152,13 +3152,34 @@ static void run_agentic_turn(char *user_input,
             }
         }
 
-        /* If we exhausted tool iterations, do one final generation for the answer */
+        /* If we exhausted tool iterations, do one final generation for the answer.
+         *
+         * Tools MUST be withdrawn for it. Passing NULL for tc_out only discards
+         * the parsed calls — it does not stop generate_chat from advertising the
+         * tool list, so the model answers the only way it has been trained to and
+         * emits another tool call. The structured call is then thrown away and
+         * whatever lead-in sentence preceded it becomes the "final answer": a
+         * capped run reported `Let me find the common directory and look at...`
+         * as its deliverable after 40 rounds of real work. Clearing g_tools is
+         * how deepsearch already suppresses tools for its own loop. */
         if (tool_iterations >= max_tool_iterations) {
-            printf("\033[90m[Generating answer...]\033[0m\n");
+            printf("\033[90m[Tool budget exhausted — asking for a final answer]\033[0m\n");
             fflush(stdout);
+
+            ADD_MESSAGE("user",
+                "You have used your entire tool budget, so no further tool calls are "
+                "possible. Answer now, from what you have already found. Give the best "
+                "complete answer you can: state what you established, and where you were "
+                "still uncertain, say so explicitly rather than leaving it out.");
+
+            int n_saved_tools = 0;
+            const BasiToolDef *saved_tools = basi_tool_defs(&n_saved_tools);
+            basi_set_tools(NULL, 0);
+
             generation_interrupted = 0;
             setup_sigint_handler();
             GenerateResult final_result = generate_chat(messages, msg_count, NULL, NULL);
+            basi_set_tools(saved_tools, n_saved_tools);
             basi_srv_ctx_used = (int) final_result.prompt_tokens;
             reset_sigint_handler();
             session_prompt_tokens += final_result.prompt_tokens;
