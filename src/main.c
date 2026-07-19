@@ -2433,6 +2433,70 @@ static char *summarize_head(bool native_tools, char *formatted_buf,
  * KV resync are deterministic. If summarization fails it falls back to a plain drop
  * (phase-1 behaviour) so the session still survives. Returns true if it compacted.
  * Must be called BEFORE rendering the current turn. */
+/* ── Evict old tool-result BODIES (BASI_TOOL_EVICT=1) ────────────────────
+ * The measured problem: a 22-tool-call research turn reached 35k tokens not
+ * because any single result was huge — they are already capped at 8000 bytes —
+ * but because 22 capped results ACCUMULATE, and every one is re-prefilled every
+ * turn at ~40 t/s. reclaim_context_if_needed only fires at ~94% of context
+ * (used > total - 4096), so on a 66k context it never ran at all: both M4 arms
+ * peaked at 53% and 83% with zero compaction.
+ *
+ * So: once context crosses a much lower watermark, replace the BODY of all but
+ * the most recent tool results with a short stub naming their chunk range in
+ * toolidx. The message itself stays (deleting it would break the
+ * tool_call/tool_result pairing that chat templates require), and the content is
+ * still reachable — the model calls result_fetch(<id>). This is the accumulation
+ * term, which per-result retrieval could not touch.
+ *
+ * Rewriting old messages invalidates the cached prefix, so this costs ONE full
+ * re-prefill of the (now smaller) history. That only pays off across many
+ * subsequent turns, which is why it fires on a watermark rather than per
+ * iteration. Default OFF. */
+#define TOOL_EVICT_MIN_BODY 2000   /* below this, a stub saves nothing worth a resync */
+
+static int evict_old_tool_results(BasiMsg *m, size_t mc, int keep_recent) {
+    /* Locate tool_result messages, newest last. */
+    int idx[256]; int n = 0;
+    for (size_t i = 0; i < mc && n < 256; i++)
+        if (m[i].role && strcmp(m[i].role, "tool_result") == 0) idx[n++] = (int) i;
+    if (n <= keep_recent) return 0;
+
+    int evicted = 0;
+    for (int k = 0; k < n - keep_recent; k++) {
+        int i = idx[k];
+        const char *env = m[i].content;
+        if (!env) continue;
+        char *body = jx_get_string(env, "content");
+        if (!body) continue;
+        if (strlen(body) < TOOL_EVICT_MIN_BODY) { free(body); continue; }
+        /* Already a stub from a previous eviction? Leave it alone. */
+        if (strstr(body, "[result evicted")) { free(body); continue; }
+
+        char *name = jx_get_string(env, "name");
+        int rid = -1;
+        int nch = toolidx_add(name ? name : "tool", NULL, body, &rid);
+        char stub[224];
+        int first = 0, last = 0;
+        if (nch > 0 && toolidx_result_span(rid, &first, &last) > 0)
+            snprintf(stub, sizeof stub,
+                "[result evicted to save context — %zu bytes indexed as chunks %d-%d; "
+                "call result_fetch(<id>) to read any part]", strlen(body), first, last);
+        else
+            snprintf(stub, sizeof stub,
+                "[result evicted to save context — %zu bytes dropped]", strlen(body));
+
+        char *new_env = tool_result_envelope(name ? name : "tool", stub);
+        if (new_env) {
+            free((void *) m[i].content);
+            m[i].content = new_env;
+            evicted++;
+        }
+        free(name);
+        free(body);
+    }
+    return evicted;
+}
+
 static bool reclaim_context_if_needed(
         bool native_tools, char *formatted_buf,
         BasiMsg **messages_p, size_t *msg_count_p,
@@ -3043,6 +3107,21 @@ static void run_agentic_turn(char *user_input,
            editing). Overridable via BASI_MAX_TOOL_ITERS. */
         int tool_iterations = 0;
         int consec_parse_fail = 0;     /* consecutive unparseable tool-call outputs */
+        /* Proactive tool-result eviction (see evict_old_tool_results). keep<0 = off. */
+        int  last_evict_iter = -1000;  /* amortize: resyncs are not free */
+        int  tool_evict_keep = -1, tool_evict_pct = 50, tool_evict_every = 5;
+        {
+            const char *e = getenv("BASI_TOOL_EVICT");
+            if (e && *e && atoi(e) != 0) {
+                tool_evict_keep = 3;                    /* newest N kept verbatim */
+                const char *k = getenv("BASI_TOOL_EVICT_KEEP");
+                if (k && *k && atoi(k) >= 0) tool_evict_keep = atoi(k);
+                const char *w = getenv("BASI_TOOL_EVICT_AT");
+                if (w && *w && atoi(w) > 0 && atoi(w) < 100) tool_evict_pct = atoi(w);
+                const char *ev = getenv("BASI_TOOL_EVICT_EVERY");
+                if (ev && *ev && atoi(ev) > 0) tool_evict_every = atoi(ev);
+            }
+        }
         int max_tool_iterations = 40;
         {
             const char *mi = getenv("BASI_MAX_TOOL_ITERS");
@@ -3060,6 +3139,29 @@ static void run_agentic_turn(char *user_input,
             if (tool_iterations > 1)
                 reclaim_context_if_needed(native_tools,
                                           formatted_buf, messages_p, msg_count_p, prev_len_p);
+
+            /* Proactive tool-result eviction, well below reclaim's ~94% wall.
+               Fires ONCE per crossing of the watermark: rewriting history costs a
+               full re-prefill, so doing it per iteration would lose more than it
+               saves. Default OFF (BASI_TOOL_EVICT=1). */
+            if (tool_evict_keep >= 0 && basi_srv_ctx_total > 0 &&
+                tool_iterations - last_evict_iter >= tool_evict_every) {
+                int used_now = context_used_tokens();
+                int mark = basi_srv_ctx_total * tool_evict_pct / 100;
+                if (used_now >= mark) {
+                    int ev = evict_old_tool_results(messages, msg_count, tool_evict_keep);
+                    if (ev > 0) {
+                        /* Only stamp on a REAL eviction, so a no-op scan does not
+                           push the next opportunity out by tool_evict_every. */
+                        last_evict_iter = tool_iterations;
+                        kv_resync_full(prev_len_p);
+                        if (!generate_quiet)
+                            fprintf(stderr, "\033[90m[evict] %d old tool result(s) -> chunk stubs "
+                                    "at %d/%d tokens (%d%% watermark)\033[0m\n",
+                                    ev, used_now, basi_srv_ctx_total, tool_evict_pct);
+                    }
+                }
+            }
 
             /* Server-chat path (item 6b, opt-in via BASI_SERVER_CHAT): the server
                templates from the message array, owns the tool grammar, and returns
