@@ -30,6 +30,7 @@
 #include "plan.h"
 #include "web.h"
 #include "lsp.h"
+#include "symbols.h"
 #include "patch.h"
 #include "scaffold.h"
 #include "session.h"
@@ -1137,7 +1138,8 @@ static char *execute_tool_native(const char *name, const char *args_json) {
     bool direct = strcmp(name, "read") == 0  || strcmp(name, "head") == 0 ||
                   strcmp(name, "tail") == 0  || strcmp(name, "grep") == 0 ||
                   strcmp(name, "wc")   == 0  || strcmp(name, "web_search") == 0 ||
-                  strcmp(name, "web_fetch") == 0 || strcmp(name, "readfile") == 0;
+                  strcmp(name, "web_fetch") == 0 || strcmp(name, "readfile") == 0 ||
+                  strcmp(name, "symbols") == 0;
 
     if (!direct) {
         char *cmd = basi_build_command(name, args_json);
@@ -1165,6 +1167,15 @@ static char *execute_tool_native(const char *name, const char *args_json) {
         if (!file) return strdup("Error: read requires a file path");
         char *r = read_small_file(file);
         free(file);
+        return r;
+    }
+    if (strcmp(name, "symbols") == 0) {
+        char *file = jx_get_string(args_json, "file");
+        if (!file) return strdup("Error: symbols requires a file path");
+        char *kind = jx_get_string(args_json, "kind");        /* may be NULL */
+        char *r = execute_symbols(file, kind);
+        read_tracker_mark(file);   /* enumerating a file counts as having inspected it */
+        free(file); free(kind);
         return r;
     }
     if (strcmp(name, "web_search") == 0) {
