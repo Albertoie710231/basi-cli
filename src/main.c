@@ -1076,9 +1076,20 @@ static char *execute_tool(const char *command) {
             read_tracker_mark(al.args[i]);
     }
 
-    char *result = run_command(sb_to_str(&shell_cmd), 512 * 1024);
+    /* Bounded, like the bash tool: these are read-only utilities, so any run that
+       lasts minutes is a malformed command rather than slow work. Belt to the
+       stdin-from-/dev/null brace in run_command_*: that removes the common
+       infinite block, this bounds whatever else the model invents. */
+    int timed_out = 0;
+    char *result = run_command_timeout(sb_to_str(&shell_cmd), 512 * 1024, 60, &timed_out);
     sb_free(&shell_cmd);
     arglist_free(&al);
+    if (timed_out) {
+        char *msg = strdup("Error: command timed out after 60s and was killed. "
+                           "Check for a command that reads stdin or scans too much.");
+        free(result);
+        return msg;
+    }
     return result;
 }
 

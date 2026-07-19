@@ -9,6 +9,7 @@
 #include <signal.h>
 #include <poll.h>
 #include <dirent.h>
+#include <fcntl.h>
 
 #include "util.h"
 
@@ -119,7 +120,18 @@ void arglist_free(ArgList *al) {
 
 char *run_command_status(const char *cmd, size_t max_output, int *exit_code) {
     if (exit_code) *exit_code = -1;
-    FILE *fp = popen(cmd, "r");
+    /* popen gives no handle on the child's fds, so close stdin from inside the
+     * shell instead. Without this a model-generated command that reads stdin —
+     * `grep pat` with no file, or the left half of a mangled `grep a|b` — inherits
+     * the terminal and blocks FOREVER, taking the whole agent loop with it (this
+     * path, unlike the bash tool, has no timeout). `exec` applies the redirect to
+     * the shell itself, so every stage of a pipeline inherits it. */
+    StringBuf guarded;
+    sb_init(&guarded);
+    sb_append_str(&guarded, "exec </dev/null; ");
+    sb_append_str(&guarded, cmd);
+    FILE *fp = popen(sb_to_str(&guarded), "r");
+    sb_free(&guarded);
     if (!fp) return strdup("Error: failed to execute command");
 
     StringBuf sb;
@@ -239,6 +251,11 @@ char *run_command_timeout(const char *cmd, size_t max_output, int timeout_s,
         dup2(pfd[1], STDOUT_FILENO);
         dup2(pfd[1], STDERR_FILENO);
         close(pfd[1]);
+        /* stdin from /dev/null: a model-generated command that reads stdin (a bare
+         * `grep pat` with no file, `cat`, `sort`) would otherwise inherit the
+         * terminal and block until the timeout fires. */
+        int devnull = open("/dev/null", O_RDONLY);
+        if (devnull >= 0) { dup2(devnull, STDIN_FILENO); close(devnull); }
         execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
         _exit(127);
     }
