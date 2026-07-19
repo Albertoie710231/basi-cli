@@ -44,6 +44,7 @@
 #include "slashmenu.h"
 #include "srvgen.h"
 #include "srvchat.h"
+#include "toolidx.h"
 
 /* MAX_TOKENS, CONTEXT_SIZE → globals.h */
 #define MAX_FILE_TOKENS     2000
@@ -3331,6 +3332,13 @@ int main(int argc, char **argv) {
        no chat model — it only exercises the embedder. */
     if (getenv("BASI_EMBED_BATCH_SELFTEST")) {
         embed_batch_selftest();
+        return 0;
+    }
+
+    /* M1: BASI_TOOLIDX_SELFTEST=1 indexes a synthetic tool result and checks that
+       retrieval surfaces a buried needle — the question the whole layer rests on. */
+    if (getenv("BASI_TOOLIDX_SELFTEST")) {
+        toolidx_selftest();
         return 0;
     }
 
