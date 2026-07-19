@@ -735,6 +735,93 @@ static char *read_small_file(const char *filepath) {
  * the top and the pass/fail summary at the bottom. Line-aware (keeps at most
  * head_lines + tail_lines lines) with a hard byte ceiling. Edits in place (the
  * result is always shorter). Returns bytes dropped (0 = left unchanged). */
+/* ── Retrieve-don't-stuff (BASI_TOOL_RETRIEVE=1) ─────────────────────────
+ * Instead of pasting a large tool result into context (and destroying its middle
+ * via truncate_tool_result), index it and inject only the chunks relevant to the
+ * task. Measured motivation: ~70% of a 21-tool-call research run was PREFILLING
+ * tool output, and generation decayed 27.0 -> 18.8 t/s as context grew.
+ *
+ * Default OFF. This trades a GUARANTEED cost for a PROBABILISTIC one — today the
+ * model reliably sees head+tail; after this it sees head + whatever retrieval
+ * surfaced, and a miss degrades the answer silently. Opt-in until measured. */
+#define TOOL_RETRIEVE_HEAD_LINES 30      /* verbatim prefix: what did we fetch? */
+/* k=3 measured on a 73 KB bash result with a buried needle (Qwen3.5-9B):
+ *   OFF (truncate) ctx 5.9k, needle LOST     k=1 ctx 4.7k, found
+ *   k=3            ctx 5.6k, found           k=5 ctx 7.4k, found
+ * k>=5 injects more than the 8 KB truncation cap and makes context BIGGER, which
+ * defeats the point; k<=3 beats truncation on context AND recovers the fact
+ * truncation destroys. 3 keeps redundancy against a retrieval miss. */
+#define TOOL_RETRIEVE_K           3
+#define TOOL_RETRIEVE_THRESHOLD   0.25f  /* needle scored 0.63 vs ~0.13 noise */
+
+static bool tool_retrieve_enabled(void) {
+    const char *e = getenv("BASI_TOOL_RETRIEVE");
+    return e && *e && atoi(e) != 0;
+}
+
+/* Returns a malloc'd replacement for `result`, or NULL to keep the normal
+ * truncate-and-paste path. NULL is returned whenever retrieval cannot be trusted
+ * (too small to bother, indexing failed, or nothing cleared the threshold) —
+ * pasting head+tail is always better than handing the model almost nothing. */
+static char *tool_result_retrieve(const char *tool, const char *args,
+                                  const char *user_input, const char *result) {
+    if (!result) return NULL;
+    size_t len = strlen(result);
+    if (len < TOOLIDX_MIN_INDEX) return NULL;
+
+    int rid = -1;
+    int nch = toolidx_add(tool, args, result, &rid);
+    if (nch <= 0) return NULL;
+
+    /* Query = what the user is trying to do + what this call asked for. The task
+       alone is too vague across a long turn; the args alone lose the goal. */
+    StringBuf q; sb_init(&q);
+    if (user_input) { sb_append_str(&q, user_input); sb_append_str(&q, " "); }
+    if (args)       sb_append_str(&q, args);
+    char *query = sb_to_str(&q);
+
+    float thr = TOOL_RETRIEVE_THRESHOLD;
+    { const char *e = getenv("BASI_TOOL_RETRIEVE_THRESHOLD"); if (e && *e) thr = (float) atof(e); }
+    int k = TOOL_RETRIEVE_K;
+    { const char *e = getenv("BASI_TOOL_RETRIEVE_K"); if (e && *e && atoi(e) > 0) k = atoi(e); }
+    if (k > 16) k = 16;
+
+    const char *hits[16]; int ids[16]; float sc[16];
+    int got = toolidx_retrieve(query, k, thr, hits, ids, sc);
+    free(query);
+    if (got <= 0) return NULL;              /* nothing relevant — fall back */
+
+    /* Head stays verbatim so the model can tell WHAT it fetched; retrieved
+       fragments alone read as context-free rubble. */
+    size_t head_end = 0;
+    { int nl = 0;
+      for (size_t i = 0; i < len && nl < TOOL_RETRIEVE_HEAD_LINES; i++)
+          if (result[i] == '\n') { nl++; head_end = i + 1; } }
+    if (head_end == 0 || head_end > len) head_end = len < 2048 ? len : 2048;
+    while (head_end > 0 && ((unsigned char) result[head_end] & 0xC0) == 0x80) head_end--;
+
+    StringBuf out; sb_init(&out);
+    sb_append(&out, result, head_end);
+
+    char note[256];
+    int first = 0, last = 0;
+    toolidx_result_span(rid, &first, &last);
+    snprintf(note, sizeof note,
+        "\n[... %zu bytes indexed as chunks %d-%d; showing the %d most relevant below. "
+        "Use result_fetch(<id>) for any other chunk. ...]\n",
+        len - head_end, first, last, got);
+    sb_append_str(&out, note);
+
+    for (int i = 0; i < got; i++) {
+        char hdr[96];
+        snprintf(hdr, sizeof hdr, "\n--- chunk %d (relevance %.2f) ---\n", ids[i], sc[i]);
+        sb_append_str(&out, hdr);
+        sb_append_str(&out, hits[i]);
+        sb_append_str(&out, "\n");
+    }
+    return sb_to_str(&out);
+}
+
 static size_t truncate_tool_result(char *s, int head_lines, int tail_lines,
                                    size_t max_bytes) {
     size_t len = strlen(s);
@@ -2988,6 +3075,7 @@ static void run_agentic_turn(char *user_input,
             char *tool_result = NULL;      /* native path computes this directly */
             char *call_env = NULL;         /* native: structured assistant tool-call envelope */
             char *call_name = NULL;        /* native: tool name, for the result envelope */
+            char *call_args = NULL;        /* native: args, for the retrieval query (ncalls is freed below) */
             bool have_call = false;
 
             /* Structured tool calls come straight from the server (one per turn). */
@@ -3003,6 +3091,7 @@ static void run_agentic_turn(char *user_input,
                             tool_result ? tool_result : "(null)");
                 if (!tool_result) unknown_tool = strdup(nm);
                 call_name = strdup(nm);
+                call_args = ncalls[0].arguments ? strdup(ncalls[0].arguments) : NULL;
                 call_env  = tool_call_envelope(ncalls[0].name, ncalls[0].arguments);
                 have_call = true;
             }
@@ -3025,9 +3114,20 @@ static void run_agentic_turn(char *user_input,
                 /* Truncate tool result if too large — line-aware, head+tail.
                    The dim "└ <summary>" sub-line reports the outcome (and any
                    trim) directly under the activity header. */
-                size_t dropped = truncate_tool_result(tool_result,
-                        TOOL_RESULT_HEAD_LINES, TOOL_RESULT_TAIL_LINES,
-                        TOOL_RESULT_MAX_BYTES);
+                size_t dropped = 0;
+                char *retrieved = NULL;
+                if (tool_retrieve_enabled())
+                    retrieved = tool_result_retrieve(call_name, call_args, user_input, tool_result);
+                if (retrieved) {
+                    size_t before = strlen(tool_result), after = strlen(retrieved);
+                    dropped = before > after ? before - after : 0;
+                    free(tool_result);
+                    tool_result = retrieved;
+                } else {
+                    dropped = truncate_tool_result(tool_result,
+                            TOOL_RESULT_HEAD_LINES, TOOL_RESULT_TAIL_LINES,
+                            TOOL_RESULT_MAX_BYTES);
+                }
                 print_tool_result_line(tool_result, dropped);
 
                 /* context_used_tokens() reads the server's tracked prompt count in
@@ -3077,6 +3177,7 @@ static void run_agentic_turn(char *user_input,
                 }
                 free(call_env);     /* native built it; NULL (safe) on legacy */
                 free(call_name);
+                free(call_args);
                 free(tool_result);
 
                 /* The tool call + result were appended to `messages`; generate_chat()
