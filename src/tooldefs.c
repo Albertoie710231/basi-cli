@@ -59,6 +59,8 @@ static const BasiToolDef TOOLS[] = {
       OBJ(STR("items", "Newline-separated '- <item>' list"), "[\"items\"]") },
     { "spike_write", "Persist a spike artifact (spike phase): Question / Findings / Decision.",
       OBJ(STR("body", "The full spike document"), "[\"body\"]") },
+    { "study_write", "Save a study: a hypothesis paired with a COMMAND that measures it. Use when a question can be settled by running something rather than by reasoning about it. Body is YAML frontmatter (metric, extract regex, runs, decision_rule) plus ## Question/Hypothesis/Experiment/Results/Verdict, with one ```arm <name> fenced block per arm. Then run `basi study run <slug>`: the verdict is computed from the measured numbers, not from your reading of them.",
+      OBJ(STR("body", "The full study document"), "[\"body\"]") },
     { "plan_verify", "Run the verify clause of every Implementation Plan row (active phase), or one row by id.",
       OBJ(STR("id", "Optional row id, e.g. 1.2"), "[]") },
 };
@@ -164,6 +166,11 @@ char *basi_build_command(const char *name, const char *args) {
     } else if (strcmp(name, "spike_write") == 0) {
         char *body = jx_get_string(args, "body");
         sb_append_str(&sb, "spike_write\n");
+        sb_append_str(&sb, body ? body : "");
+        free(body);
+    } else if (strcmp(name, "study_write") == 0) {
+        char *body = jx_get_string(args, "body");
+        sb_append_str(&sb, "study_write\n");
         sb_append_str(&sb, body ? body : "");
         free(body);
     } else if (strcmp(name, "plan_verify") == 0) {

@@ -858,6 +858,15 @@ static char *execute_tool(const char *command) {
         }
     }
 
+    /* study_write: persist a falsifiable experiment. Not phase-gated — a study
+     * is a way to settle a question by measurement, useful in any phase. */
+    if (strncmp(command, "study_write", 11) == 0) {
+        char after = command[11];
+        if (after == ' ' || after == '\t' || after == '\n' || after == '\0') {
+            return execute_study_write(command + 11);
+        }
+    }
+
     /* plan_verify: run each row's verify clause, report OK/FAIL/SETUP/SKIP. */
     if (strncmp(command, "plan_verify", 11) == 0) {
         char after = command[11];
