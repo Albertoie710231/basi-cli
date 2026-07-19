@@ -31,6 +31,7 @@
 #include "web.h"
 #include "lsp.h"
 #include "symbols.h"
+#include "study.h"
 #include "patch.h"
 #include "scaffold.h"
 #include "session.h"
@@ -3187,6 +3188,12 @@ int main(int argc, char **argv) {
             "Usage:\n"
             "  basi-cli docs add <file.md> [--shelf=notes|pinned|docs]\n");
         return 2;
+    }
+
+    /* `basi-cli study ...`: the discovery loop runs without loading a model —
+     * executing an experiment and applying its decision rule is deterministic. */
+    if (argc >= 2 && strcmp(argv[1], "study") == 0) {
+        return cmd_study(argc - 2, argv + 2);
     }
 
     Cli cli = parse_args(argc, argv);
