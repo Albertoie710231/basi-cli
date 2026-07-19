@@ -2978,8 +2978,11 @@ static void run_agentic_turn(char *user_input,
             session_gen_tokens    += result.gen_tokens;
 
             /* Performance metrics */
-            double prompt_tps = result.prompt_time_s > 0
-                ? result.prompt_tokens / result.prompt_time_s : 0;
+            /* The server's own prefill rate (over the tokens it actually evaluated).
+               Displays identically to the old prompt_tokens/prompt_time_s form, which
+               algebraically reduced to this same figure — the difference is that
+               prompt_time_s is now a real duration rather than a reconstruction. */
+            double prompt_tps = result.prompt_tps;
             double gen_tps = result.gen_time_s > 0
                 ? result.gen_tokens / result.gen_time_s : 0;
             char meter[80];

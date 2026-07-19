@@ -138,7 +138,7 @@ static void chat_on_content(const char *chunk, void *ud) {
  * res.prompt_tokens carries the server's exact prompt count for ctx accounting. */
 GenerateResult generate_chat(const BasiMsg *messages, size_t msg_count,
                              BasiToolCall **tc_out, int *n_tc_out) {
-    GenerateResult res = { NULL, 0, 0, 0.0, 0.0 };
+    GenerateResult res = { NULL, 0, 0, 0, 0.0, 0.0, 0.0 };
     if (tc_out) *tc_out = NULL;
     if (n_tc_out) *n_tc_out = 0;
 
@@ -267,9 +267,24 @@ single_sample:
     res.prompt_tokens = (size_t) r->prompt_tokens;
     res.gen_tokens    = (size_t) r->completion_tokens;
     res.gen_time_s    = (r->tps > 0) ? r->completion_tokens / r->tps : (time_now() - t0);
-    /* Meter shows prompt_tokens/prompt_time_s; pick prompt_time_s so it reconstructs
-       the server's reported prefill rate (0 when fully cache-hit → "Prompt: 0.0"). */
-    res.prompt_time_s = (r->prompt_tps > 0) ? r->prompt_tokens / r->prompt_tps : 0.0;
+    /* Prefill time comes straight from the server's own clock. The old form,
+       prompt_tokens/prompt_tps, divided the whole prompt by a rate measured over
+       only the evaluated tokens; on a cache-hit turn (prompt_tokens=15442,
+       prompt_n=19) that reported ~400s of prefill for 0.49s of work. */
+    res.prompt_n      = (size_t) r->prompt_n;
+    res.prompt_time_s = r->prompt_ms / 1000.0;
+    res.prompt_tps    = r->prompt_tps;
+
+    /* BASI_TIMING_TRACE=1: one TSV row per model round, so the prefill/decode split
+       of a real agentic run can be summed from the server's clock instead of
+       estimated. Columns: prompt_tokens (occupancy) prompt_n (work) prefill_s
+       gen_tokens gen_s. */
+    if (getenv("BASI_TIMING_TRACE")) {
+        fprintf(stderr, "[timing]\t%zu\t%zu\t%.3f\t%zu\t%.3f\n",
+                res.prompt_tokens, res.prompt_n, res.prompt_time_s,
+                res.gen_tokens, res.gen_time_s);
+        fflush(stderr);
+    }
 
     if (r->n_tool_calls > 0 && tc_out) {
         BasiToolCall *arr = calloc((size_t) r->n_tool_calls, sizeof(BasiToolCall));

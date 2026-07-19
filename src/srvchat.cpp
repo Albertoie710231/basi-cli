@@ -76,19 +76,28 @@ struct AccChoice {
     std::vector<AccTool> tools;
 };
 
+/* The response-level usage/timings block. One per response, shared by every
+ * choice, so it is accumulated during the stream and handed to each finalize. */
+struct RespStats {
+    int    prompt_tokens = 0, completion_tokens = 0, prompt_n = 0;
+    double tps = 0, prompt_tps = 0, prompt_ms = 0, predicted_ms = 0;
+};
+
 /* Turn an accumulated choice into the malloc'd C result the callers free with
  * srvchat_free(). Usage/timings are per-response, so they are passed in. */
-static SrvChatResult *finalize_choice(const AccChoice &ac, int prompt_tokens,
-                                      int completion_tokens, double tps, double prompt_tps) {
+static SrvChatResult *finalize_choice(const AccChoice &ac, const RespStats &st) {
     SrvChatResult *res = (SrvChatResult *) calloc(1, sizeof *res);
     if (!res) return nullptr;
     res->content       = dup_cstr(ac.content);
     res->reasoning     = ac.reasoning.empty() ? nullptr : dup_cstr(ac.reasoning);
     res->finish_reason = ac.finish.empty()    ? nullptr : dup_cstr(ac.finish);
-    res->prompt_tokens     = prompt_tokens;
-    res->completion_tokens = completion_tokens;
-    res->tps               = tps;
-    res->prompt_tps        = prompt_tps;
+    res->prompt_tokens     = st.prompt_tokens;
+    res->completion_tokens = st.completion_tokens;
+    res->tps               = st.tps;
+    res->prompt_tps        = st.prompt_tps;
+    res->prompt_n          = st.prompt_n;
+    res->prompt_ms         = st.prompt_ms;
+    res->predicted_ms      = st.predicted_ms;
     if (!ac.tools.empty()) {
         res->tool_calls = (SrvToolCall *) calloc(ac.tools.size(), sizeof(SrvToolCall));
         if (res->tool_calls) {
@@ -136,8 +145,7 @@ extern "C" int srvchat_complete_n(
     /* Grown on demand: the server assigns each choice a stable `index` in every
      * chunk, so deltas route by that rather than by arrival order. */
     std::vector<AccChoice> choices(1);
-    int prompt_tokens = 0, completion_tokens = 0;
-    double tps = 0, prompt_tps = 0;
+    RespStats st;
 
     char *line = nullptr; size_t cap = 0; ssize_t len;
     while ((len = getline(&line, &cap, p)) != -1) {
@@ -190,12 +198,16 @@ extern "C" int srvchat_complete_n(
             }
         }
         if (d.contains("usage") && d["usage"].is_object()) {
-            prompt_tokens     = d["usage"].value("prompt_tokens", 0);
-            completion_tokens = d["usage"].value("completion_tokens", 0);
+            st.prompt_tokens     = d["usage"].value("prompt_tokens", 0);
+            st.completion_tokens = d["usage"].value("completion_tokens", 0);
         }
         if (d.contains("timings") && d["timings"].is_object()) {
-            tps        = d["timings"].value("predicted_per_second", 0.0);
-            prompt_tps = d["timings"].value("prompt_per_second", 0.0);
+            const json &t = d["timings"];
+            st.tps          = t.value("predicted_per_second", 0.0);
+            st.prompt_tps   = t.value("prompt_per_second", 0.0);
+            st.prompt_n     = t.value("prompt_n", 0);
+            st.prompt_ms    = t.value("prompt_ms", 0.0);
+            st.predicted_ms = t.value("predicted_ms", 0.0);
         }
     }
     free(line);
@@ -208,8 +220,7 @@ extern "C" int srvchat_complete_n(
      * enters the conversation, which is what the ctx meter needs. */
     int filled = 0;
     for (size_t i = 0; i < choices.size() && filled < max_out; i++) {
-        SrvChatResult *r = finalize_choice(choices[i], prompt_tokens,
-                                           completion_tokens, tps, prompt_tps);
+        SrvChatResult *r = finalize_choice(choices[i], st);
         if (!r) break;
         out[filled++] = r;
     }

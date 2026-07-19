@@ -23,10 +23,20 @@ typedef struct {
     char        *reasoning;       /* accumulated reasoning text (malloc'd; may be NULL) */
     SrvToolCall *tool_calls;      /* array (malloc'd; NULL if none) */
     int          n_tool_calls;
-    int          prompt_tokens;   /* from usage (0 if absent) */
+    int          prompt_tokens;   /* from usage: the WHOLE prompt, INCLUDING the KV-cache-hit
+                                     prefix. This is context occupancy, NOT work done. */
     int          completion_tokens;
     double       tps;             /* predicted (generation) tokens/sec from timings (0 if absent) */
     double       prompt_tps;      /* prompt (prefill) tokens/sec from timings (0 if absent/cached) */
+    /* Prefill WORK, as opposed to prompt size. The server evaluates only the tokens
+     * that miss the KV cache, and prompt_tps is a rate over THOSE — so deriving a
+     * duration as prompt_tokens/prompt_tps mixes a whole-prompt numerator with an
+     * evaluated-only denominator. Measured on Qwen3.5-9B, a cache-hit turn reports
+     * prompt_tokens=15442 against prompt_n=19: that derivation overstates prefill
+     * time by ~813x, reproducibly. Use prompt_ms for time and prompt_n for work. */
+    int          prompt_n;        /* tokens actually EVALUATED (excludes the cache hit) */
+    double       prompt_ms;       /* server-measured wall-time to evaluate those tokens */
+    double       predicted_ms;    /* server-measured wall-time to generate the completion */
     char        *finish_reason;   /* "stop" | "tool_calls" | "length" | ... (malloc'd, may be NULL) */
 } SrvChatResult;
 

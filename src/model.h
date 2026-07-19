@@ -27,9 +27,15 @@ int basi_list_models(char ***out);
 /* ── Generation ────────────────────────────────────────────────────── */
 typedef struct {
     char  *text;          /* malloc'd, caller frees */
-    size_t prompt_tokens;
+    size_t prompt_tokens; /* whole prompt, incl. the KV-cache-hit prefix — this is
+                             context OCCUPANCY, and not the work the server did */
     size_t gen_tokens;
-    double prompt_time_s;
+    size_t prompt_n;      /* prompt tokens actually EVALUATED (cache misses only) */
+    double prompt_time_s; /* real seconds spent prefilling, measured by the server.
+                             Do NOT reconstruct it as prompt_tokens/prompt_tps: those
+                             have different denominators and the result is ~800x high
+                             on a cache hit. Pair it with prompt_n, never prompt_tokens. */
+    double prompt_tps;    /* server's prefill rate, over prompt_n */
     double gen_time_s;
 } GenerateResult;
 
