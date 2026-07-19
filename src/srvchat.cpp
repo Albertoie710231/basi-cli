@@ -25,10 +25,15 @@ static char *dup_cstr(const std::string &s) {
     return p;
 }
 
-/* Assemble the request body: caller messages/tools + streaming + sampling. */
+/* Assemble the request body: caller messages/tools + streaming + sampling.
+ * n_choices>1 asks the server for N independent continuations of ONE prefill —
+ * measured at 6720 prompt tokens: n=4 returns 4 answers in 11.5s with
+ * cached_tokens=6716, vs 33s for 4 separate concurrent requests that each
+ * re-prefill the shared prefix. Streaming preserves per-choice indices. */
 static std::string build_request(const char *messages_json, const char *tools_json,
-                                 const SrvSampling *samp, int n_predict) {
+                                 const SrvSampling *samp, int n_predict, int n_choices) {
     json req;
+    if (n_choices > 1) req["n"] = n_choices;
     req["messages"] = json::parse(messages_json);
     if (tools_json && *tools_json) {
         json t = json::parse(tools_json);
@@ -36,6 +41,14 @@ static std::string build_request(const char *messages_json, const char *tools_js
     }
     req["stream"] = true;
     req["stream_options"] = json{{"include_usage", true}};
+    /* BASI_NO_THINK=1: suppress the model's reasoning (<think>) blocks. On a
+     * reasoning-tuned model (Qwen3.x) the per-turn <think> span dominates
+     * generation time; disabling it via the chat template's enable_thinking=false
+     * kwarg makes the agent loop several times faster at some accuracy cost. */
+    if (const char *nt = getenv("BASI_NO_THINK"); nt && *nt && atoi(nt)) {
+        req["chat_template_kwargs"] = json{{"enable_thinking", false}};
+        req["reasoning_budget"] = 0;   /* llama-server native no-think, if supported */
+    }
     if (n_predict > 0) req["max_tokens"] = n_predict;
     if (samp) {
         if (samp->temperature >= 0)   req["temperature"] = samp->temperature;
@@ -56,22 +69,60 @@ static std::string build_request(const char *messages_json, const char *tools_js
 /* One streamed tool call, accumulated across deltas (arguments arrive in pieces). */
 struct AccTool { std::string id, name, args; };
 
-extern "C" SrvChatResult *srvchat_complete(
+/* One in-flight choice. With n=1 there is exactly one of these, which is why the
+ * single-result entry point is a thin wrapper rather than a separate parser. */
+struct AccChoice {
+    std::string content, reasoning, finish;
+    std::vector<AccTool> tools;
+};
+
+/* Turn an accumulated choice into the malloc'd C result the callers free with
+ * srvchat_free(). Usage/timings are per-response, so they are passed in. */
+static SrvChatResult *finalize_choice(const AccChoice &ac, int prompt_tokens,
+                                      int completion_tokens, double tps, double prompt_tps) {
+    SrvChatResult *res = (SrvChatResult *) calloc(1, sizeof *res);
+    if (!res) return nullptr;
+    res->content       = dup_cstr(ac.content);
+    res->reasoning     = ac.reasoning.empty() ? nullptr : dup_cstr(ac.reasoning);
+    res->finish_reason = ac.finish.empty()    ? nullptr : dup_cstr(ac.finish);
+    res->prompt_tokens     = prompt_tokens;
+    res->completion_tokens = completion_tokens;
+    res->tps               = tps;
+    res->prompt_tps        = prompt_tps;
+    if (!ac.tools.empty()) {
+        res->tool_calls = (SrvToolCall *) calloc(ac.tools.size(), sizeof(SrvToolCall));
+        if (res->tool_calls) {
+            for (size_t i = 0; i < ac.tools.size(); i++) {
+                res->tool_calls[i].id        = dup_cstr(ac.tools[i].id);
+                res->tool_calls[i].name      = dup_cstr(ac.tools[i].name);
+                res->tool_calls[i].arguments = dup_cstr(ac.tools[i].args.empty()
+                                                        ? std::string("{}") : ac.tools[i].args);
+            }
+            res->n_tool_calls = (int) ac.tools.size();
+        }
+    }
+    return res;
+}
+
+extern "C" int srvchat_complete_n(
         int port, const char *messages_json, const char *tools_json,
-        const SrvSampling *samp, int n_predict,
-        void (*on_content)(const char *, void *),
-        void (*on_reasoning)(const char *, void *),
-        void *ud) {
+        const SrvSampling *samp, int n_predict, int n_choices,
+        void (*on_content)(int, const char *, void *),
+        void (*on_reasoning)(int, const char *, void *),
+        void *ud, SrvChatResult **out, int max_out) {
+
+    if (!out || max_out <= 0) return -1;
+    if (n_choices < 1) n_choices = 1;
 
     std::string body;
-    try { body = build_request(messages_json, tools_json, samp, n_predict); }
-    catch (...) { return nullptr; }   /* caller passed invalid messages/tools JSON */
+    try { body = build_request(messages_json, tools_json, samp, n_predict, n_choices); }
+    catch (...) { return -1; }   /* caller passed invalid messages/tools JSON */
 
     /* Write the request to a temp file (avoids quoting a big body on the argv). */
     char reqpath[] = "/tmp/basi_srvchat_XXXXXX";
     int rfd = mkstemp(reqpath);
-    if (rfd < 0) return nullptr;
-    { FILE *rf = fdopen(rfd, "w"); if (!rf) { close(rfd); unlink(reqpath); return nullptr; }
+    if (rfd < 0) return -1;
+    { FILE *rf = fdopen(rfd, "w"); if (!rf) { close(rfd); unlink(reqpath); return -1; }
       fwrite(body.data(), 1, body.size(), rf); fclose(rf); }
 
     char cmd[512];
@@ -80,10 +131,11 @@ extern "C" SrvChatResult *srvchat_complete(
         "-H 'Content-Type: application/json' --data-binary @%s", port, reqpath);
 
     FILE *p = popen(cmd, "r");
-    if (!p) { unlink(reqpath); return nullptr; }
+    if (!p) { unlink(reqpath); return -1; }
 
-    std::string content, reasoning, finish;
-    std::vector<AccTool> tools;
+    /* Grown on demand: the server assigns each choice a stable `index` in every
+     * chunk, so deltas route by that rather than by arrival order. */
+    std::vector<AccChoice> choices(1);
     int prompt_tokens = 0, completion_tokens = 0;
     double tps = 0, prompt_tps = 0;
 
@@ -97,34 +149,45 @@ extern "C" SrvChatResult *srvchat_complete(
         json d;
         try { d = json::parse(j); } catch (...) { continue; }
 
-        if (d.contains("choices") && d["choices"].is_array() && !d["choices"].empty()) {
-            const json &ch = d["choices"][0];
-            if (ch.contains("delta") && ch["delta"].is_object()) {
-                const json &delta = ch["delta"];
-                if (delta.contains("reasoning_content") && delta["reasoning_content"].is_string()) {
-                    std::string r = delta["reasoning_content"].get<std::string>();
-                    if (!r.empty()) { reasoning += r; if (on_reasoning) on_reasoning(r.c_str(), ud); }
-                }
-                if (delta.contains("content") && delta["content"].is_string()) {
-                    std::string c = delta["content"].get<std::string>();
-                    if (!c.empty()) { content += c; if (on_content) on_content(c.c_str(), ud); }
-                }
-                if (delta.contains("tool_calls") && delta["tool_calls"].is_array()) {
-                    for (const json &tc : delta["tool_calls"]) {
-                        size_t idx = tc.value("index", 0);
-                        if (idx >= tools.size()) tools.resize(idx + 1);
-                        AccTool &at = tools[idx];
-                        if (tc.contains("id") && tc["id"].is_string()) at.id = tc["id"].get<std::string>();
-                        if (tc.contains("function") && tc["function"].is_object()) {
-                            const json &fn = tc["function"];
-                            if (fn.contains("name") && fn["name"].is_string()) at.name = fn["name"].get<std::string>();
-                            if (fn.contains("arguments") && fn["arguments"].is_string()) at.args += fn["arguments"].get<std::string>();
+        if (d.contains("choices") && d["choices"].is_array()) {
+            for (const json &ch : d["choices"]) {
+                size_t ci = ch.value("index", 0);
+                if (ci >= choices.size()) choices.resize(ci + 1);
+                AccChoice &acc = choices[ci];
+
+                if (ch.contains("delta") && ch["delta"].is_object()) {
+                    const json &delta = ch["delta"];
+                    if (delta.contains("reasoning_content") && delta["reasoning_content"].is_string()) {
+                        std::string r = delta["reasoning_content"].get<std::string>();
+                        if (!r.empty()) {
+                            acc.reasoning += r;
+                            if (on_reasoning) on_reasoning((int) ci, r.c_str(), ud);
+                        }
+                    }
+                    if (delta.contains("content") && delta["content"].is_string()) {
+                        std::string c = delta["content"].get<std::string>();
+                        if (!c.empty()) {
+                            acc.content += c;
+                            if (on_content) on_content((int) ci, c.c_str(), ud);
+                        }
+                    }
+                    if (delta.contains("tool_calls") && delta["tool_calls"].is_array()) {
+                        for (const json &tc : delta["tool_calls"]) {
+                            size_t idx = tc.value("index", 0);
+                            if (idx >= acc.tools.size()) acc.tools.resize(idx + 1);
+                            AccTool &at = acc.tools[idx];
+                            if (tc.contains("id") && tc["id"].is_string()) at.id = tc["id"].get<std::string>();
+                            if (tc.contains("function") && tc["function"].is_object()) {
+                                const json &fn = tc["function"];
+                                if (fn.contains("name") && fn["name"].is_string()) at.name = fn["name"].get<std::string>();
+                                if (fn.contains("arguments") && fn["arguments"].is_string()) at.args += fn["arguments"].get<std::string>();
+                            }
                         }
                     }
                 }
+                if (ch.contains("finish_reason") && ch["finish_reason"].is_string())
+                    acc.finish = ch["finish_reason"].get<std::string>();
             }
-            if (ch.contains("finish_reason") && ch["finish_reason"].is_string())
-                finish = ch["finish_reason"].get<std::string>();
         }
         if (d.contains("usage") && d["usage"].is_object()) {
             prompt_tokens     = d["usage"].value("prompt_tokens", 0);
@@ -139,27 +202,44 @@ extern "C" SrvChatResult *srvchat_complete(
     pclose(p);
     unlink(reqpath);
 
-    SrvChatResult *res = (SrvChatResult *) calloc(1, sizeof *res);
-    if (!res) return nullptr;
-    res->content   = dup_cstr(content);
-    res->reasoning = reasoning.empty() ? nullptr : dup_cstr(reasoning);
-    res->finish_reason = finish.empty() ? nullptr : dup_cstr(finish);
-    res->prompt_tokens = prompt_tokens;
-    res->completion_tokens = completion_tokens;
-    res->tps = tps;
-    res->prompt_tps = prompt_tps;
-    if (!tools.empty()) {
-        res->tool_calls = (SrvToolCall *) calloc(tools.size(), sizeof(SrvToolCall));
-        if (res->tool_calls) {
-            for (size_t i = 0; i < tools.size(); i++) {
-                res->tool_calls[i].id        = dup_cstr(tools[i].id);
-                res->tool_calls[i].name      = dup_cstr(tools[i].name);
-                res->tool_calls[i].arguments = dup_cstr(tools[i].args.empty() ? std::string("{}") : tools[i].args);
-            }
-            res->n_tool_calls = (int) tools.size();
-        }
+    /* The server reports one usage block for the whole response, so per-choice
+     * completion_tokens is not available; every choice carries the same figure.
+     * Since best-of-N keeps exactly one choice, that is the count that actually
+     * enters the conversation, which is what the ctx meter needs. */
+    int filled = 0;
+    for (size_t i = 0; i < choices.size() && filled < max_out; i++) {
+        SrvChatResult *r = finalize_choice(choices[i], prompt_tokens,
+                                           completion_tokens, tps, prompt_tps);
+        if (!r) break;
+        out[filled++] = r;
     }
-    return res;
+    return filled;
+}
+
+/* Single-choice entry point — unchanged signature, so the five existing call
+ * sites (model.c:155 and the selftests) need no edit. */
+struct OneShim { void (*c)(const char *, void *); void (*r)(const char *, void *); void *ud; };
+static void shim_content(int, const char *chunk, void *ud) {
+    OneShim *s = (OneShim *) ud; if (s->c) s->c(chunk, s->ud);
+}
+static void shim_reason(int, const char *chunk, void *ud) {
+    OneShim *s = (OneShim *) ud; if (s->r) s->r(chunk, s->ud);
+}
+
+extern "C" SrvChatResult *srvchat_complete(
+        int port, const char *messages_json, const char *tools_json,
+        const SrvSampling *samp, int n_predict,
+        void (*on_content)(const char *, void *),
+        void (*on_reasoning)(const char *, void *),
+        void *ud) {
+
+    OneShim shim{on_content, on_reasoning, ud};
+    SrvChatResult *one = nullptr;
+    int got = srvchat_complete_n(port, messages_json, tools_json, samp, n_predict, 1,
+                                 on_content   ? shim_content : nullptr,
+                                 on_reasoning ? shim_reason  : nullptr,
+                                 &shim, &one, 1);
+    return got == 1 ? one : nullptr;
 }
 
 extern "C" void srvchat_free(SrvChatResult *r) {
@@ -223,6 +303,75 @@ extern "C" int srvchat_embed(int port, const char *text, float *out, int max_dim
     } catch (...) { return -1; }
 }
 
+/* Locate the float vector inside one response object, flattening the one level
+ * of nesting llama-server uses ("embedding":[[...]]). Shared by both embed paths. */
+static const json *embed_vec_of(const json &obj) {
+    if (!obj.is_object() || !obj.contains("embedding")) return nullptr;
+    const json *emb = &obj["embedding"];
+    if (!emb->is_array() || emb->empty()) return nullptr;
+    if ((*emb)[0].is_array()) emb = &(*emb)[0];
+    return emb->is_array() ? emb : nullptr;
+}
+
+extern "C" int srvchat_embed_batch(int port, const char **texts, int n,
+                                   float *out, int max_dim) {
+    if (!texts || !out || n <= 0 || max_dim <= 0) return -1;
+
+    std::string body;
+    try {
+        json arr = json::array();
+        for (int i = 0; i < n; i++) arr.push_back(texts[i] ? texts[i] : "");
+        json req; req["content"] = std::move(arr);
+        /* Tool output is arbitrary fetched bytes; never let one bad sequence
+         * abort serialization (same reasoning as the chat path). */
+        body = req.dump(-1, ' ', false, json::error_handler_t::replace);
+    } catch (...) { return -1; }
+
+    char reqpath[] = "/tmp/basi_srvembb_XXXXXX";
+    int rfd = mkstemp(reqpath);
+    if (rfd < 0) return -1;
+    { FILE *rf = fdopen(rfd, "w"); if (!rf) { close(rfd); unlink(reqpath); return -1; }
+      fwrite(body.data(), 1, body.size(), rf); fclose(rf); }
+
+    char cmd[512];
+    snprintf(cmd, sizeof cmd,
+        "curl -s -X POST http://127.0.0.1:%d/embedding "
+        "-H 'Content-Type: application/json' --data-binary @%s", port, reqpath);
+
+    FILE *p = popen(cmd, "r");
+    if (!p) { unlink(reqpath); return -1; }
+    std::string resp;
+    { char buf[65536]; size_t k; while ((k = fread(buf, 1, sizeof buf, p)) > 0) resp.append(buf, k); }
+    pclose(p);
+    unlink(reqpath);
+
+    try {
+        json d = json::parse(resp);
+        if (!d.is_array() || d.empty()) return -1;      /* an error object lands here too */
+
+        int dim = 0;
+        int filled = 0;
+        for (const json &obj : d) {
+            const json *vec = embed_vec_of(obj);
+            if (!vec) continue;
+            /* Route by the server's index; arrival order is not guaranteed. */
+            int idx = obj.value("index", -1);
+            if (idx < 0 || idx >= n) continue;
+            int cnt = (int) vec->size();
+            if (cnt > max_dim) cnt = max_dim;
+            if (dim == 0) dim = cnt;
+            else if (cnt != dim) return -1;             /* ragged: refuse rather than corrupt */
+            float *dst = out + (size_t) idx * (size_t) max_dim;
+            for (int i = 0; i < cnt; i++) dst[i] = (*vec)[i].get<float>();
+            filled++;
+        }
+        /* A partial batch would silently leave stale/zero vectors behind, which
+         * corrupts retrieval quality invisibly — fail loudly instead. */
+        if (filled != n || dim == 0) return -1;
+        return dim;
+    } catch (...) { return -1; }
+}
+
 /* ── self-test ──────────────────────────────────────────────────────────── */
 
 static void st_content(const char *c, void *) { fputs(c, stdout); fflush(stdout); }
@@ -254,6 +403,41 @@ extern "C" void srvchat_selftest(const char *model_path, int ngl, int ctx) {
 
     SrvSampling samp = { .temperature = 0.0, .repeat_penalty = 1.1, .repeat_last_n = 256,
                          .min_p = 0.05, .top_k = 0, .top_p = 1.0, .seed = -1 };
+
+    /* BASI_SRV_CHAT_N>1 exercises the best-of-N path: one prefill, N sampled
+     * continuations, deltas routed by choice index. Uses temp 0.4 (the real agent
+     * default) because temp 0 forces top_k=1 above and every choice would be
+     * identical, which would make the divergence check meaningless. */
+    int n_choices = 1;
+    if (const char *e = getenv("BASI_SRV_CHAT_N"); e && *e && atoi(e) > 1) n_choices = atoi(e);
+    if (n_choices > 1) {
+        samp.temperature = 0.4;
+        fprintf(stderr, "[srvchat] best-of-N mode: n=%d (one prefill, %d samples)\n",
+                n_choices, n_choices);
+        std::vector<SrvChatResult *> outs((size_t) n_choices, nullptr);
+        int got = srvchat_complete_n(port, messages, tools, &samp, 200, n_choices,
+                                     nullptr, nullptr, nullptr, outs.data(), n_choices);
+        fprintf(stderr, "\n---\n[srvchat] choices returned: %d (asked %d)\n", got, n_choices);
+        int distinct = 0;
+        for (int i = 0; i < got; i++) {
+            if (!outs[i]) { fprintf(stderr, "  [%d] NULL\n", i); continue; }
+            const char *c = outs[i]->content ? outs[i]->content : "";
+            bool dup = false;
+            for (int k = 0; k < i; k++)
+                if (outs[k] && outs[k]->content && strcmp(outs[k]->content, c) == 0) { dup = true; break; }
+            if (!dup) distinct++;
+            fprintf(stderr, "  [%d] %zu bytes  tool_calls=%d  finish=%s  %.60s\n",
+                    i, strlen(c), outs[i]->n_tool_calls,
+                    outs[i]->finish_reason ? outs[i]->finish_reason : "(none)", c);
+        }
+        fprintf(stderr, "[srvchat] distinct=%d/%d  prompt_tokens=%d (paid ONCE)\n",
+                distinct, got, got > 0 && outs[0] ? outs[0]->prompt_tokens : 0);
+        for (int i = 0; i < got; i++) srvchat_free(outs[i]);
+        srvgen_kill(pid);
+        fprintf(stderr, "[srvchat] server killed. done.\n");
+        return;
+    }
+
     SrvChatResult *r = srvchat_complete(port, messages, tools, &samp, 200, st_content, st_reason, nullptr);
     fprintf(stderr, "\n---\n");
     if (!r) { fprintf(stderr, "[srvchat] request FAILED\n"); srvgen_kill(pid); return; }

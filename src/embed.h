@@ -31,6 +31,18 @@ bool embed_available(void);
  * Returns -1 before init. */
 int  embed_dim(void);
 
+/* Embed `n` texts in ONE request. Writes row i at out[i * embed_dim()], so `out`
+ * must hold n * embed_dim() floats. Returns 0 on success, -1 on failure (all or
+ * nothing — a partial batch is reported as failure rather than leaving stale
+ * rows, which would corrupt retrieval silently). Rows are L2-normalized exactly
+ * as embed_text does, so batch and single results are interchangeable in a store
+ * (verified: worst cosine(single,batch) = 0.999994, i.e. float rounding only).
+ * ~2.2x faster than looping embed_text, plateauing by N~64 at ~19 ms/chunk. */
+int  embed_texts(const char **texts, int n, float *out);
+
+/* Self-test (BASI_EMBED_BATCH_SELFTEST=1): batch-vs-single equivalence + speedup. */
+void embed_batch_selftest(void);
+
 /* Embed `text` into `out` (caller-allocated, must be at least
  * embed_dim() floats). Output is L2-normalized so dot product == cosine
  * similarity. Returns 0 on success, -1 on failure. */

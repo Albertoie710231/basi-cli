@@ -118,6 +118,8 @@ int srvgen_write_launch_script(const SrvLaunch *cfg, const char *path) {
     fprintf(f, "  -m \"%s\" \\\n", model);
     fprintf(f, "  -ngl %d -c %d \\\n", cfg->ngl, cfg->ctx);
     fprintf(f, "  --host %s --port %d", host, cfg->port);
+    /* --kv-unified keeps each slot at the FULL -c; without it -c is split N ways. */
+    if (cfg->n_parallel > 1) fprintf(f, " \\\n  -np %d --kv-unified", cfg->n_parallel);
     if (cfg->flash_attn) fprintf(f, " \\\n  -fa on");
     if (cfg->spec_type && *cfg->spec_type)
         fprintf(f, " \\\n  --spec-type %s --spec-draft-n-max %d", cfg->spec_type, cfg->spec_nmax);
@@ -128,6 +130,23 @@ int srvgen_write_launch_script(const SrvLaunch *cfg, const char *path) {
     fclose(f);
     chmod(path, 0755);
     return 0;
+}
+
+int srvgen_script_has_slots(const char *path, int need) {
+    if (!path || need <= 1) return 1;          /* single slot: nothing required */
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    int slots = 0, unified = 0;
+    char line[1024];
+    while (fgets(line, sizeof line, f)) {
+        if (line[0] == '#') continue;          /* the doc comments mention the flags */
+        if (strstr(line, "--kv-unified")) unified = 1;
+        const char *np = strstr(line, "-np ");
+        if (np) slots = atoi(np + 4);
+        else if ((np = strstr(line, "--parallel ")) != NULL) slots = atoi(np + 11);
+    }
+    fclose(f);
+    return slots >= need && unified;
 }
 
 int srvgen_script_matches(const char *path, const char *model_path) {

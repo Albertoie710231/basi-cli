@@ -9,6 +9,7 @@
 #include <sys/stat.h>
 #include <dirent.h>
 #include <errno.h>
+#include <time.h>       /* clock_gettime — batch self-test timing */
 
 #include <sys/types.h>
 
@@ -260,6 +261,101 @@ int embed_text(const char *text, float *out) {
        exact unit vector regardless (idempotent) and to match the old contract. */
     l2_normalize(out, embed_dim_v);
     return 0;
+}
+
+int embed_texts(const char **texts, int n, float *out) {
+    if (embed_pid <= 0) { set_err("embed_texts called before embed_init succeeded"); return -1; }
+    if (!texts || !out || n <= 0) { set_err("embed_texts: bad argument"); return -1; }
+
+    int d = srvchat_embed_batch(embed_port, texts, n, out, embed_dim_v);
+    if (d <= 0) { set_err("embedder batch /embedding request failed"); return -1; }
+
+    /* Same post-processing as embed_text, per row: pad short, then normalize so
+       dot product == cosine. Callers must be able to mix batch and single results
+       in one store, so the contract has to be byte-for-byte the same. */
+    for (int i = 0; i < n; i++) {
+        float *v = out + (size_t) i * (size_t) embed_dim_v;
+        for (int k = d; k < embed_dim_v; k++) v[k] = 0.0f;
+        l2_normalize(v, embed_dim_v);
+    }
+    return 0;
+}
+
+/* Self-test (BASI_EMBED_BATCH_SELFTEST=1): prove the batch path returns vectors
+   IDENTICAL to the single path — a silent divergence would corrupt retrieval
+   without ever erroring — and report the speedup on realistically sized chunks. */
+void embed_batch_selftest(void) {
+    fprintf(stderr, "\n=== embed batch self-test ===\n");
+    if (embed_init() != 0) {
+        fprintf(stderr, "[embed] init FAILED: %s\n", embed_last_error());
+        return;
+    }
+    const int dim = embed_dim();
+    /* Batch size drives the speedup (per-request overhead is amortized), so make
+       it sweepable — the right default for the tool-result indexer depends on it. */
+    int N = 32;
+    { const char *e = getenv("BASI_EMBED_BATCH_N"); if (e && *e && atoi(e) > 0) N = atoi(e); }
+    fprintf(stderr, "[embed] ready, dim=%d, n=%d\n", dim, N);
+
+    /* ~200 chars each — matches memory.c's MEM_CHUNK_MAX. Short strings hide the
+       per-request overhead entirely and make batching look useless. */
+    char **texts = (char **) calloc((size_t) N, sizeof *texts);
+    for (int i = 0; i < N; i++) {
+        char buf[512];
+        snprintf(buf, sizeof buf,
+                 "chunk %d: the DPAS instruction performs D = C + A x B with systolic depth "
+                 "eight on Intel Xe2 hardware, and the repeat count controls how many output "
+                 "rows a single subgroup produces per call.", i);
+        texts[i] = strdup(buf);
+    }
+
+    float *single = (float *) calloc((size_t) N * dim, sizeof(float));
+    float *batch  = (float *) calloc((size_t) N * dim, sizeof(float));
+    if (!texts || !single || !batch) { fprintf(stderr, "[embed] OOM\n"); return; }
+
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    int bad = 0;
+    for (int i = 0; i < N; i++)
+        if (embed_text(texts[i], single + (size_t) i * dim) != 0) bad++;
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    double s_one = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9;
+
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    int rc = embed_texts((const char **) texts, N, batch);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    double s_bat = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9;
+
+    if (rc != 0) { fprintf(stderr, "[embed] BATCH FAILED: %s\n", embed_last_error()); return; }
+
+    /* Cosine between the two versions of each row must be ~1.0. */
+    double worst = 1.0;
+    int    worst_i = -1;
+    for (int i = 0; i < N; i++) {
+        const float *a = single + (size_t) i * dim, *b = batch + (size_t) i * dim;
+        double dot = 0.0;
+        for (int k = 0; k < dim; k++) dot += (double) a[k] * (double) b[k];
+        if (dot < worst) { worst = dot; worst_i = i; }
+    }
+
+    fprintf(stderr, "[embed] single: %.2fs (%.1f ms/text, %d failed)\n",
+            s_one, 1000.0 * s_one / N, bad);
+    fprintf(stderr, "[embed] batch : %.2fs (%.1f ms/text)\n", s_bat, 1000.0 * s_bat / N);
+    fprintf(stderr, "[embed] speedup: %.1fx\n", s_bat > 0 ? s_one / s_bat : 0.0);
+    fprintf(stderr, "[embed] worst cosine(single,batch) = %.6f (row %d) -> %s\n",
+            worst, worst_i, worst > 0.9999 ? "IDENTICAL ✓" : "DIVERGENT ✗");
+
+    /* Distinct texts must still yield distinct vectors — catches a batch path that
+       silently returns the same embedding N times. */
+    double cross = 0.0;
+    for (int k = 0; k < dim; k++) cross += (double) batch[k] * (double) batch[(size_t) dim + k];
+    fprintf(stderr, "[embed] cosine(row0,row1) = %.4f -> %s\n",
+            cross, cross < 0.999 ? "distinct ✓" : "SUSPICIOUS (rows identical)");
+
+    for (int i = 0; i < N; i++) free(texts[i]);
+    free(texts); free(single); free(batch);
+    embed_shutdown();
+    fprintf(stderr, "[embed] done.\n");
 }
 
 /* ── Chunker ───────────────────────────────────────────────────────── *
@@ -735,7 +831,7 @@ char *execute_docs_vector_search(const char *args) {
     float *qvec = malloc(store.dim * sizeof(float));
     if (embed_text(query, qvec) != 0) {
         char *msg = malloc(512);
-        snprintf(msg, 512, "docs_vector_search failed embedding query: %s",
+        snprintf(msg, 512, "docs_vector_search failed embedding query: %.440s",
                  embed_last_error());
         free(qvec); vs_clear(&store); free(query);
         return msg;

@@ -22,6 +22,7 @@
 #include "md.h"
 #include "srvgen.h"
 #include "srvchat.h"
+#include "bestof.h"
 
 
 /* ── Spinner frames ────────────────────────────────────────────────── */
@@ -152,8 +153,78 @@ GenerateResult generate_chat(const BasiMsg *messages, size_t msg_count,
 
     ChatDisplay disp = { (generate_markdown && !generate_quiet) ? 1 : 0, false, false, 0, 0.0 };
     double t0 = time_now();
-    SrvChatResult *r = srvchat_complete(basi_srv_port, mj, tj, &basi_srv_sampling, n_predict,
-                                        chat_on_content, chat_on_reasoning, &disp);
+
+    /* BASI_BEST_OF_N>1: sample N turns from ONE prefill and keep the consensus
+       pick. Costs ~1.95x a single turn for N=4 (not Nx) because the server
+       prefills once — but it REQUIRES the launch script to carry `-np N
+       --kv-unified`, or the server caps n at the slot count and 400s the request.
+       Streaming is suppressed here: N interleaved token streams are unreadable,
+       so the turn renders after the winner is chosen. */
+    int best_of = 0;
+    { const char *e = getenv("BASI_BEST_OF_N"); if (e && *e) best_of = atoi(e); }
+
+    /* Whether the answer was already shown live by the streaming callbacks. The
+       best-of-N path streams nothing (N interleaved streams are unreadable), so
+       its winner has to be rendered explicitly once chosen. */
+    bool streamed = true;
+
+    SrvChatResult *r = NULL;
+    if (best_of > 1) {
+        SrvChatResult **cands = calloc((size_t) best_of, sizeof *cands);
+        int got = cands ? srvchat_complete_n(basi_srv_port, mj, tj, &basi_srv_sampling,
+                                             n_predict, best_of, NULL, NULL, NULL,
+                                             cands, best_of)
+                        : -1;
+        if (got > 0) {
+            BestOfPick pick = bestof_select(cands, got);
+            /* winner<0 means NOTHING was usable — every candidate empty, which is
+               exactly what a server-rejected request looks like (an error response
+               carries no deltas, so each result parses to empty rather than NULL).
+               Taking cands[0] here would hand back a blank turn and suppress the
+               fallback; bestof.h's contract is to fall through to a single sample. */
+            if (pick.winner < 0) {
+                if (!generate_quiet)
+                    fprintf(stderr, "\033[33m[best-of-%d] no usable candidate "
+                            "(server rejected the request?) — retrying single-sample\033[0m\n", best_of);
+                for (int i = 0; i < got; i++) srvchat_free(cands[i]);
+                bestof_free(&pick);
+                free(cands);
+                cands = NULL;
+                goto single_sample;
+            }
+            int w = pick.winner;
+            if (!generate_quiet)
+                fprintf(stderr, "\033[90m[best-of-%d] %s\033[0m\n", got,
+                        pick.reason ? pick.reason : "no consensus, kept first");
+            /* BASI_BEST_OF_DEBUG=1 shows the REJECTED candidates too. A ranker you
+               can't see the losers of is a ranker you can't evaluate — especially
+               in medoid mode, where "most central" is only a proxy for "best". */
+            if (getenv("BASI_BEST_OF_DEBUG")) {
+                for (int i = 0; i < got; i++) {
+                    if (!cands[i]) continue;
+                    const char *c = cands[i]->content ? cands[i]->content : "";
+                    if (cands[i]->n_tool_calls > 0)
+                        fprintf(stderr, "\033[90m  %s [%d] %s(%.90s)\033[0m\n",
+                                i == w ? "->" : "  ", i,
+                                cands[i]->tool_calls[0].name ? cands[i]->tool_calls[0].name : "?",
+                                cands[i]->tool_calls[0].arguments ? cands[i]->tool_calls[0].arguments : "");
+                    else
+                        fprintf(stderr, "\033[90m  %s [%d] %zub: %.140s…\033[0m\n",
+                                i == w ? "->" : "  ", i, strlen(c), c);
+                }
+            }
+            r = cands[w];
+            streamed = false;
+            for (int i = 0; i < got; i++) if (i != w) srvchat_free(cands[i]);
+            bestof_free(&pick);
+        }
+        free(cands);
+        /* Fall through to the single-sample path if the N-way request failed. */
+    }
+single_sample:
+    if (!r)
+        r = srvchat_complete(basi_srv_port, mj, tj, &basi_srv_sampling, n_predict,
+                             chat_on_content, chat_on_reasoning, &disp);
     free(mj); free(tj);
 
     if (!r) {
@@ -182,7 +253,9 @@ GenerateResult generate_chat(const BasiMsg *messages, size_t msg_count,
         if (show_thinking) printf("\033[0m\n"); else clear_thinking_box();
         disp.thinking_box_shown = false;
     }
-    if (answer_in_reasoning && !generate_quiet) {        /* box hid the answer — reveal it */
+    /* Render when the answer was never shown live: either the reasoning box hid
+       it, or best-of-N suppressed streaming entirely. */
+    if ((answer_in_reasoning || !streamed) && !generate_quiet) {
         if (disp.md) { md_begin(); md_feed(answer, strlen(answer)); md_end(); }
         else { printf("\033[0m"); fputs(answer, stdout); }
     } else if (disp.md && disp.md_started) {

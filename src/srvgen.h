@@ -31,6 +31,12 @@ typedef struct {
     int         spec_nmax;        /* --spec-draft-n-max */
     int         flash_attn;       /* -fa on */
     int         jinja;            /* --jinja (needed for the chat/tools endpoints) */
+    /* Server slots. >1 emits `-np N --kv-unified`, which best-of-N REQUIRES: the
+     * server caps the OpenAI `n` parameter at the slot count (with -np 1 it 400s
+     * "Value must be between 1 <= value <= 1"). --kv-unified is not optional
+     * either — without it `-c` is DIVIDED across slots, so `-c 8192 -np 4` leaves
+     * 2048 per slot and silently rejects any longer prompt. */
+    int         n_parallel;       /* 0/1 = omit (single slot, no best-of-N) */
     const char *reasoning_format; /* --reasoning-format (e.g. "auto"); NULL = omit */
 } SrvLaunch;
 
@@ -43,6 +49,11 @@ int srvgen_write_launch_script(const SrvLaunch *cfg, const char *path);
 /* If `path` exists and its "# BASI-MODEL:" marker equals model_path, return 1
  * (reuse the user's script as-is); else 0 (missing / stale / different model). */
 int srvgen_script_matches(const char *path, const char *model_path);
+
+/* 1 if `path` launches with at least `need` slots AND --kv-unified — i.e. it can
+ * serve best-of-`need`. Used to warn instead of letting every turn 400 when a
+ * reused/hand-edited script predates best-of-N. */
+int srvgen_script_has_slots(const char *path, int need);
 
 /* Spawn llama-server by exec'ing a launch script (`bash path`), then poll /health
  * on `port`. Same return contract as srvgen_spawn. */

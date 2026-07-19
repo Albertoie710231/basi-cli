@@ -755,10 +755,21 @@ static size_t truncate_tool_result(char *s, int head_lines, int tail_lines,
     for (size_t i = len; i-- > 0; )
         if (s[i] == '\n') { if (++tl > tail_lines) { tail_start = i + 1; break; } }
 
-    /* enforce the byte ceiling: split the budget between head and tail */
+    /* enforce the byte ceiling: split the budget between head and tail.
+       The cut MUST land on a UTF-8 character boundary. Slicing mid-codepoint
+       yields invalid UTF-8, which makes nlohmann's dump() throw when the message
+       array is serialized — killing the whole turn with an empty request (seen
+       for real: a fetched page with box-drawing glyphs ended three runs at
+       prompt_tokens=0 with no error shown). Continuation bytes are 10xxxxxx. */
     size_t half = max_bytes / 2;
-    if (head_end > half) head_end = half;
-    if (len - tail_start > half) tail_start = len - half;
+    if (head_end > half) {
+        head_end = half;
+        while (head_end > 0 && ((unsigned char) s[head_end] & 0xC0) == 0x80) head_end--;
+    }
+    if (len - tail_start > half) {
+        tail_start = len - half;
+        while (tail_start < len && ((unsigned char) s[tail_start] & 0xC0) == 0x80) tail_start++;
+    }
     if (tail_start <= head_end) return 0;          /* nothing left to drop */
 
     size_t dropped_bytes = tail_start - head_end;
@@ -3315,6 +3326,15 @@ int main(int argc, char **argv) {
         return 0;
     }
 
+    /* Retrieve-don't-stuff M0: BASI_EMBED_BATCH_SELFTEST=1 spawns the embedder and
+       checks the batch path against the single path (equivalence + speedup). Needs
+       no chat model — it only exercises the embedder. */
+    if (getenv("BASI_EMBED_BATCH_SELFTEST")) {
+        embed_batch_selftest();
+        return 0;
+    }
+
+
     /* Item 6 phase (b) round-trip: serialize a mock conversation that already
        contains a tool_call + tool_result via basi_messages_to_json (OpenAI format,
        synthetic call ids), send it through the chat client, and check the model
@@ -3372,6 +3392,25 @@ int main(int argc, char **argv) {
         { const char *e = getenv("BASI_SPEC_NMAX"); if (e && *e) spec_nmax = atoi(e); }
         int srv_ctx = ctx_override > 0 ? ctx_override : CONTEXT_SIZE;
 
+        /* Attach mode (BASI_ATTACH=1 / BASI_SERVER_PORT=N): reuse an already-running
+           llama-server rather than spawning our own — a pure HTTP client, like Pi.
+           Lets one persistent server serve many short basi invocations (e.g. a
+           benchmark harness); we neither spawn it nor tear it down. */
+        const char *attach_env  = getenv("BASI_ATTACH");
+        const char *attach_port = getenv("BASI_SERVER_PORT");
+        if ((attach_env && atoi(attach_env)) || (attach_port && *attach_port)) {
+            int aport = (attach_port && *attach_port) ? atoi(attach_port) : 8181;
+            char hc[160];
+            snprintf(hc, sizeof hc, "curl -sf -o /dev/null http://127.0.0.1:%d/health", aport);
+            if (system(hc) != 0) {
+                fprintf(stderr, "Error: BASI_ATTACH set but no healthy llama-server on 127.0.0.1:%d\n", aport);
+                return 1;
+            }
+            basi_srv_port      = aport;
+            basi_srv_ctx_total = srv_ctx;
+            fprintf(stderr, "\033[90m[server mode] attached to running llama-server on :%d (no spawn / no teardown)\033[0m\n", aport);
+        } else {
+
         /* Spec-decode selection, in precedence order: explicit BASI_SPEC env wins;
            else the picker's choice; else auto-enable draft-mtp for an MTP model
            (its head is exactly for this). Flash-attn follows the picker, else spec. */
@@ -3388,14 +3427,28 @@ int main(int argc, char **argv) {
            it. Reuse the user's script when it targets THIS model (respecting edits);
            regenerate when it's missing or for a different model (e.g. after /model). */
         const char *script = ".basi/run-llama-server.sh";
+        /* best-of-N needs one slot per sampled candidate (the server caps `n` at
+           the slot count), so the launch script must be generated with -np N. */
+        int srv_slots = 0;
+        { const char *e = getenv("BASI_BEST_OF_N"); if (e && *e) srv_slots = atoi(e); }
         SrvLaunch L = {
             .server_bin = sbin, .model_path = model_path, .ngl = n_gpu_layers,
             .ctx = srv_ctx, .host = "127.0.0.1", .port = 8181,
             .spec_type = spec_type, .spec_nmax = spec_nmax,
             .flash_attn = fa_on, .jinja = 1, .reasoning_format = "auto",
+            .n_parallel = srv_slots,
         };
         if (srvgen_script_matches(script, model_path)) {
             fprintf(stderr, "\033[90m[server mode] using launch script %s (edit it to change flags)\033[0m\n", script);
+            /* A hand-edited or pre-best-of-N script may not request the slots.
+               llama-server's default (-np auto) often allocates enough anyway, so
+               this is a heads-up, not a verdict: if auto lands below N the server
+               rejects every turn with an opaque 400 on `n`. */
+            if (srv_slots > 1 && !srvgen_script_has_slots(script, srv_slots))
+                fprintf(stderr, "\033[33m[best-of-%d] %s does not request `-np %d --kv-unified`; "
+                        "relying on the server's auto slot count. If turns fail with a 400 on `n`, "
+                        "add the flags or delete the script to regenerate.\033[0m\n",
+                        srv_slots, script, srv_slots);
         } else {
             if (srvgen_write_launch_script(&L, script) == 0)
                 fprintf(stderr, "\033[90m[server mode] wrote launch script %s\033[0m\n", script);
@@ -3410,6 +3463,7 @@ int main(int argc, char **argv) {
         basi_srv_port      = 8181;
         basi_srv_ctx_total = srv_ctx;   /* the server's context size, for the ctx meter */
         fprintf(stderr, "\033[90m[server mode] ready — generation delegated to llama-server\033[0m\n");
+        }
     }
 
     /* Sampling knobs for the server /v1/chat/completions request (generation runs

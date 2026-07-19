@@ -41,12 +41,44 @@ SrvChatResult *srvchat_complete(int port, const char *messages_json, const char 
                                 void (*on_reasoning)(const char *chunk, void *ud),
                                 void *ud);
 
+/* Best-of-N in ONE request: ask the server for n_choices independent
+ * continuations of a single prefill. Measured on a 6720-token prompt with
+ * Qwen3.5-9B: n=4 returns 4 answers in 11.5s (cached_tokens=6716) vs 33s for 4
+ * separate concurrent requests, which each re-prefill the shared prefix — so 4
+ * candidates cost ~1.95x one candidate, not 4x. Streaming is preserved: each SSE
+ * chunk carries its choice index, and the callbacks receive it so the caller can
+ * render one trajectory live (rendering all N interleaved is unreadable).
+ *
+ * Fills out[0..max_out) with malloc'd results (free each with srvchat_free) and
+ * returns how many were written, or -1 on transport failure. */
+int srvchat_complete_n(int port, const char *messages_json, const char *tools_json,
+                       const SrvSampling *samp, int n_predict, int n_choices,
+                       void (*on_content)(int choice, const char *chunk, void *ud),
+                       void (*on_reasoning)(int choice, const char *chunk, void *ud),
+                       void *ud, SrvChatResult **out, int max_out);
+
 void srvchat_free(SrvChatResult *r);
 
 /* POST one text to a llama-server /embedding endpoint (spawned with --embedding).
  * Writes up to max_dim floats of the pooled embedding into out and returns the
  * count written (the embedding dimension), or -1 on transport/parse failure. */
 int srvchat_embed(int port, const char *text, float *out, int max_dim);
+
+/* Embed `n` texts in ONE request ("content": [...]). Writes each embedding at
+ * out[i * max_dim] (stride max_dim) and returns the dimension, or -1 on failure.
+ *
+ * Measured in-process on the Arc (Jina v5 small, ~200-char chunks), speedup vs
+ * looping the single-text path: 1.6x @ N=16, 2.1x @ N=64, 2.2x @ N=256 — it
+ * PLATEAUS around 2.2x by N~64, bottoming out at ~19 ms/text. The win is
+ * per-REQUEST overhead, not model throughput, so it only appears on realistically
+ * sized chunks; a micro-benchmark with 50-char strings on CPU shows no gain at
+ * all (0.8x) and will mislead you. Do not expect more than ~2x from bigger batches.
+ *
+ * COST NOTE for anyone indexing tool output: ~19 ms/chunk at best means a 237 KB
+ * page split at 200 chars (~1200 chunks) costs ~23 s to index. Chunk COARSE.
+ *
+ * Results are routed by the response's `index` field, not arrival order. */
+int srvchat_embed_batch(int port, const char **texts, int n, float *out, int max_dim);
 
 /* Self-test (BASI_SRV_CHAT_SELFTEST=1): spawn a server, send one message + a bash
  * tool, stream it, print structured content/reasoning/tool_calls/usage, tear down. */

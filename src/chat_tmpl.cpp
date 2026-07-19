@@ -48,7 +48,11 @@ extern "C" char *basi_tools_to_json(void) {
             catch (...) { fn["parameters"] = nlohmann::ordered_json::object(); }
             arr.push_back({ {"type", "function"}, {"function", std::move(fn)} });
         }
-        return strdup(arr.dump().c_str());
+        /* error_handler_t::replace: never THROW on invalid UTF-8. Tool results
+           carry arbitrary fetched bytes; a single bad sequence must degrade to
+           U+FFFD, not abort serialization and blank out the whole turn. */
+        return strdup(arr.dump(-1, ' ', false,
+                               nlohmann::json::error_handler_t::replace).c_str());
     } catch (...) { return nullptr; }
 }
 
@@ -98,7 +102,11 @@ extern "C" char *basi_messages_to_json(const BasiMsg *msgs, int n_msgs) {
                 arr.push_back({ {"role", role}, {"content", content} });
             }
         }
-        return strdup(arr.dump().c_str());
+        /* error_handler_t::replace: never THROW on invalid UTF-8. Tool results
+           carry arbitrary fetched bytes; a single bad sequence must degrade to
+           U+FFFD, not abort serialization and blank out the whole turn. */
+        return strdup(arr.dump(-1, ' ', false,
+                               nlohmann::json::error_handler_t::replace).c_str());
     } catch (...) { return nullptr; }
 }
 
