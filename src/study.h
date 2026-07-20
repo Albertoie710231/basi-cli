@@ -153,6 +153,13 @@ typedef struct {
      * because a model that writes its own allowlist has no allowlist. */
     const char *question;   /* NULL = seed from an existing artifact */
     const char *allow;      /* comma-separated command prefixes; required with question */
+
+    /* Independent explorations of the SAME question, each told what the earlier
+     * ones covered and pushed elsewhere. ROBIN's breadth mechanism: it generates
+     * N *distinct* ideas and ranks them rather than iterating one chain. A single
+     * trajectory stops at its first success — measured, one found flash attention
+     * worth +1.5% and halted without touching batch size, threads or offload. */
+    int trajectories;       /* <=1 = single chain */
 } StudyLoopOpts;
 
 /* seed_slug names an existing artifact, or is the slug to CREATE when

@@ -1734,7 +1734,12 @@ static char *propose_artifact(const StudyLoopOpts *opts, const char *user_msg,
     return out;
 }
 
-char *study_loop(const char *seed_slug, const StudyLoopOpts *opts) {
+/* One trajectory: seed a study (optionally from a question), then chain rounds
+ * off each computed verdict until STOP or the round budget. `explored` (may be
+ * NULL) lists what EARLIER trajectories already covered, so this one is pushed
+ * somewhere else. Appends its own one-line finding to `finding` if non-NULL. */
+static char *study_trajectory(const char *seed_slug, const StudyLoopOpts *opts,
+                              const char *explored, StringBuf *finding) {
     StringBuf log;
     sb_init(&log);
     char line[1024];
@@ -1742,6 +1747,7 @@ char *study_loop(const char *seed_slug, const StudyLoopOpts *opts) {
     char base[128];
     snprintf(base, sizeof(base), "%s", seed_slug);
     char *cur_slug = strdup(seed_slug);
+    char *last_done_slug = NULL;
 
     /* The allowlist is read ONCE, from the seed a human wrote, and is injected
      * into every generated round. Re-reading it per round would let the model
@@ -1787,6 +1793,18 @@ char *study_loop(const char *seed_slug, const StudyLoopOpts *opts) {
                           "command actually prints, an extract regex that matches it, two arms "
                           "differing in exactly ONE thing, and a decision rule you commit to "
                           "before seeing any data.\n");
+        /* ROBIN generates N *distinct* ideas rather than iterating one — breadth
+         * first, then rank. Without this a trajectory re-derives the previous
+         * one's finding: the first run here found flash attention worth +1.5%
+         * and stopped, never touching batch size, threads or offload. */
+        if (explored && *explored) {
+            sb_append_str(&u, "\nEARLIER TRAJECTORIES ALREADY INVESTIGATED THIS QUESTION AND "
+                              "COVERED THE GROUND BELOW. Investigate a DIFFERENT dimension — do "
+                              "not re-test these variables, even if a result there looked "
+                              "promising:\n\n");
+            sb_append_str(&u, explored);
+            sb_append_char(&u, '\n');
+        }
         if (allow && !opts->unsafe) {
             sb_append_str(&u, "\nEvery arm command MUST begin with one of these exact prefixes, "
                               "and may not chain, pipe or redirect: ");
@@ -1840,6 +1858,7 @@ char *study_loop(const char *seed_slug, const StudyLoopOpts *opts) {
 
         /* 1. Execute. Deterministic: this is where the loop touches ground. */
         char *report = study_run_slug(cur_slug, cli_progress, NULL);
+        free(last_done_slug); last_done_slug = strdup(cur_slug);
         sb_append_str(&log, report);
 
         char *path = study_path(cur_slug);
@@ -1945,8 +1964,86 @@ char *study_loop(const char *seed_slug, const StudyLoopOpts *opts) {
         cur_slug = strdup(next_slug);
     }
 
+    /* Hand the next trajectory a compact account of what this one covered:
+     * the variable it varied (its arm commands) and what the verdict was. */
+    if (finding && last_done_slug) {
+        char *fp = study_path(last_done_slug);
+        size_t fl = 0;
+        char *fc = fp ? kb_read_file(fp, &fl) : NULL;
+        if (fc) {
+            KbFrontmatter ffm;
+            if (kb_parse_frontmatter(fc, fl, &ffm) >= 0) {
+                StudyArm fa[STUDY_MAX_ARMS];
+                char *ferr = NULL;
+                int fn = study_parse_arms(fc + ffm.body_offset, fl - ffm.body_offset,
+                                          fa, STUDY_MAX_ARMS, &ferr);
+                snprintf(line, sizeof(line), "- trajectory '%s':\n", last_done_slug);
+                sb_append_str(finding, line);
+                for (int i = 0; i < fn; i++) {
+                    snprintf(line, sizeof(line), "    arm %s: %.180s\n", fa[i].name, fa[i].command);
+                    sb_append_str(finding, line);
+                    free(fa[i].name); free(fa[i].command);
+                }
+                free(ferr);
+                kb_fm_free(&ffm);
+            }
+            const char *v = strstr(fc, "verdict: ");
+            if (v) {
+                const char *ve = strchr(v, '\n');
+                char *vs = trim_dup(v, ve ? (size_t)(ve - v) : strlen(v));
+                snprintf(line, sizeof(line), "    %.400s\n", vs);
+                sb_append_str(finding, line);
+                free(vs);
+            }
+            free(fc);
+        }
+        free(fp);
+    }
+    free(last_done_slug);
     free(cur_slug);
     free(allow);
+    return sb_to_str(&log);
+}
+
+char *study_loop(const char *seed_slug, const StudyLoopOpts *opts) {
+    int ntraj = opts->trajectories > 0 ? opts->trajectories : 1;
+    StringBuf log, explored;
+    sb_init(&log);
+    sb_init(&explored);
+    char line[512];
+
+    for (int t = 1; t <= ntraj; t++) {
+        char tslug[192];
+        if (ntraj > 1) snprintf(tslug, sizeof(tslug), "%s-t%d", seed_slug, t);
+        else           snprintf(tslug, sizeof(tslug), "%s", seed_slug);
+
+        if (ntraj > 1) {
+            snprintf(line, sizeof(line), "\n████ trajectory %d/%d ████\n", t, ntraj);
+            sb_append_str(&log, line);
+            fputs(line, stderr);
+        }
+
+        StringBuf finding;
+        sb_init(&finding);
+        char *sub = study_trajectory(tslug, opts,
+                                     explored.len ? explored.data : NULL,
+                                     &finding);
+        sb_append_str(&log, sub ? sub : "");
+        free(sub);
+
+        if (finding.len) {
+            sb_append(&explored, finding.data, finding.len);
+            sb_free(&finding);
+        } else {
+            sb_free(&finding);
+        }
+    }
+
+    if (ntraj > 1 && explored.len) {
+        sb_append_str(&log, "\n════ what every trajectory covered ════\n\n");
+        sb_append(&log, explored.data, explored.len);
+    }
+    sb_free(&explored);
     sb_append_str(&log, "\nloop finished.\n");
     return sb_to_str(&log);
 }
@@ -1995,6 +2092,8 @@ int cmd_study(int argc, char **argv) {
             "  loop <slug>   run rounds unattended: verdict -> next hypothesis\n"
             "                --question \"...\" --allow \"<prefixes>\" designs the first\n"
             "                study too, so any question can be run end to end\n"
+            "                --trajectories N runs N INDEPENDENT explorations, each told\n"
+            "                what the others covered so it probes a different dimension\n"
             "  list         list studies and their status\n"
             "  show <slug>  print the study artifact\n");
         return 2;
@@ -2016,7 +2115,7 @@ int cmd_study(int argc, char **argv) {
     if (strcmp(argv[0], "loop") == 0) {
         if (argc < 2) { fprintf(stderr, "study loop: missing seed slug\n"); return 2; }
         StudyLoopOpts o = { .max_rounds = 5, .port = 8181, .unsafe = false,
-                            .question = NULL, .allow = NULL };
+                            .question = NULL, .allow = NULL, .trajectories = 1 };
         const char *pe = getenv("BASI_SERVER_PORT");
         if (pe && *pe) o.port = atoi(pe);
         for (int i = 2; i < argc; i++) {
@@ -2024,8 +2123,13 @@ int cmd_study(int argc, char **argv) {
             else if (strcmp(argv[i], "--port") == 0 && i + 1 < argc)  o.port = atoi(argv[++i]);
             else if (strcmp(argv[i], "--question") == 0 && i + 1 < argc) o.question = argv[++i];
             else if (strcmp(argv[i], "--allow") == 0 && i + 1 < argc)  o.allow = argv[++i];
+            else if (strcmp(argv[i], "--trajectories") == 0 && i + 1 < argc) o.trajectories = atoi(argv[++i]);
             else if (strcmp(argv[i], "--unsafe") == 0)                o.unsafe = true;
             else { fprintf(stderr, "study loop: unknown option '%s'\n", argv[i]); return 2; }
+        }
+        if (o.trajectories < 1 || o.trajectories > 20) {
+            fprintf(stderr, "study loop: --trajectories must be 1..20\n");
+            return 2;
         }
         if (o.max_rounds < 0 || o.max_rounds > 1000) {
             fprintf(stderr, "study loop: --max-rounds must be 0..1000 (0 = until STOP)\n");
