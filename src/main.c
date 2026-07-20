@@ -867,6 +867,36 @@ static char *execute_tool(const char *command) {
         }
     }
 
+    /* study_run: execute a study's arms and hand back the COMPUTED verdict.
+     *
+     * This is what closes the loop. study_write alone let the model author an
+     * experiment it could never learn the outcome of; with this it can edit
+     * code, measure, and be told by a number it does not control whether the
+     * change survived.
+     *
+     * Gated like bash, and for the same reason: it runs commands out of the
+     * artifact. It grants no NEW power — the model already has bash in this
+     * loop — so there is deliberately no allow_commands allowlist here. That
+     * belongs to `study loop`, which runs unattended with nobody watching. */
+    if (strncmp(command, "study_run", 9) == 0) {
+        char after = command[9];
+        if (after == ' ' || after == '\t' || after == '\n' || after == '\0') {
+            const char *slug = command + 9;
+            while (*slug == ' ' || *slug == '\t' || *slug == '\n') slug++;
+            if (!*slug) return strdup("Error: study_run requires a study slug.");
+
+            bool auto_approve = (permission_mode == PERM_BYPASS) || bash_always_allowed;
+            if (!auto_approve) {
+                char label[256];
+                snprintf(label, sizeof(label), "study_run %s", slug);
+                int decision = request_approval("study_run", label);
+                if (decision == 0) return strdup("User denied execution.");
+                if (decision == 2) bash_always_allowed = true;
+            }
+            return study_run_slug(slug, NULL, NULL);
+        }
+    }
+
     /* plan_verify: run each row's verify clause, report OK/FAIL/SETUP/SKIP. */
     if (strncmp(command, "plan_verify", 11) == 0) {
         char after = command[11];

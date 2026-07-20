@@ -61,6 +61,8 @@ static const BasiToolDef TOOLS[] = {
       OBJ(STR("body", "The full spike document"), "[\"body\"]") },
     { "study_write", "Save a study: a hypothesis paired with a COMMAND that measures it. Use when a question can be settled by running something rather than by reasoning about it. Body is YAML frontmatter (metric, extract regex, runs, decision_rule) plus ## Question/Hypothesis/Experiment/Results/Verdict, with one ```arm <name> fenced block per arm. Then run `basi study run <slug>`: the verdict is computed from the measured numbers, not from your reading of them.",
       OBJ(STR("body", "The full study document"), "[\"body\"]") },
+    { "study_run", "Execute a study written with study_write and return the measured results plus the computed verdict (SUPPORTED / REFUTED / INCONCLUSIVE). Run this after study_write, and after any change you want to measure. The verdict is computed from the numbers by the pre-registered decision rule — you cannot argue with it, so use it: keep the change if SUPPORTED, revert it if REFUTED, and if INCONCLUSIVE the effect was not distinguishable from noise, so do NOT report it as an improvement.",
+      OBJ(STR("slug", "Slug of the study to run"), "[\"slug\"]") },
     { "plan_verify", "Run the verify clause of every Implementation Plan row (active phase), or one row by id.",
       OBJ(STR("id", "Optional row id, e.g. 1.2"), "[]") },
 };
@@ -173,6 +175,9 @@ char *basi_build_command(const char *name, const char *args) {
         sb_append_str(&sb, "study_write\n");
         sb_append_str(&sb, body ? body : "");
         free(body);
+    } else if (strcmp(name, "study_run") == 0) {
+        sb_append_str(&sb, "study_run");
+        append_arg(&sb, args, "slug", false);
     } else if (strcmp(name, "plan_verify") == 0) {
         sb_append_str(&sb, "plan_verify");
         append_arg(&sb, args, "id", false);
