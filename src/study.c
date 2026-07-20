@@ -817,16 +817,19 @@ static unsigned long tree_fingerprint(void) {
     return h;
 }
 
-/* Collapse a command's output into one short readable line for the Results
+/* Collapse a command's output into a short readable excerpt for the Results
  * section: strip CR (progress spinners overwrite with them), fold newlines and
- * runs of blanks, and cap the length. */
-static char *squash_output(const char *out) {
-    if (!out || !*out) return strdup("(no output)");
-    size_t cap = 240;
-    char *o = malloc(cap + 4);
-    size_t n = 0;
+ * runs of blanks, and cap the length.
+ *
+ * HEAD *AND* TAIL, because the useful part is usually at the END. Measured: four
+ * unattended rounds tried to fix an extract regex against llama-bench while the
+ * excerpt showed only its Vulkan device banner — the results table they needed
+ * was past the cut. This is the same finding as c03f7c2, which replaced
+ * head-only tool-result truncation for exactly this reason. */
+static char *squash_range(const char *p, const char *end, char *o, size_t cap, size_t *np) {
+    size_t n = *np;
     bool sp = false;
-    for (const char *p = out; *p && n < cap; p++) {
+    for (; p < end && n < cap; p++) {
         unsigned char c = (unsigned char)*p;
         if (c == '\r' || c == '\n' || c == '\t' || c == ' ') { sp = true; continue; }
         if (c < 0x20) continue;
@@ -834,10 +837,29 @@ static char *squash_output(const char *out) {
         sp = false;
         if (n < cap) o[n++] = (char)c;
     }
+    *np = n;
+    return o;
+}
+
+static char *squash_output(const char *out) {
+    if (!out || !*out) return strdup("(no output)");
+    const size_t HEAD = 140, TAIL = 220;
+    size_t len = strlen(out);
+    size_t cap = HEAD + TAIL + 8;
+    char *o = malloc(cap + 8);
+    size_t n = 0;
+
+    if (len <= HEAD + TAIL) {
+        squash_range(out, out + len, o, cap, &n);
+    } else {
+        squash_range(out, out + HEAD, o, HEAD, &n);
+        const char *mid = " ... ";
+        for (const char *m = mid; *m && n < cap; m++) o[n++] = *m;
+        squash_range(out + len - TAIL, out + len, o, cap, &n);
+    }
     while (n && o[n-1] == ' ') n--;
     o[n] = '\0';
     if (!n) { free(o); return strdup("(no output)"); }
-    if (strlen(out) > cap) { memcpy(o + (n > 3 ? n - 3 : 0), "...", 3); }
     return o;
 }
 
