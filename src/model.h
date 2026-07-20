@@ -14,6 +14,7 @@ typedef struct {
     float temperature;
     int   spec_draft_mtp;  /* 1 = launch llama-server with --spec-type draft-mtp (MTP models) */
     int   flash_attn;      /* 1 = -fa on */
+    int   cpu_moe;         /* 1 = --cpu-moe (MoE: experts to RAM, attention to GPU) */
 } LaunchConfig;
 
 LaunchConfig pick_model(void);

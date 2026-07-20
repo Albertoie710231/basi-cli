@@ -117,6 +117,9 @@ int srvgen_write_launch_script(const SrvLaunch *cfg, const char *path) {
     fprintf(f, "exec \"%s\" \\\n", bin);
     fprintf(f, "  -m \"%s\" \\\n", model);
     fprintf(f, "  -ngl %d -c %d \\\n", cfg->ngl, cfg->ctx);
+    /* Experts to system RAM, attention layers to the GPU. Emitted for MoE models
+     * because it is both faster and smaller than fitting whole layers. */
+    if (cfg->cpu_moe) fprintf(f, "  --cpu-moe \\\n");
     fprintf(f, "  --host %s --port %d", host, cfg->port);
     /* --kv-unified keeps each slot at the FULL -c; without it -c is split N ways. */
     if (cfg->n_parallel > 1) fprintf(f, " \\\n  -np %d --kv-unified", cfg->n_parallel);

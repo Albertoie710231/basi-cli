@@ -29,6 +29,11 @@ typedef struct {
     int         port;             /* --port (BASI connects here) */
     const char *spec_type;        /* --spec-type (e.g. "draft-mtp"); NULL/"" = off */
     int         spec_nmax;        /* --spec-draft-n-max */
+    /* --cpu-moe: pin MoE expert tensors to system RAM while every attention layer
+     * goes to the GPU. On an A3B this is both faster and smaller than fitting
+     * whole layers (33.97 vs 24.60 tok/s, ~4.0 vs ~5.5 GB), because only a couple
+     * of experts fire per token but an offloaded layer must carry all of them. */
+    int         cpu_moe;          /* 1 = emit --cpu-moe */
     int         flash_attn;       /* -fa on */
     int         jinja;            /* --jinja (needed for the chat/tools endpoints) */
     /* Server slots. >1 emits `-np N --kv-unified`, which best-of-N REQUIRES: the

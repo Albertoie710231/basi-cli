@@ -3327,7 +3327,7 @@ int main(int argc, char **argv) {
     static char default_model[1024];
     int ctx_override = 0;
     float temp_override = -1;
-    int picker_spec = -1, picker_fa = -1;   /* server launch flags from the picker (-1 = not set) */
+    int picker_spec = -1, picker_fa = -1, picker_cpumoe = -1;   /* server launch flags from the picker (-1 = not set) */
     bool loaded_from_default = false;   /* model came from the saved-default file */
     /* --pick (from /model): force the picker BEFORE any model is loaded, so its
        VRAM probe / auto-fit see the whole GPU free (the previous model was
@@ -3345,6 +3345,7 @@ int main(int argc, char **argv) {
             temp_override = cfg.temperature;
             picker_spec   = cfg.spec_draft_mtp;
             picker_fa     = cfg.flash_attn;
+            picker_cpumoe = cfg.cpu_moe;
             save_default_model(model_path, n_gpu_layers, cfg.ctx_size);
         }
     }
@@ -3379,6 +3380,7 @@ int main(int argc, char **argv) {
         temp_override = cfg.temperature;
         picker_spec  = cfg.spec_draft_mtp;
         picker_fa    = cfg.flash_attn;
+        picker_cpumoe = cfg.cpu_moe;
         /* An explicit pick always (re)writes the default — including repairing a
            stale file that pointed at a since-deleted model. */
         save_default_model(model_path, n_gpu_layers, cfg.ctx_size);
@@ -3541,6 +3543,7 @@ int main(int argc, char **argv) {
         else if (picker_spec == 1)      spec_type = "draft-mtp";
         else if (picker_spec < 0 && model_is_mtp) spec_type = "draft-mtp";
         int fa_on = (picker_fa >= 0) ? picker_fa : (spec_type != NULL);
+        int cpu_moe_on = (picker_cpumoe >= 0) ? picker_cpumoe : 0;
 
         /* "How to run llama-server for this model" IS the config now, so BASI keeps
            it as a standalone, editable script (.basi/run-llama-server.sh) and execs
@@ -3555,7 +3558,7 @@ int main(int argc, char **argv) {
             .server_bin = sbin, .model_path = model_path, .ngl = n_gpu_layers,
             .ctx = srv_ctx, .host = "127.0.0.1", .port = 8181,
             .spec_type = spec_type, .spec_nmax = spec_nmax,
-            .flash_attn = fa_on, .jinja = 1, .reasoning_format = "auto",
+            .flash_attn = fa_on, .cpu_moe = cpu_moe_on, .jinja = 1, .reasoning_format = "auto",
             .n_parallel = srv_slots,
         };
         if (srvgen_script_matches(script, model_path)) {
