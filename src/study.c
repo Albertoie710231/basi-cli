@@ -725,12 +725,25 @@ char *study_parse(const char *content, size_t content_len, Study *out) {
 #define RC_SENTINEL "__BASI_STUDY_RC="
 
 /* Pull the last capture-group-1 match out of `text`. Returns true if found. */
-static bool extract_metric(const regex_t *re, const char *text, double *out) {
+/* Returns true if a number was extracted. `spread` (if non-NULL) receives the
+ * ratio between the largest and smallest DISTINCT values the regex matched in
+ * this one run — 1.0 when it matched a single quantity.
+ *
+ * A regex that matches several very different numbers in one invocation is not
+ * identifying a metric, it is sampling whichever happened to come last.
+ * Measured: `zstd -b` prints compression AND decompression throughput on the
+ * same line, `([0-9.]+)\s*MB/s` matched both, and one arm was scored on
+ * decompression (~2580) against another on compression (~405). The loop
+ * reported SUPPORTED at p=1e-10 for a comparison between two different
+ * quantities. */
+static bool extract_metric(const regex_t *re, const char *text, double *out,
+                           double *spread, double *out_lo, double *out_hi) {
     regmatch_t m[2];
     const char *cur = text;
     bool found = false;
-    double last = 0;
+    double last = 0, lo = 0, hi = 0;
     int flags = 0;
+    if (spread) *spread = 1.0;
     while (*cur && regexec(re, cur, 2, m, flags) == 0) {
         if (m[1].rm_so >= 0) {
             size_t len = (size_t)(m[1].rm_eo - m[1].rm_so);
@@ -740,7 +753,11 @@ static bool extract_metric(const regex_t *re, const char *text, double *out) {
                 buf[len] = '\0';
                 char *end = NULL;
                 double v = strtod(buf, &end);
-                if (end != buf) { last = v; found = true; }
+                if (end != buf) {
+                    if (!found || v < lo) lo = v;
+                    if (!found || v > hi) hi = v;
+                    last = v; found = true;
+                }
             }
         }
         regoff_t adv = (m[0].rm_eo > m[0].rm_so) ? m[0].rm_eo : m[0].rm_so + 1;
@@ -748,6 +765,9 @@ static bool extract_metric(const regex_t *re, const char *text, double *out) {
         flags = REG_NOTBOL;
     }
     if (found) *out = last;
+    if (found && spread && lo > 0) *spread = hi / lo;
+    if (found && out_lo) *out_lo = lo;
+    if (found && out_hi) *out_hi = hi;
     return found;
 }
 
@@ -847,6 +867,7 @@ void study_execute(Study *s, StudyProgressFn progress, void *ud) {
 
             StudyRun *r = &arm->runs[arm->nruns++];
             memset(r, 0, sizeof(*r));
+            double run_spread = 1.0, run_lo = 0, run_hi = 0;
             r->seconds = dt;
             r->exit_code = -1;
 
@@ -866,7 +887,7 @@ void study_execute(Study *s, StudyProgressFn progress, void *ud) {
                 }
                 if (r->exit_code != 0) {
                     r->status = RUN_FAILED;
-                } else if (extract_metric(&re, outp, &r->value)) {
+                } else if (extract_metric(&re, outp, &r->value, &run_spread, &run_lo, &run_hi)) {
                     r->status = RUN_OK;
                 } else {
                     r->status = RUN_NO_METRIC;
@@ -874,6 +895,13 @@ void study_execute(Study *s, StudyProgressFn progress, void *ud) {
                 /* Keep what it printed when there is no number to report, so the
                  * next round can see WHY instead of guessing at the CLI. */
                 if (r->status != RUN_OK) r->sample = squash_output(outp);
+                /* Remember the worst ambiguity seen; one contaminated run is
+                 * enough to invalidate the arm's numbers. */
+                if (r->status == RUN_OK && run_spread > arm->metric_spread) {
+                    arm->metric_spread = run_spread;
+                    arm->metric_lo = run_lo;
+                    arm->metric_hi = run_hi;
+                }
             }
             free(outp);
             if (progress) progress(arm->name, i + 1, s->runs, ud);
@@ -928,6 +956,20 @@ StudyVerdict study_decide(const Study *s, char **detail) {
      * before the "optimised" arm ran, so both arms measured the SAME slow code.
      * It came back REFUTED on contaminated data and a genuine 11.9x improvement
      * was reverted, with a confident and entirely wrong explanation attached. */
+    /* A regex that matched several very different numbers in ONE run is not
+     * identifying a metric — it is reporting whichever came last. Refuse to
+     * compare arms whose numbers may not even be the same quantity. */
+    for (int i = 0; i < s->narms && !insufficient; i++) {
+        if (s->arms[i].metric_spread > 2.0) {
+            snprintf(reason, sizeof(reason),
+                "one run of arm '%s' matched both %.4g and %.4g (%.1fx apart), so the extract "
+                "regex is capturing more than one quantity — anchor it to the exact field",
+                s->arms[i].name, s->arms[i].metric_lo, s->arms[i].metric_hi,
+                s->arms[i].metric_spread);
+            insufficient = true;
+        }
+    }
+
     for (int i = 1; i < s->narms; i++) {
         if (s->arms[i].tree_hash != s->arms[0].tree_hash) {
             snprintf(reason, sizeof(reason),

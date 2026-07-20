@@ -59,6 +59,15 @@ typedef struct {
      * silently changes what every LATER arm measures. Comparing fingerprints
      * across arms catches that; see study_execute(). */
     unsigned long tree_hash;
+
+    /* Worst ratio between the largest and smallest DISTINCT numbers the extract
+     * regex matched within a SINGLE run. 1.0 means it matched one quantity. A
+     * large value means the regex is not identifying the metric — measured on
+     * `zstd -b`, which prints compression and decompression throughput on one
+     * line, so one arm scored ~2580 (decompression) against another's ~405
+     * (compression) and the loop called it SUPPORTED at p=1e-10. */
+    double metric_spread;
+    double metric_lo, metric_hi;  /* the conflicting values, for the error message */
 } StudyArm;
 
 typedef struct {
