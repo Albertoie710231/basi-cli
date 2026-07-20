@@ -863,6 +863,26 @@ static char *squash_output(const char *out) {
     return o;
 }
 
+/* Abbreviate a command for a summary line, keeping the TAIL.
+ *
+ * What distinguishes two arms is almost always at the end — the flags — while
+ * the head is a long shared path. Measured: the cross-trajectory brief truncated
+ * arm commands at 180 chars, which a model path consumed entirely, so every arm
+ * read as identical and later trajectories could not see what earlier ones had
+ * actually varied. Same head-vs-tail lesson as the failure excerpts. */
+static char *abbrev_cmd(const char *cmd) {
+    if (!cmd) return strdup("(none)");
+    size_t len = strlen(cmd);
+    const size_t HEAD = 40, TAIL = 130;
+    if (len <= HEAD + TAIL) return strdup(cmd);
+    char *o = malloc(HEAD + TAIL + 8);
+    memcpy(o, cmd, HEAD);
+    memcpy(o + HEAD, " … ", 5);                 /* U+2026, 3 bytes + 2 spaces */
+    memcpy(o + HEAD + 5, cmd + len - TAIL, TAIL);
+    o[HEAD + 5 + TAIL] = '\0';
+    return o;
+}
+
 void study_execute(Study *s, StudyProgressFn progress, void *ud) {
     regex_t re;
     if (regcomp(&re, s->extract, REG_EXTENDED) != 0) return;  /* validated already */
@@ -1889,7 +1909,9 @@ static char *study_trajectory(const char *seed_slug, const StudyLoopOpts *opts,
                 int rn = study_parse_arms(content + rfm.body_offset, len - rfm.body_offset,
                                           ra, STUDY_MAX_ARMS, &rerr);
                 for (int i = 0; i < rn; i++) {
-                    snprintf(line, sizeof(line), "arm %s: %.200s\n", ra[i].name, ra[i].command);
+                    char *rab = abbrev_cmd(ra[i].command);
+                    snprintf(line, sizeof(line), "arm %s: %s\n", ra[i].name, rab);
+                    free(rab);
                     sb_append_str(&rec, line);
                     free(ra[i].name); free(ra[i].command);
                 }
@@ -1981,8 +2003,10 @@ static char *study_trajectory(const char *seed_slug, const StudyLoopOpts *opts,
                 snprintf(line, sizeof(line), "- trajectory '%s':\n", last_done_slug);
                 sb_append_str(finding, line);
                 for (int i = 0; i < fn; i++) {
-                    snprintf(line, sizeof(line), "    arm %s: %.180s\n", fa[i].name, fa[i].command);
+                    char *ab = abbrev_cmd(fa[i].command);
+                    snprintf(line, sizeof(line), "    arm %s: %s\n", fa[i].name, ab);
                     sb_append_str(finding, line);
+                    free(ab);
                     free(fa[i].name); free(fa[i].command);
                 }
                 free(ferr);
