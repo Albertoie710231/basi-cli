@@ -1436,6 +1436,14 @@ static char *extract_artifact(const char *text) {
 /* How many times a round may re-ask after a rejected artifact. */
 #define LOOP_MAX_ATTEMPTS 3
 
+/* Generation budget for one artifact proposal. An artifact is only ~600 tokens,
+ * but on a reasoning model the <think> span runs first and can consume many
+ * thousands before a single line of the answer appears. This was an unexamined
+ * 4096 and a seed round died with finish=length: 4096 tokens of reasoning, no
+ * artifact. Budget for thinking AND writing rather than suppressing reasoning,
+ * which is where hypothesis quality comes from. */
+#define LOOP_MAX_TOKENS 16384
+
 /* Incremental chat-messages JSON array. */
 typedef struct { StringBuf b; int n; } Msgs;
 
@@ -1457,6 +1465,129 @@ static void msgs_add(Msgs *m, const char *role, const char *content) {
 static char *msgs_done(Msgs *m) {
     sb_append_char(&m->b, ']');
     return sb_to_str(&m->b);
+}
+
+
+/* Ask the model for a study artifact and keep asking, up to LOOP_MAX_ATTEMPTS,
+ * feeding the validator's own errors back each time. Returns a malloc'd,
+ * VALIDATED and safety-gated artifact, or NULL. *said_stop is set when the model
+ * deliberately ended the loop rather than failing.
+ *
+ * Shared by the seed step (from a question) and every later round (from the
+ * previous verdict), so both get the same self-correction. Measured need: three
+ * consecutive single-shot attempts on Qwen3.5-9B produced three DIFFERENT
+ * malformed artifacts, and catching them without a retry only ends the run. */
+static char *propose_artifact(const StudyLoopOpts *opts, const char *user_msg,
+                              const char *target_slug, const char *parent_slug,
+                              const char *allow, StringBuf *log, bool *said_stop) {
+    char *prev_reply = NULL, *feedback = NULL, *out = NULL;
+    char line[1024];
+    if (said_stop) *said_stop = false;
+
+    for (int attempt = 1; attempt <= LOOP_MAX_ATTEMPTS && !out; attempt++) {
+        Msgs m;
+        msgs_init(&m);
+        msgs_add(&m, "system", LOOP_SYSTEM_PROMPT);
+        msgs_add(&m, "user", user_msg);
+        if (prev_reply && feedback) {
+            msgs_add(&m, "assistant", prev_reply);
+            StringBuf fb;
+            sb_init(&fb);
+            sb_append_str(&fb, "That artifact was REJECTED:\n\n");
+            sb_append_str(&fb, feedback);
+            sb_append_str(&fb, "\nResend the COMPLETE corrected artifact, starting with the "
+                               "--- frontmatter line. Do not explain, do not apologise, do "
+                               "not send only the changed part.\n");
+            char *fbs = sb_to_str(&fb);
+            msgs_add(&m, "user", fbs);
+            free(fbs);
+        }
+        char *msgs = msgs_done(&m);
+
+        SrvChatResult *r = srvchat_complete(opts->port, msgs, NULL, NULL, LOOP_MAX_TOKENS, NULL, NULL, NULL);
+        free(msgs);
+        if (!r || !r->content || !*r->content) {
+            if (r && r->reasoning && *r->reasoning)
+                snprintf(line, sizeof(line),
+                    "loop: model produced %d tokens of reasoning but no answer (finish=%s); "
+                    "stopping. Try BASI_NO_THINK=1.\n",
+                    r->completion_tokens, r->finish_reason ? r->finish_reason : "?");
+            else
+                snprintf(line, sizeof(line),
+                    "loop: no response from llama-server on port %d; stopping.\n", opts->port);
+            sb_append_str(log, line);
+            if (r) srvchat_free(r);
+            break;
+        }
+
+        char *artifact = extract_artifact(r->content);
+        char *reply = trim_dup(r->content, strlen(r->content));
+        srvchat_free(r);
+
+        if (!artifact && strncmp(reply, "STOP", 4) == 0) {
+            if (said_stop) *said_stop = true;
+            free(reply);
+            break;
+        }
+
+        char *a1 = NULL, *a2 = NULL, *a3 = NULL, *a4 = NULL, *c = NULL, *why_bad = NULL;
+        if (!artifact) {
+            why_bad = strdup("- the reply did not contain a study artifact. It must start "
+                             "with a --- frontmatter line.\n");
+        } else {
+            a1 = replace_fm_key(artifact, strlen(artifact), "slug", target_slug);
+            a2 = a1 ? replace_fm_key(a1, strlen(a1), "status", "proposed") : NULL;
+            a3 = (a2 && parent_slug) ? replace_fm_key(a2, strlen(a2), "parent", parent_slug) : NULL;
+            char *base_for_allow = a3 ? a3 : a2;
+            a4 = (base_for_allow && allow)
+               ? replace_fm_key(base_for_allow, strlen(base_for_allow), "allow_commands", allow) : NULL;
+            c = a4 ? a4 : (a3 ? a3 : (a2 ? a2 : a1));
+            if (!c) c = artifact;
+
+            why_bad = validate_study_artifact(c, strlen(c));
+
+            if (!why_bad && !opts->unsafe) {
+                StudyArm arms[STUDY_MAX_ARMS];
+                char *aerr = NULL;
+                KbFrontmatter cfm;
+                kb_parse_frontmatter(c, strlen(c), &cfm);
+                int n = study_parse_arms(c + cfm.body_offset, strlen(c) - cfm.body_offset,
+                                         arms, STUDY_MAX_ARMS, &aerr);
+                kb_fm_free(&cfm);
+                free(aerr);
+                StringBuf gb;
+                sb_init(&gb);
+                for (int i = 0; i < n; i++) {
+                    char why[256];
+                    if (!arm_command_allowed(arms[i].command, allow, why, sizeof(why))) {
+                        snprintf(line, sizeof(line),
+                            "- arm '%s' is not authorised: %s\n  command: %s\n",
+                            arms[i].name, why, arms[i].command);
+                        sb_append_str(&gb, line);
+                        fputs(line, stderr);
+                    }
+                    free(arms[i].name); free(arms[i].command);
+                }
+                if (gb.len) why_bad = sb_to_str(&gb); else sb_free(&gb);
+            }
+        }
+
+        if (!why_bad) {
+            out = strdup(c);
+            free(reply);
+        } else {
+            snprintf(line, sizeof(line), "\nloop: attempt %d/%d rejected:\n",
+                     attempt, LOOP_MAX_ATTEMPTS);
+            sb_append_str(log, line);
+            sb_append_str(log, why_bad);
+            fputs(line, stderr);
+            free(prev_reply); prev_reply = reply;
+            free(feedback);   feedback = why_bad;
+        }
+        free(artifact); free(a1); free(a2); free(a3); free(a4);
+    }
+    free(prev_reply); free(feedback);
+    return out;
 }
 
 char *study_loop(const char *seed_slug, const StudyLoopOpts *opts) {
@@ -1487,6 +1618,62 @@ char *study_loop(const char *seed_slug, const StudyLoopOpts *opts) {
         }
         free(sp);
     }
+    /* --question: no seed artifact exists yet, so the model writes the FIRST
+     * study too — question, metric, extract regex, arms, decision rule. This is
+     * what makes the loop general-purpose rather than a runner for experiments a
+     * human already designed. The allowlist comes from the CLI, not from the
+     * artifact: a model that writes its own allowlist has no allowlist. */
+    if (opts->question && *opts->question) {
+        allow = opts->allow ? strdup(opts->allow) : NULL;
+        if (!allow && !opts->unsafe) {
+            sb_free(&log);
+            free(cur_slug);
+            return strdup(
+                "study loop --question needs --allow: the model writes the whole first study,\n"
+                "including its arm commands, so the list of permitted command prefixes must\n"
+                "come from you. e.g. --allow './bench.sh, python3 tools/measure.py'\n"
+                "Pass --unsafe to run without one.\n");
+        }
+
+        StringBuf u;
+        sb_init(&u);
+        sb_append_str(&u, "Design the FIRST study for this question:\n\n");
+        sb_append_str(&u, opts->question);
+        sb_append_str(&u, "\n\nYou are choosing what to measure and how. Pick a metric that the "
+                          "command actually prints, an extract regex that matches it, two arms "
+                          "differing in exactly ONE thing, and a decision rule you commit to "
+                          "before seeing any data.\n");
+        if (allow && !opts->unsafe) {
+            sb_append_str(&u, "\nEvery arm command MUST begin with one of these exact prefixes, "
+                              "and may not chain, pipe or redirect: ");
+            sb_append_str(&u, allow);
+            sb_append_char(&u, '\n');
+        }
+        char *user_msg = sb_to_str(&u);
+
+        snprintf(line, sizeof(line), "\n══ seeding from question ══\n");
+        sb_append_str(&log, line);
+        fputs(line, stderr);
+
+        bool stop = false;
+        char *seed = propose_artifact(opts, user_msg, seed_slug, NULL, allow, &log, &stop);
+        free(user_msg);
+        if (!seed) {
+            sb_append_str(&log, "\nloop: could not design a study for that question; stopping.\n");
+            free(allow); free(cur_slug);
+            return sb_to_str(&log);
+        }
+        char *msg = execute_study_write(seed);
+        sb_append_str(&log, msg);
+        bool ok = strstr(msg, "rejected") == NULL && strstr(msg, "failed") == NULL;
+        free(msg); free(seed);
+        if (!ok) {
+            sb_append_str(&log, "loop: could not persist the seed study; stopping.\n");
+            free(allow); free(cur_slug);
+            return sb_to_str(&log);
+        }
+    }
+
     if (!allow && !opts->unsafe) {
         sb_free(&log);
         free(cur_slug);
@@ -1522,14 +1709,7 @@ char *study_loop(const char *seed_slug, const StudyLoopOpts *opts) {
             break;
         }
 
-        /* 2. Ask for the next hypothesis, given the COMPUTED verdict.
-         *
-         * Bounded retry with the validator's own errors fed back. Measured on
-         * Qwen3.5-9B: three consecutive single-shot attempts produced three
-         * DIFFERENT malformed artifacts (frontmatter in a ```yaml fence, keys
-         * missing, prose). The harness caught all three, but catching them only
-         * ends the run — a loop meant to survive unattended has to let the model
-         * see exactly what was wrong and fix it, the way plan_write does. */
+        /* 2. Ask for the next hypothesis, given the COMPUTED verdict. */
         char next_slug[160];
         snprintf(next_slug, sizeof(next_slug), "%s-r%d", base, round + 1);
 
@@ -1547,124 +1727,9 @@ char *study_loop(const char *seed_slug, const StudyLoopOpts *opts) {
         }
         char *user_msg = sb_to_str(&u);
 
-        char *cand = NULL;          /* validated + gated artifact, once we have one */
-        char *prev_reply = NULL;    /* last attempt, for the corrective turn */
-        char *feedback = NULL;      /* why it was rejected */
-        bool stop_loop = false, said_stop = false;
-
-        for (int attempt = 1; attempt <= LOOP_MAX_ATTEMPTS && !cand && !stop_loop; attempt++) {
-            Msgs m;
-            msgs_init(&m);
-            msgs_add(&m, "system", LOOP_SYSTEM_PROMPT);
-            msgs_add(&m, "user", user_msg);
-            if (prev_reply && feedback) {
-                msgs_add(&m, "assistant", prev_reply);
-                StringBuf fb;
-                sb_init(&fb);
-                sb_append_str(&fb, "That artifact was REJECTED:\n\n");
-                sb_append_str(&fb, feedback);
-                sb_append_str(&fb, "\nResend the COMPLETE corrected artifact, starting with the "
-                                   "--- frontmatter line. Do not explain, do not apologise, do "
-                                   "not send only the changed part.\n");
-                char *fbs = sb_to_str(&fb);
-                msgs_add(&m, "user", fbs);
-                free(fbs);
-            }
-            char *msgs = msgs_done(&m);
-
-            SrvChatResult *r = srvchat_complete(opts->port, msgs, NULL, NULL, 4096,
-                                                NULL, NULL, NULL);
-            free(msgs);
-            if (!r || !r->content || !*r->content) {
-                if (r && r->reasoning && *r->reasoning)
-                    snprintf(line, sizeof(line),
-                        "loop: model produced %d tokens of reasoning but no answer "
-                        "(finish=%s); stopping. Try BASI_NO_THINK=1.\n",
-                        r->completion_tokens, r->finish_reason ? r->finish_reason : "?");
-                else
-                    snprintf(line, sizeof(line),
-                        "loop: no response from llama-server on port %d; stopping.\n", opts->port);
-                sb_append_str(&log, line);
-                if (r) srvchat_free(r);
-                stop_loop = true;
-                break;
-            }
-
-            char *artifact = extract_artifact(r->content);
-            char *reply = trim_dup(r->content, strlen(r->content));
-            srvchat_free(r);
-
-            /* STOP must BE the reply, not merely appear in it — otherwise an
-             * artifact that failed to parse but mentions the word reads as a
-             * deliberate stop, and a broken run looks like a finished one. */
-            if (!artifact && strncmp(reply, "STOP", 4) == 0) {
-                said_stop = stop_loop = true;
-                free(reply);
-                break;
-            }
-
-            /* Assign slug/parent/status/allowlist ourselves: fewer ways for a
-             * round to fail, and inheritance must not be model-editable. */
-            char *a1 = NULL, *a2 = NULL, *a3 = NULL, *a4 = NULL, *c = NULL;
-            char *why_bad = NULL;
-            if (!artifact) {
-                why_bad = strdup("- the reply did not contain a study artifact. It must start "
-                                 "with a --- frontmatter line.\n");
-            } else {
-                a1 = replace_fm_key(artifact, strlen(artifact), "slug", next_slug);
-                a2 = a1 ? replace_fm_key(a1, strlen(a1), "parent", cur_slug) : NULL;
-                a3 = a2 ? replace_fm_key(a2, strlen(a2), "status", "proposed") : NULL;
-                a4 = (a3 && allow) ? replace_fm_key(a3, strlen(a3), "allow_commands", allow) : NULL;
-                c = a4 ? a4 : (a3 ? a3 : (a2 ? a2 : a1));
-                if (!c) c = artifact;
-
-                why_bad = validate_study_artifact(c, strlen(c));
-
-                /* Safety gate on the arms the model just wrote. A blocked
-                 * command is fed back too: it is a fixable mistake, not an
-                 * attack, and the model can retry within its allowance. */
-                if (!why_bad && !opts->unsafe) {
-                    StudyArm arms[STUDY_MAX_ARMS];
-                    char *aerr = NULL;
-                    KbFrontmatter cfm;
-                    kb_parse_frontmatter(c, strlen(c), &cfm);
-                    int n = study_parse_arms(c + cfm.body_offset, strlen(c) - cfm.body_offset,
-                                             arms, STUDY_MAX_ARMS, &aerr);
-                    kb_fm_free(&cfm);
-                    free(aerr);
-                    StringBuf gb;
-                    sb_init(&gb);
-                    for (int i = 0; i < n; i++) {
-                        char why[256];
-                        if (!arm_command_allowed(arms[i].command, allow, why, sizeof(why))) {
-                            snprintf(line, sizeof(line),
-                                "- arm '%s' is not authorised: %s\n  command: %s\n",
-                                arms[i].name, why, arms[i].command);
-                            sb_append_str(&gb, line);
-                            fputs(line, stderr);
-                        }
-                        free(arms[i].name); free(arms[i].command);
-                    }
-                    if (gb.len) why_bad = sb_to_str(&gb); else sb_free(&gb);
-                }
-            }
-
-            if (!why_bad) {
-                cand = strdup(c);
-                free(reply);
-            } else {
-                snprintf(line, sizeof(line),
-                         "\nloop: attempt %d/%d rejected:\n", attempt, LOOP_MAX_ATTEMPTS);
-                sb_append_str(&log, line);
-                sb_append_str(&log, why_bad);
-                fputs(line, stderr);
-                free(prev_reply); prev_reply = reply;
-                free(feedback);   feedback = why_bad;
-            }
-            free(artifact); free(a1); free(a2); free(a3); free(a4);
-        }
-
-        free(user_msg); free(prev_reply); free(feedback);
+        bool said_stop = false;
+        char *cand = propose_artifact(opts, user_msg, next_slug, cur_slug, allow, &log, &said_stop);
+        free(user_msg);
         free(report); free(content); free(path);
 
         if (said_stop) {
@@ -1672,7 +1737,6 @@ char *study_loop(const char *seed_slug, const StudyLoopOpts *opts) {
             free(cand);
             break;
         }
-        if (stop_loop) { free(cand); break; }
         if (!cand) {
             snprintf(line, sizeof(line),
                 "\nloop: no valid study after %d attempts; stopping.\n", LOOP_MAX_ATTEMPTS);
@@ -1740,6 +1804,8 @@ int cmd_study(int argc, char **argv) {
             "usage: basi-cli study <run|list|show> [slug]\n"
             "  run <slug>    execute the study's arms and compute the verdict\n"
             "  loop <slug>   run rounds unattended: verdict -> next hypothesis\n"
+            "                --question \"...\" --allow \"<prefixes>\" designs the first\n"
+            "                study too, so any question can be run end to end\n"
             "  list         list studies and their status\n"
             "  show <slug>  print the study artifact\n");
         return 2;
@@ -1760,12 +1826,15 @@ int cmd_study(int argc, char **argv) {
 
     if (strcmp(argv[0], "loop") == 0) {
         if (argc < 2) { fprintf(stderr, "study loop: missing seed slug\n"); return 2; }
-        StudyLoopOpts o = { .max_rounds = 5, .port = 8181, .unsafe = false };
+        StudyLoopOpts o = { .max_rounds = 5, .port = 8181, .unsafe = false,
+                            .question = NULL, .allow = NULL };
         const char *pe = getenv("BASI_SERVER_PORT");
         if (pe && *pe) o.port = atoi(pe);
         for (int i = 2; i < argc; i++) {
             if (strcmp(argv[i], "--max-rounds") == 0 && i + 1 < argc) o.max_rounds = atoi(argv[++i]);
             else if (strcmp(argv[i], "--port") == 0 && i + 1 < argc)  o.port = atoi(argv[++i]);
+            else if (strcmp(argv[i], "--question") == 0 && i + 1 < argc) o.question = argv[++i];
+            else if (strcmp(argv[i], "--allow") == 0 && i + 1 < argc)  o.allow = argv[++i];
             else if (strcmp(argv[i], "--unsafe") == 0)                o.unsafe = true;
             else { fprintf(stderr, "study loop: unknown option '%s'\n", argv[i]); return 2; }
         }

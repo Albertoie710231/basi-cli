@@ -129,8 +129,19 @@ typedef struct {
     int  max_rounds;
     int  port;         /* llama-server port for hypothesis generation */
     bool unsafe;       /* skip the arm-command allowlist */
+
+    /* Start from a QUESTION rather than a hand-written seed artifact. This is
+     * what makes the loop general-purpose: point it at any question in any
+     * domain and it writes the first study itself — the metric, the extract
+     * regex, the arms and the decision rule — instead of a human pre-encoding
+     * the experiment. `allow` then comes from the CLI rather than the artifact,
+     * because a model that writes its own allowlist has no allowlist. */
+    const char *question;   /* NULL = seed from an existing artifact */
+    const char *allow;      /* comma-separated command prefixes; required with question */
 } StudyLoopOpts;
 
+/* seed_slug names an existing artifact, or is the slug to CREATE when
+ * opts->question is set. */
 char *study_loop(const char *seed_slug, const StudyLoopOpts *opts);
 
 /* CLI: basi-cli study <run|list|show> ... */
