@@ -2532,9 +2532,10 @@ static void handle_slash_command(char *user_input,
                     "  /premortem            (drafting only) enter premortem — model rewrites the plan with a ## Pre-mortem section\n"
                     "  /deepsearch <question>\n"
                     "                        multi-round deep research (web + knowledge base), synthesized + cited\n"
-                    "  /study <question>     settle a question by MEASUREMENT: designs experiments, runs them,\n"
-                    "                        and reports verdicts computed from the numbers (not argued).\n"
-                    "                        BASI_STUDY_TRAJECTORIES=N explores N different angles; BASI_STUDY_ROUNDS=N\n"
+                    "  /study [N] <question> settle a question by MEASUREMENT: designs the experiments, runs\n"
+                    "                        them, reports verdicts computed from the numbers (not argued).\n"
+                    "                        Explores N DIFFERENT theories (default 3), each told what the\n"
+                    "                        others covered; findings ranked by measured effect\n"
                     "  /model [name]         switch model (no arg: picker; name: match; keeps your chat)\n"
                     "  /cookbook [sub]       download & manage models (list | search | get <repo> | rm)\n"
                     "\n"
@@ -2749,22 +2750,40 @@ static void handle_slash_command(char *user_input,
                 if (!*q) {
                     printf("\033[31m[/study: needs a question. Usage: /study <question to settle by measurement>]\033[0m\n");
                     printf("\033[90m  e.g. /study which zstd level compresses fastest on this machine\033[0m\n");
+                    printf("\033[90m  /study <N> <question> explores N different theories (default 3)\033[0m\n");
                     fflush(stdout);
                     free(user_input);
                     return;
                 }
+                /* Optional leading count: "/study 5 <question>" runs 5 independent
+                 * explorations. DEFAULT 3, matching ROBIN's num_assays — a single
+                 * chain stops at its first success, which is exactly when it is
+                 * most tempting to stop and least justified. */
+                int ntraj = 3;
+                if (*q >= '1' && *q <= '9') {
+                    const char *after = q;
+                    int v = 0;
+                    while (*after >= '0' && *after <= '9') v = v * 10 + (*after++ - '0');
+                    if (*after == ' ' && v >= 1 && v <= 20) {
+                        ntraj = v;
+                        q = after;
+                        while (*q == ' ') q++;
+                    }
+                }
+                if (!*q) {
+                    printf("\033[31m[/study: needs a question after the count]\033[0m\n");
+                    fflush(stdout); free(user_input); return;
+                }
                 char *q_copy = strdup(q);
                 StudyLoopOpts so = { .max_rounds = 3, .port = basi_srv_port,
                                      .unsafe = true, .question = q_copy,
-                                     .allow = NULL, .trajectories = 1 };
-                { const char *e = getenv("BASI_STUDY_TRAJECTORIES"); if (e && *e) so.trajectories = atoi(e); }
-                { const char *e = getenv("BASI_STUDY_ROUNDS");       if (e && *e) so.max_rounds   = atoi(e); }
-                if (so.trajectories < 1) so.trajectories = 1;
+                                     .allow = NULL, .trajectories = ntraj };
+                { const char *e = getenv("BASI_STUDY_ROUNDS"); if (e && *e) so.max_rounds = atoi(e); }
 
                 char slug[128];
                 snprintf(slug, sizeof(slug), "session-study-%d", (int)(time(NULL) % 100000));
-                printf("\033[90m[/study] %d trajectory(ies), up to %d rounds each — verdicts are computed, not argued\033[0m\n",
-                       so.trajectories, so.max_rounds);
+                printf("\033[90m[/study] exploring %d different theories, up to %d rounds each — "
+                       "verdicts are computed, not argued\033[0m\n", so.trajectories, so.max_rounds);
                 fflush(stdout);
 
                 char *report = study_loop(slug, &so);
