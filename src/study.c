@@ -1739,12 +1739,13 @@ static char *propose_artifact(const StudyLoopOpts *opts, const char *user_msg,
  * NULL) lists what EARLIER trajectories already covered, so this one is pushed
  * somewhere else. Appends its own one-line finding to `finding` if non-NULL. */
 static char *study_trajectory(const char *seed_slug, const StudyLoopOpts *opts,
-                              const char *explored, StringBuf *finding) {
+                              const char *explored, StringBuf *finding,
+                              char **final_slug) {
     StringBuf log;
     sb_init(&log);
     char line[1024];
 
-    char base[128];
+    char base[256];
     snprintf(base, sizeof(base), "%s", seed_slug);
     char *cur_slug = strdup(seed_slug);
     char *last_done_slug = NULL;
@@ -1918,7 +1919,7 @@ static char *study_trajectory(const char *seed_slug, const StudyLoopOpts *opts,
         }
 
         /* 2. Ask for the next hypothesis, given the COMPUTED verdict. */
-        char next_slug[160];
+        char next_slug[288];
         snprintf(next_slug, sizeof(next_slug), "%s-r%d", base, round + 1);
 
         StringBuf u;
@@ -1999,10 +2000,77 @@ static char *study_trajectory(const char *seed_slug, const StudyLoopOpts *opts,
         }
         free(fp);
     }
-    free(last_done_slug);
+    if (final_slug) *final_slug = last_done_slug; else free(last_done_slug);
     free(cur_slug);
     free(allow);
     return sb_to_str(&log);
+}
+
+/* ── Ranking across trajectories ────────────────────────────────────────
+ * ROBIN closes with Bradley-Terry-Luce over pairwise LLM preferences, because
+ * it cannot run its experiments — model opinion is the only signal it has. Here
+ * every finding already carries measured numbers and a p-value, so the ranking
+ * is arithmetic over those instead: effect size, with significance as the gate.
+ * The ordering is not something the model can argue with. */
+typedef struct {
+    char   slug[192];
+    bool   supported;
+    double effect_pct;   /* |better - worse| / worse * 100 */
+    double p;
+    double best, other;
+    char   detail[320];
+} TrajFinding;
+
+/* Pull the executed numbers back out of a completed artifact. */
+static bool summarize_study(const char *slug, TrajFinding *out) {
+    memset(out, 0, sizeof(*out));
+    snprintf(out->slug, sizeof(out->slug), "%s", slug ? slug : "?");
+    char *path = study_path(slug);
+    size_t len = 0;
+    char *c = path ? kb_read_file(path, &len) : NULL;
+    free(path);
+    if (!c) return false;
+
+    out->supported = strstr(c, "**SUPPORTED**") != NULL;
+
+    const char *pp = strstr(c, "\np: ");
+    if (pp) out->p = strtod(pp + 4, NULL);
+
+    /* "substituted: mean(B) = 75.49 > mean(A) = 74.31" */
+    const char *sub = strstr(c, "substituted: ");
+    if (sub) {
+        const char *e = strchr(sub, '\n');
+        size_t n = e ? (size_t)(e - sub) : strlen(sub);
+        if (n >= sizeof(out->detail)) n = sizeof(out->detail) - 1;
+        memcpy(out->detail, sub, n);
+        out->detail[n] = '\0';
+
+        double v[4]; int nv = 0;
+        for (const char *q = sub; q < sub + n && nv < 4; q++) {
+            if (*q == '=' ) {
+                char *end = NULL;
+                double d = strtod(q + 1, &end);
+                if (end != q + 1) { v[nv++] = d; q = end - 1; }
+            }
+        }
+        if (nv >= 2) {
+            double a = v[0], b = v[1];
+            out->best  = a > b ? a : b;
+            out->other = a > b ? b : a;
+            if (out->other != 0.0)
+                out->effect_pct = (out->best - out->other) / out->other * 100.0;
+        }
+    }
+    free(c);
+    return true;
+}
+
+static int cmp_finding(const void *x, const void *y) {
+    const TrajFinding *a = x, *b = y;
+    if (a->supported != b->supported) return a->supported ? -1 : 1;  /* supported first */
+    if (a->effect_pct < b->effect_pct) return 1;                     /* bigger effect first */
+    if (a->effect_pct > b->effect_pct) return -1;
+    return 0;
 }
 
 char *study_loop(const char *seed_slug, const StudyLoopOpts *opts) {
@@ -2011,11 +2079,13 @@ char *study_loop(const char *seed_slug, const StudyLoopOpts *opts) {
     sb_init(&log);
     sb_init(&explored);
     char line[512];
+    TrajFinding finds[20];
+    int nfind = 0;
 
     for (int t = 1; t <= ntraj; t++) {
         char tslug[192];
-        if (ntraj > 1) snprintf(tslug, sizeof(tslug), "%s-t%d", seed_slug, t);
-        else           snprintf(tslug, sizeof(tslug), "%s", seed_slug);
+        if (ntraj > 1) snprintf(tslug, sizeof(tslug), "%.150s-t%d", seed_slug, t);
+        else           snprintf(tslug, sizeof(tslug), "%.180s", seed_slug);
 
         if (ntraj > 1) {
             snprintf(line, sizeof(line), "\n████ trajectory %d/%d ████\n", t, ntraj);
@@ -2025,11 +2095,14 @@ char *study_loop(const char *seed_slug, const StudyLoopOpts *opts) {
 
         StringBuf finding;
         sb_init(&finding);
+        char *done = NULL;
         char *sub = study_trajectory(tslug, opts,
                                      explored.len ? explored.data : NULL,
-                                     &finding);
+                                     &finding, &done);
         sb_append_str(&log, sub ? sub : "");
         free(sub);
+        if (done && nfind < 20 && summarize_study(done, &finds[nfind])) nfind++;
+        free(done);
 
         if (finding.len) {
             sb_append(&explored, finding.data, finding.len);
@@ -2042,6 +2115,32 @@ char *study_loop(const char *seed_slug, const StudyLoopOpts *opts) {
     if (ntraj > 1 && explored.len) {
         sb_append_str(&log, "\n════ what every trajectory covered ════\n\n");
         sb_append(&log, explored.data, explored.len);
+    }
+
+    /* Ranked synthesis. ROBIN orders its candidates by Bradley-Terry-Luce over
+     * model preference; these carry measured effect sizes and p-values, so they
+     * are ordered by those instead — supported findings first, largest effect
+     * first. Nothing here is a judgement call. */
+    if (nfind > 1) {
+        qsort(finds, (size_t)nfind, sizeof(finds[0]), cmp_finding);
+        sb_append_str(&log, "\n════ findings, ranked by measured effect ════\n\n");
+        int shown = 0;
+        for (int i = 0; i < nfind; i++) {
+            if (!finds[i].supported) continue;
+            char rl[900];
+            snprintf(rl, sizeof(rl), "%d. %.180s — %+.1f%% (%.4g vs %.4g), p=%.3g\n     %.300s\n",
+                     ++shown, finds[i].slug, finds[i].effect_pct,
+                     finds[i].best, finds[i].other, finds[i].p, finds[i].detail);
+            sb_append_str(&log, rl);
+        }
+        if (!shown)
+            sb_append_str(&log, "no trajectory produced a SUPPORTED finding.\n");
+        for (int i = 0; i < nfind; i++) {
+            if (finds[i].supported) continue;
+            char rl[256];
+            snprintf(rl, sizeof(rl), "   (not supported) %.180s\n", finds[i].slug);
+            sb_append_str(&log, rl);
+        }
     }
     sb_free(&explored);
     sb_append_str(&log, "\nloop finished.\n");
