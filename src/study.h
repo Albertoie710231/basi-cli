@@ -41,6 +41,12 @@ typedef struct {
     StudyRunStatus status;
     int            exit_code;
     double         seconds;
+    /* A short excerpt of what the command actually printed, kept ONLY for runs
+     * that produced no usable number. Without it the loop debugs blind: it is
+     * told "no-metric rc=0" and cannot tell a wrong flag from a wrong regex from
+     * a command that simply prints nothing. Measured: three unattended rounds
+     * were spent guessing at a CLI whose error message was right there. */
+    char          *sample;
 } StudyRun;
 
 typedef struct {

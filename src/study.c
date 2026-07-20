@@ -687,7 +687,10 @@ char *validate_study_artifact(const char *content, size_t content_len) {
 void study_free(Study *s) {
     if (!s) return;
     free(s->slug); free(s->metric); free(s->extract); free(s->decision_rule);
-    for (int i = 0; i < s->narms; i++) { free(s->arms[i].name); free(s->arms[i].command); }
+    for (int i = 0; i < s->narms; i++) {
+        free(s->arms[i].name); free(s->arms[i].command);
+        for (int j = 0; j < s->arms[i].nruns; j++) free(s->arms[i].runs[j].sample);
+    }
     memset(s, 0, sizeof(*s));
 }
 
@@ -793,6 +796,30 @@ static unsigned long tree_fingerprint(void) {
     return h;
 }
 
+/* Collapse a command's output into one short readable line for the Results
+ * section: strip CR (progress spinners overwrite with them), fold newlines and
+ * runs of blanks, and cap the length. */
+static char *squash_output(const char *out) {
+    if (!out || !*out) return strdup("(no output)");
+    size_t cap = 240;
+    char *o = malloc(cap + 4);
+    size_t n = 0;
+    bool sp = false;
+    for (const char *p = out; *p && n < cap; p++) {
+        unsigned char c = (unsigned char)*p;
+        if (c == '\r' || c == '\n' || c == '\t' || c == ' ') { sp = true; continue; }
+        if (c < 0x20) continue;
+        if (sp && n) o[n++] = ' ';
+        sp = false;
+        if (n < cap) o[n++] = (char)c;
+    }
+    while (n && o[n-1] == ' ') n--;
+    o[n] = '\0';
+    if (!n) { free(o); return strdup("(no output)"); }
+    if (strlen(out) > cap) { memcpy(o + (n > 3 ? n - 3 : 0), "...", 3); }
+    return o;
+}
+
 void study_execute(Study *s, StudyProgressFn progress, void *ud) {
     regex_t re;
     if (regcomp(&re, s->extract, REG_EXTENDED) != 0) return;  /* validated already */
@@ -844,6 +871,9 @@ void study_execute(Study *s, StudyProgressFn progress, void *ud) {
                 } else {
                     r->status = RUN_NO_METRIC;
                 }
+                /* Keep what it printed when there is no number to report, so the
+                 * next round can see WHY instead of guessing at the CLI. */
+                if (r->status != RUN_OK) r->sample = squash_output(outp);
             }
             free(outp);
             if (progress) progress(arm->name, i + 1, s->runs, ud);
@@ -1059,6 +1089,27 @@ static char *render_results(const Study *s) {
             sb_append_str(&b, line);
         }
         sb_append_char(&b, '\n');
+    }
+
+    /* For every arm that produced no usable number, show what the command
+     * actually printed. A verdict of "0 valid runs" is not actionable on its
+     * own — measured: three unattended rounds guessing at a CLI whose error
+     * message was sitting in the discarded output. */
+    bool any_diag = false;
+    for (int i = 0; i < s->narms; i++) {
+        const StudyArm *a = &s->arms[i];
+        for (int j = 0; j < a->nruns; j++) {
+            if (a->runs[j].status == RUN_OK || !a->runs[j].sample) continue;
+            if (!any_diag) {
+                sb_append_str(&b, "\nWhat the failing commands printed "
+                                  "(first failure per arm — fix the command or the extract regex):\n\n");
+                any_diag = true;
+            }
+            snprintf(line, sizeof(line), "- %s [%s]: %s\n",
+                     a->name, run_status_name(a->runs[j].status), a->runs[j].sample);
+            sb_append_str(&b, line);
+            break;   /* one per arm is enough; they repeat */
+        }
     }
     sb_append_char(&b, '\n');
     return sb_to_str(&b);
