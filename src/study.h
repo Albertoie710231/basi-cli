@@ -48,6 +48,11 @@ typedef struct {
     char     *command;                 /* shell command to execute */
     StudyRun  runs[STUDY_MAX_RUNS];
     int       nruns;                   /* runs attempted */
+    /* Fingerprint of the working tree taken just before this arm's first run.
+     * Arms execute sequentially, so an arm that edits the code under test
+     * silently changes what every LATER arm measures. Comparing fingerprints
+     * across arms catches that; see study_execute(). */
+    unsigned long tree_hash;
 } StudyArm;
 
 typedef struct {

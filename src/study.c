@@ -748,6 +748,51 @@ static bool extract_metric(const regex_t *re, const char *text, double *out) {
     return found;
 }
 
+/* SOURCE files only. A benchmark legitimately writes scratch state, logs,
+ * objects and binaries while it runs; hashing those flags every honest study as
+ * contaminated (measured: it turned all four regression fixtures INCONCLUSIVE,
+ * because their harness keeps a counter file). What must not change between
+ * arms is the CODE under test, so only source extensions are fingerprinted. */
+static bool is_source_file(const char *name) {
+    const char *dot = strrchr(name, '.');
+    if (!dot) return false;
+    static const char *ext[] = { ".c", ".h", ".cpp", ".cc", ".cxx", ".hpp", ".hh",
+                                 ".py", ".rs", ".go", ".js", ".ts", ".java", ".sh",
+                                 ".cl", ".cu", ".glsl", ".comp", ".m", ".swift", NULL };
+    for (const char **e = ext; *e; e++) if (strcmp(dot, *e) == 0) return true;
+    return false;
+}
+
+/* Fingerprint the source tree: each source file's path, size and mtime folded
+ * into one number. Cheap, and enough to notice that an arm rewrote the code
+ * under test. .basi/ is skipped because the runner itself writes there. */
+static void tree_hash_walk(const char *dir, unsigned long *h, int depth) {
+    if (depth > 4) return;
+    DIR *d = opendir(dir);
+    if (!d) return;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        if (e->d_name[0] == '.') continue;         /* skips .basi, .git, dotfiles */
+        char path[2048];
+        if ((size_t)snprintf(path, sizeof(path), "%s/%s", dir, e->d_name) >= sizeof(path)) continue;
+        struct stat st;
+        if (stat(path, &st) != 0) continue;
+        if (S_ISDIR(st.st_mode)) { tree_hash_walk(path, h, depth + 1); continue; }
+        if (!S_ISREG(st.st_mode)) continue;
+        if (!is_source_file(e->d_name)) continue;
+        for (const char *p = e->d_name; *p; p++) *h = *h * 131u + (unsigned char)*p;
+        *h = *h * 1000003u + (unsigned long)st.st_size;
+        *h = *h * 1000003u + (unsigned long)st.st_mtime;
+    }
+    closedir(d);
+}
+
+static unsigned long tree_fingerprint(void) {
+    unsigned long h = 1469598103u;
+    tree_hash_walk(".", &h, 0);
+    return h;
+}
+
 void study_execute(Study *s, StudyProgressFn progress, void *ud) {
     regex_t re;
     if (regcomp(&re, s->extract, REG_EXTENDED) != 0) return;  /* validated already */
@@ -755,6 +800,7 @@ void study_execute(Study *s, StudyProgressFn progress, void *ud) {
     for (int a = 0; a < s->narms; a++) {
         StudyArm *arm = &s->arms[a];
         arm->nruns = 0;
+        arm->tree_hash = tree_fingerprint();
         for (int i = 0; i < s->runs && i < STUDY_MAX_RUNS; i++) {
             /* Wrap so we learn the exit status through a stdout-only channel:
              * run_command_timeout merges stderr and does not report it. */
@@ -844,6 +890,24 @@ StudyVerdict study_decide(const Study *s, char **detail) {
 
     bool insufficient = false;
     char reason[256] = {0};
+
+    /* Arms run one after another, so an arm that rewrites the code under test
+     * changes what every later arm measures — and the comparison is then between
+     * two states of the world, not two configurations. Observed for real: a
+     * baseline arm ran `cp work.c.bak work.c`, restoring the unoptimised file
+     * before the "optimised" arm ran, so both arms measured the SAME slow code.
+     * It came back REFUTED on contaminated data and a genuine 11.9x improvement
+     * was reverted, with a confident and entirely wrong explanation attached. */
+    for (int i = 1; i < s->narms; i++) {
+        if (s->arms[i].tree_hash != s->arms[0].tree_hash) {
+            snprintf(reason, sizeof(reason),
+                "the working tree CHANGED between arm '%s' and arm '%s' — an arm modified "
+                "the files under test, so the arms did not measure the same code",
+                s->arms[0].name, s->arms[i].name);
+            insufficient = true;
+            break;
+        }
+    }
 
     for (int i = 0; i < 2; i++) {
         if (ops[i]->is_const) { vals[i] = ops[i]->constant; continue; }
