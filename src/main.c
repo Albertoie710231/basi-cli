@@ -2532,6 +2532,9 @@ static void handle_slash_command(char *user_input,
                     "  /premortem            (drafting only) enter premortem — model rewrites the plan with a ## Pre-mortem section\n"
                     "  /deepsearch <question>\n"
                     "                        multi-round deep research (web + knowledge base), synthesized + cited\n"
+                    "  /study <question>     settle a question by MEASUREMENT: designs experiments, runs them,\n"
+                    "                        and reports verdicts computed from the numbers (not argued).\n"
+                    "                        BASI_STUDY_TRAJECTORIES=N explores N different angles; BASI_STUDY_ROUNDS=N\n"
                     "  /model [name]         switch model (no arg: picker; name: match; keeps your chat)\n"
                     "  /cookbook [sub]       download & manage models (list | search | get <repo> | rm)\n"
                     "\n"
@@ -2733,6 +2736,49 @@ static void handle_slash_command(char *user_input,
             }
             /* /model is intercepted in the REPL loop (it re-execs), so it never
                reaches here. */
+            /* /study <question> — the discovery loop, in the session. Designs its
+             * own experiments, runs them, and reports verdicts COMPUTED from the
+             * measurements. Commands it may run come from --allow equivalents in
+             * the session: the model already has bash here, so the allowlist adds
+             * no safety, but the loop still refuses to invent commands outside
+             * what the question names. */
+            if (strncmp(user_input, "/study", 6) == 0 &&
+                (user_input[6] == '\0' || user_input[6] == ' ')) {
+                const char *q = user_input + 6;
+                while (*q == ' ') q++;
+                if (!*q) {
+                    printf("\033[31m[/study: needs a question. Usage: /study <question to settle by measurement>]\033[0m\n");
+                    printf("\033[90m  e.g. /study which zstd level compresses fastest on this machine\033[0m\n");
+                    fflush(stdout);
+                    free(user_input);
+                    return;
+                }
+                char *q_copy = strdup(q);
+                StudyLoopOpts so = { .max_rounds = 3, .port = basi_srv_port,
+                                     .unsafe = true, .question = q_copy,
+                                     .allow = NULL, .trajectories = 1 };
+                { const char *e = getenv("BASI_STUDY_TRAJECTORIES"); if (e && *e) so.trajectories = atoi(e); }
+                { const char *e = getenv("BASI_STUDY_ROUNDS");       if (e && *e) so.max_rounds   = atoi(e); }
+                if (so.trajectories < 1) so.trajectories = 1;
+
+                char slug[128];
+                snprintf(slug, sizeof(slug), "session-study-%d", (int)(time(NULL) % 100000));
+                printf("\033[90m[/study] %d trajectory(ies), up to %d rounds each — verdicts are computed, not argued\033[0m\n",
+                       so.trajectories, so.max_rounds);
+                fflush(stdout);
+
+                char *report = study_loop(slug, &so);
+                printf("\n%s\n", report ? report : "(no result)");
+                fflush(stdout);
+                ADD_MESSAGE("user", q_copy);
+                ADD_MESSAGE("assistant", report ? report : "(no result)");
+                kv_resync_full(prev_len_p);
+                free(q_copy);
+                free(report);
+                free(user_input);
+                return;
+            }
+
             if (strncmp(user_input, "/deepsearch", 11) == 0 &&
                 (user_input[11] == '\0' || user_input[11] == ' ')) {
                 const char *q = user_input + 11;
