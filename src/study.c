@@ -1754,13 +1754,118 @@ static char *propose_artifact(const StudyLoopOpts *opts, const char *user_msg,
     return out;
 }
 
+/* ── Ranking across trajectories ────────────────────────────────────────
+ * ROBIN closes with Bradley-Terry-Luce over pairwise LLM preferences, because
+ * it cannot run its experiments — model opinion is the only signal it has. Here
+ * every finding already carries measured numbers and a p-value, so the ranking
+ * is arithmetic over those instead: effect size, with significance as the gate.
+ * The ordering is not something the model can argue with. */
+typedef struct {
+    char   slug[192];
+    bool   supported;
+    bool   measured;     /* both arms produced numbers — a real negative counts */
+    double effect_pct;   /* |better - worse| / worse * 100 */
+    double p;
+    double best, other;
+    char   verdict[32];  /* SUPPORTED / REFUTED / INCONCLUSIVE */
+    char   what[320];    /* what the arms actually differed by */
+    char   detail[320];
+} TrajFinding;
+
+/* Pull the executed numbers back out of a completed artifact. */
+static bool summarize_study(const char *slug, TrajFinding *out) {
+    memset(out, 0, sizeof(*out));
+    snprintf(out->slug, sizeof(out->slug), "%s", slug ? slug : "?");
+    char *path = study_path(slug);
+    size_t len = 0;
+    char *c = path ? kb_read_file(path, &len) : NULL;
+    free(path);
+    if (!c) return false;
+
+    out->supported = strstr(c, "**SUPPORTED**") != NULL;
+
+    const char *pp = strstr(c, "\np: ");
+    if (pp) out->p = strtod(pp + 4, NULL);
+
+    /* "substituted: mean(B) = 75.49 > mean(A) = 74.31" */
+    const char *sub = strstr(c, "substituted: ");
+    if (sub) {
+        const char *e = strchr(sub, '\n');
+        size_t n = e ? (size_t)(e - sub) : strlen(sub);
+        if (n >= sizeof(out->detail)) n = sizeof(out->detail) - 1;
+        memcpy(out->detail, sub, n);
+        out->detail[n] = '\0';
+
+        double v[4]; int nv = 0;
+        for (const char *q = sub; q < sub + n && nv < 4; q++) {
+            if (*q == '=' ) {
+                char *end = NULL;
+                double d = strtod(q + 1, &end);
+                if (end != q + 1) { v[nv++] = d; q = end - 1; }
+            }
+        }
+        if (nv >= 2) {
+            double a = v[0], b = v[1];
+            out->best  = a > b ? a : b;
+            out->other = a > b ? b : a;
+            out->measured = true;
+            if (out->other != 0.0)
+                out->effect_pct = (out->best - out->other) / out->other * 100.0;
+        }
+    }
+
+    snprintf(out->verdict, sizeof(out->verdict), "%s",
+             out->supported                      ? "SUPPORTED"
+           : strstr(c, "**REFUTED**")            ? "REFUTED"
+                                                 : "INCONCLUSIVE");
+
+    /* What the arms actually differed by. A finding nobody can read is not a
+     * finding: reporting only a slug and "not supported" hides the entire
+     * content of a negative result. */
+    KbFrontmatter fm;
+    if (kb_parse_frontmatter(c, len, &fm) >= 0) {
+        StudyArm arms[STUDY_MAX_ARMS];
+        char *aerr = NULL;
+        int n = study_parse_arms(c + fm.body_offset, len - fm.body_offset,
+                                 arms, STUDY_MAX_ARMS, &aerr);
+        /* Strip the common prefix so only the distinguishing tail remains. */
+        size_t common = 0;
+        if (n >= 2) {
+            while (arms[0].command[common] && arms[1].command[common] &&
+                   arms[0].command[common] == arms[1].command[common]) common++;
+            while (common > 0 && arms[0].command[common - 1] != ' ') common--;
+        }
+        size_t used = 0;
+        for (int i = 0; i < n && used + 8 < sizeof(out->what); i++) {
+            const char *tailp = arms[i].command + (strlen(arms[i].command) > common ? common : 0);
+            int w = snprintf(out->what + used, sizeof(out->what) - used,
+                             "%s%s=[%.90s]", used ? "  " : "", arms[i].name,
+                             *tailp ? tailp : "(same)");
+            if (w > 0) used += (size_t)w;
+        }
+        for (int i = 0; i < n; i++) { free(arms[i].name); free(arms[i].command); }
+        free(aerr);
+        kb_fm_free(&fm);
+    }
+    free(c);
+    return true;
+}
+
+static int cmp_finding(const void *x, const void *y) {
+    const TrajFinding *a = x, *b = y;
+    if (a->supported != b->supported) return a->supported ? -1 : 1;  /* supported first */
+    if (a->effect_pct < b->effect_pct) return 1;                     /* bigger effect first */
+    if (a->effect_pct > b->effect_pct) return -1;
+    return 0;
+}
 /* One trajectory: seed a study (optionally from a question), then chain rounds
  * off each computed verdict until STOP or the round budget. `explored` (may be
  * NULL) lists what EARLIER trajectories already covered, so this one is pushed
  * somewhere else. Appends its own one-line finding to `finding` if non-NULL. */
 static char *study_trajectory(const char *seed_slug, const StudyLoopOpts *opts,
                               const char *explored, StringBuf *finding,
-                              char **final_slug) {
+                              char **final_slug,
+                              TrajFinding *finds, int *nfind, int maxfind) {
     StringBuf log;
     sb_init(&log);
     char line[1024];
@@ -1880,6 +1985,11 @@ static char *study_trajectory(const char *seed_slug, const StudyLoopOpts *opts,
         /* 1. Execute. Deterministic: this is where the loop touches ground. */
         char *report = study_run_slug(cur_slug, cli_progress, NULL);
         free(last_done_slug); last_done_slug = strdup(cur_slug);
+        /* Record EVERY round, not just the last. A trajectory's earlier rounds
+         * carry real results — "this knob does nothing" is a finding — and
+         * reporting only the final one threw them away. */
+        if (finds && nfind && *nfind < maxfind &&
+            summarize_study(cur_slug, &finds[*nfind])) (*nfind)++;
         sb_append_str(&log, report);
 
         char *path = study_path(cur_slug);
@@ -2030,72 +2140,6 @@ static char *study_trajectory(const char *seed_slug, const StudyLoopOpts *opts,
     return sb_to_str(&log);
 }
 
-/* ── Ranking across trajectories ────────────────────────────────────────
- * ROBIN closes with Bradley-Terry-Luce over pairwise LLM preferences, because
- * it cannot run its experiments — model opinion is the only signal it has. Here
- * every finding already carries measured numbers and a p-value, so the ranking
- * is arithmetic over those instead: effect size, with significance as the gate.
- * The ordering is not something the model can argue with. */
-typedef struct {
-    char   slug[192];
-    bool   supported;
-    double effect_pct;   /* |better - worse| / worse * 100 */
-    double p;
-    double best, other;
-    char   detail[320];
-} TrajFinding;
-
-/* Pull the executed numbers back out of a completed artifact. */
-static bool summarize_study(const char *slug, TrajFinding *out) {
-    memset(out, 0, sizeof(*out));
-    snprintf(out->slug, sizeof(out->slug), "%s", slug ? slug : "?");
-    char *path = study_path(slug);
-    size_t len = 0;
-    char *c = path ? kb_read_file(path, &len) : NULL;
-    free(path);
-    if (!c) return false;
-
-    out->supported = strstr(c, "**SUPPORTED**") != NULL;
-
-    const char *pp = strstr(c, "\np: ");
-    if (pp) out->p = strtod(pp + 4, NULL);
-
-    /* "substituted: mean(B) = 75.49 > mean(A) = 74.31" */
-    const char *sub = strstr(c, "substituted: ");
-    if (sub) {
-        const char *e = strchr(sub, '\n');
-        size_t n = e ? (size_t)(e - sub) : strlen(sub);
-        if (n >= sizeof(out->detail)) n = sizeof(out->detail) - 1;
-        memcpy(out->detail, sub, n);
-        out->detail[n] = '\0';
-
-        double v[4]; int nv = 0;
-        for (const char *q = sub; q < sub + n && nv < 4; q++) {
-            if (*q == '=' ) {
-                char *end = NULL;
-                double d = strtod(q + 1, &end);
-                if (end != q + 1) { v[nv++] = d; q = end - 1; }
-            }
-        }
-        if (nv >= 2) {
-            double a = v[0], b = v[1];
-            out->best  = a > b ? a : b;
-            out->other = a > b ? b : a;
-            if (out->other != 0.0)
-                out->effect_pct = (out->best - out->other) / out->other * 100.0;
-        }
-    }
-    free(c);
-    return true;
-}
-
-static int cmp_finding(const void *x, const void *y) {
-    const TrajFinding *a = x, *b = y;
-    if (a->supported != b->supported) return a->supported ? -1 : 1;  /* supported first */
-    if (a->effect_pct < b->effect_pct) return 1;                     /* bigger effect first */
-    if (a->effect_pct > b->effect_pct) return -1;
-    return 0;
-}
 
 char *study_loop(const char *seed_slug, const StudyLoopOpts *opts) {
     int ntraj = opts->trajectories > 0 ? opts->trajectories : 1;
@@ -2122,10 +2166,10 @@ char *study_loop(const char *seed_slug, const StudyLoopOpts *opts) {
         char *done = NULL;
         char *sub = study_trajectory(tslug, opts,
                                      explored.len ? explored.data : NULL,
-                                     &finding, &done);
+                                     &finding, &done,
+                                     finds, &nfind, (int)(sizeof(finds)/sizeof(finds[0])));
         sb_append_str(&log, sub ? sub : "");
         free(sub);
-        if (done && nfind < 20 && summarize_study(done, &finds[nfind])) nfind++;
         free(done);
 
         if (finding.len) {
@@ -2148,21 +2192,30 @@ char *study_loop(const char *seed_slug, const StudyLoopOpts *opts) {
     if (nfind > 1) {
         qsort(finds, (size_t)nfind, sizeof(finds[0]), cmp_finding);
         sb_append_str(&log, "\n════ findings, ranked by measured effect ════\n\n");
+        char rl[1200];
         int shown = 0;
         for (int i = 0; i < nfind; i++) {
             if (!finds[i].supported) continue;
-            char rl[900];
-            snprintf(rl, sizeof(rl), "%d. %.180s — %+.1f%% (%.4g vs %.4g), p=%.3g\n     %.300s\n",
-                     ++shown, finds[i].slug, finds[i].effect_pct,
-                     finds[i].best, finds[i].other, finds[i].p, finds[i].detail);
+            snprintf(rl, sizeof(rl), "%d. WORKS  %+.1f%%  (%.4g vs %.4g, p=%.3g)\n"
+                                     "     tested: %.300s\n     %.180s\n",
+                     ++shown, finds[i].effect_pct, finds[i].best, finds[i].other,
+                     finds[i].p, finds[i].what, finds[i].slug);
             sb_append_str(&log, rl);
         }
         if (!shown)
-            sb_append_str(&log, "no trajectory produced a SUPPORTED finding.\n");
+            sb_append_str(&log, "Nothing beat the baseline. The measured negatives:\n\n");
+
+        /* Negative results are results. A knob that provably does nothing is
+         * worth as much as one that works — it stops the next person retrying
+         * it — so report what was tested and the numbers, not just a slug. */
         for (int i = 0; i < nfind; i++) {
             if (finds[i].supported) continue;
-            char rl[256];
-            snprintf(rl, sizeof(rl), "   (not supported) %.180s\n", finds[i].slug);
+            if (finds[i].measured)
+                snprintf(rl, sizeof(rl), "   %-12s no gain (%.4g vs %.4g)\n     tested: %.300s\n",
+                         finds[i].verdict, finds[i].best, finds[i].other, finds[i].what);
+            else
+                snprintf(rl, sizeof(rl), "   %-12s no usable measurement\n     tested: %.300s\n",
+                         finds[i].verdict, finds[i].what);
             sb_append_str(&log, rl);
         }
     }
