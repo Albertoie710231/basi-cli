@@ -13,6 +13,7 @@
 #include "util.h"
 #include "kb.h"
 #include "srvchat.h"
+#include "memory.h"
 #include "study.h"
 
 static void cli_progress(const char *arm, int run, int of, void *ud);
@@ -1581,6 +1582,34 @@ static char *propose_artifact(const StudyLoopOpts *opts, const char *user_msg,
         Msgs m;
         msgs_init(&m);
         msgs_add(&m, "system", LOOP_SYSTEM_PROMPT);
+
+        /* Prior rounds, pulled from BASI's retrieval memory rather than carried
+         * in the prompt. Without this the loop is amnesiac: each round sees only
+         * the round before it, so it re-proposes approaches that already failed
+         * — measured, four rounds against llama-bench failing the same way with
+         * no record that the previous three had. Retrieval keeps the prompt
+         * BOUNDED while history grows, which is what lets the loop run
+         * indefinitely instead of until the context fills. */
+        if (mem_count() > 0) {
+            char *hits[6]; float sc[6];
+            int nh = mem_retrieve(user_msg, 6, 0.25f, hits, sc);
+            if (nh > 0) {
+                StringBuf hb;
+                sb_init(&hb);
+                sb_append_str(&hb, "Earlier rounds of this investigation (most relevant first). "
+                                   "Do NOT repeat an approach that already failed here — either "
+                                   "fix what broke it or test something else:\n\n");
+                for (int h = 0; h < nh; h++) {
+                    sb_append_str(&hb, hits[h]);
+                    sb_append_char(&hb, '\n');
+                    free(hits[h]);
+                }
+                char *hs = sb_to_str(&hb);
+                msgs_add(&m, "user", hs);
+                free(hs);
+            }
+        }
+
         msgs_add(&m, "user", user_msg);
         if (prev_reply && feedback) {
             msgs_add(&m, "assistant", prev_reply);
@@ -1778,7 +1807,10 @@ char *study_loop(const char *seed_slug, const StudyLoopOpts *opts) {
             "Pass --unsafe to run without one.\n");
     }
 
-    for (int round = 1; round <= opts->max_rounds; round++) {
+    /* max_rounds <= 0 means run until the model says STOP or something breaks.
+     * Safe now that history lives in retrieval memory rather than the prompt:
+     * the context per round is bounded, so nothing grows without limit. */
+    for (int round = 1; opts->max_rounds <= 0 || round <= opts->max_rounds; round++) {
         snprintf(line, sizeof(line),
                  "\n══ round %d/%d — study '%s' ══\n", round, opts->max_rounds, cur_slug);
         sb_append_str(&log, line);
@@ -1791,12 +1823,54 @@ char *study_loop(const char *seed_slug, const StudyLoopOpts *opts) {
         char *path = study_path(cur_slug);
         size_t len = 0;
         char *content = path ? kb_read_file(path, &len) : NULL;
+
+        /* Record what this round tried and what came of it, so later rounds can
+         * retrieve it instead of rediscovering it. Compact on purpose: the
+         * hypothesis, the exact arm commands, and the computed verdict line —
+         * that is what a future round needs in order not to repeat this one. */
+        if (content) {
+            StringBuf rec;
+            sb_init(&rec);
+            snprintf(line, sizeof(line), "Round %d — study '%s'\n", round, cur_slug);
+            sb_append_str(&rec, line);
+            size_t hl = 0;
+            const char *hyp = study_section(content, len, "Hypothesis", &hl);
+            if (hyp && hl) {
+                char *h = trim_dup(hyp, hl > 400 ? 400 : hl);
+                sb_append_str(&rec, "hypothesis: "); sb_append_str(&rec, h);
+                sb_append_char(&rec, '\n'); free(h);
+            }
+            StudyArm ra[STUDY_MAX_ARMS];
+            char *rerr = NULL;
+            KbFrontmatter rfm;
+            if (kb_parse_frontmatter(content, len, &rfm) >= 0) {
+                int rn = study_parse_arms(content + rfm.body_offset, len - rfm.body_offset,
+                                          ra, STUDY_MAX_ARMS, &rerr);
+                for (int i = 0; i < rn; i++) {
+                    snprintf(line, sizeof(line), "arm %s: %.200s\n", ra[i].name, ra[i].command);
+                    sb_append_str(&rec, line);
+                    free(ra[i].name); free(ra[i].command);
+                }
+                free(rerr);
+                kb_fm_free(&rfm);
+            }
+            const char *v = strstr(content, "verdict: ");
+            if (v) {
+                const char *ve = strchr(v, '\n');
+                char *vs = trim_dup(v, ve ? (size_t)(ve - v) : strlen(v));
+                sb_append_str(&rec, vs); sb_append_char(&rec, '\n');
+                free(vs);
+            }
+            char *recs = sb_to_str(&rec);
+            mem_add(recs);
+            free(recs);
+        }
         if (!content) {
             sb_append_str(&log, "loop: cannot re-read the artifact; stopping.\n");
             free(report); free(path); break;
         }
 
-        if (round == opts->max_rounds) {
+        if (opts->max_rounds > 0 && round == opts->max_rounds) {
             sb_append_str(&log, "\nloop: round budget exhausted.\n");
             free(report); free(content); free(path);
             break;
@@ -1931,8 +2005,8 @@ int cmd_study(int argc, char **argv) {
             else if (strcmp(argv[i], "--unsafe") == 0)                o.unsafe = true;
             else { fprintf(stderr, "study loop: unknown option '%s'\n", argv[i]); return 2; }
         }
-        if (o.max_rounds < 1 || o.max_rounds > 100) {
-            fprintf(stderr, "study loop: --max-rounds must be 1..100\n");
+        if (o.max_rounds < 0 || o.max_rounds > 1000) {
+            fprintf(stderr, "study loop: --max-rounds must be 0..1000 (0 = until STOP)\n");
             return 2;
         }
         char hc[192];
