@@ -182,6 +182,28 @@ static int study_parse_arms(const char *body, size_t body_len,
                         if (err) *err = m;
                         return -1;
                     }
+                    /* Two arms running the SAME command is not an experiment, it
+                     * is one measurement taken twice, and the difference between
+                     * them is pure noise. Observed for real: a model edited the
+                     * file under test, pointed both arms at the same build-and-run
+                     * script, and reported the 1.3% gap between two runs of the
+                     * IDENTICAL binary as a win — while the change it had actually
+                     * made was worth 11.9x. Nothing downstream can detect this, so
+                     * it has to die here. */
+                    if (strcmp(arms[i].command, arms[n].command) == 0) {
+                        char *m = malloc(512);
+                        snprintf(m, 512,
+                            "- arms '%s' and '%s' run the SAME command, so they measure the same "
+                            "thing and their difference is only noise. Each arm must run a "
+                            "DIFFERENT configuration. If you are comparing a change against a "
+                            "baseline, the arms must select between them (a flag, an env var, or "
+                            "separate build outputs) — editing the file in place leaves no "
+                            "baseline to measure.\n",
+                            arms[i].name, arms[n].name);
+                        free(arms[n].name); free(arms[n].command);
+                        if (err) *err = m;
+                        return -1;
+                    }
                 }
                 n++;
                 /* Resume after the closing fence line. */
@@ -625,6 +647,16 @@ char *validate_study_artifact(const char *content, size_t content_len) {
             char buf[384];
             snprintf(buf, sizeof(buf), "- decision_rule invalid: %s\n", rerr);
             sb_append_str(&errs, buf);
+        } else if (!r.has_p && !r.lhs.is_const && !r.rhs.is_const) {
+            /* Comparing two arms without a significance clause lets any noise
+             * gap pass as a win — measured: a 1.3% difference between two runs
+             * of the SAME binary was reported as SUPPORTED. A threshold rule
+             * against a constant is exempt; arm-vs-arm is not. */
+            sb_append_str(&errs,
+                "- decision_rule compares two arms but pre-registers no significance clause. "
+                "Append 'and p < 0.05' (or your chosen threshold). Without it, a difference "
+                "indistinguishable from noise counts as a win — which is how a 1.3% gap between "
+                "two runs of the same binary once passed as an improvement.\n");
         } else if (narms > 0) {
             const ROperand *ops[2] = { &r.lhs, &r.rhs };
             for (int i = 0; i < 2; i++) {
