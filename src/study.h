@@ -160,6 +160,17 @@ typedef struct {
      * trajectory stops at its first success — measured, one found flash attention
      * worth +1.5% and halted without touching batch size, threads or offload. */
     int trajectories;       /* <=1 = single chain */
+
+    /* Dispatch the trajectories CONCURRENTLY (fork one child per trajectory, in
+     * waves) instead of one after another, so their /v1/chat/completions
+     * requests are in flight together and the server batches them across its
+     * parallel KV slots. Requires the launch script to carry `-np N
+     * --kv-unified` or the requests serialise onto fewer slots. Only sound when
+     * the arms are write-isolated by construction — concurrent arms in the same
+     * working directory can corrupt each other's measurement. See
+     * study_loop_concurrent() for the full set of trade-offs. Ignored unless
+     * trajectories > 1. */
+    bool concurrent;
 } StudyLoopOpts;
 
 /* seed_slug names an existing artifact, or is the slug to CREATE when

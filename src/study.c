@@ -9,11 +9,14 @@
 #include <time.h>
 #include <dirent.h>
 #include <sys/stat.h>
+#include <unistd.h>
+#include <sys/wait.h>
 
 #include "util.h"
 #include "kb.h"
 #include "srvchat.h"
 #include "memory.h"
+#include "embed.h"    /* embed_init — spawn the shared embedder before forking */
 #include "study.h"
 
 static void cli_progress(const char *arm, int run, int of, void *ud);
@@ -2141,8 +2144,273 @@ static char *study_trajectory(const char *seed_slug, const StudyLoopOpts *opts,
 }
 
 
+/* Shared final synthesis for both the serial and concurrent trajectory paths:
+ * order findings by measured effect (supported first, largest effect first) and
+ * report the measured negatives too. Nothing here is a judgement call — the
+ * ordering is arithmetic over the numbers, see cmp_finding. */
+static void study_rank_synthesis(StringBuf *log, TrajFinding *finds, int nfind) {
+    if (nfind <= 1) return;
+    qsort(finds, (size_t)nfind, sizeof(finds[0]), cmp_finding);
+    sb_append_str(log, "\n════ findings, ranked by measured effect ════\n\n");
+    char rl[1200];
+    int shown = 0;
+    for (int i = 0; i < nfind; i++) {
+        if (!finds[i].supported) continue;
+        snprintf(rl, sizeof(rl), "%d. WORKS  %+.1f%%  (%.4g vs %.4g, p=%.3g)\n"
+                                 "     tested: %.300s\n     %.180s\n",
+                 ++shown, finds[i].effect_pct, finds[i].best, finds[i].other,
+                 finds[i].p, finds[i].what, finds[i].slug);
+        sb_append_str(log, rl);
+    }
+    if (!shown)
+        sb_append_str(log, "Nothing beat the baseline. The measured negatives:\n\n");
+
+    /* Negative results are results. A knob that provably does nothing is worth
+     * as much as one that works — it stops the next person retrying it — so
+     * report what was tested and the numbers, not just a slug. */
+    for (int i = 0; i < nfind; i++) {
+        if (finds[i].supported) continue;
+        if (finds[i].measured)
+            snprintf(rl, sizeof(rl), "   %-12s no gain (%.4g vs %.4g)\n     tested: %.300s\n",
+                     finds[i].verdict, finds[i].best, finds[i].other, finds[i].what);
+        else
+            snprintf(rl, sizeof(rl), "   %-12s no usable measurement\n     tested: %.300s\n",
+                     finds[i].verdict, finds[i].what);
+        sb_append_str(log, rl);
+    }
+}
+
+/* Children in flight at once. A modest cap: each is a full study (LLM calls plus
+ * shell builds), and the server's KV slots (-np N) are the real ceiling anyway.
+ * More trajectories than this run in sequential waves. */
+#define STUDY_MAX_CONCURRENT 6
+
+/* ── Per-child working-tree isolation ──────────────────────────────────
+ * Concurrent arms run shell commands in the working directory, so two
+ * trajectories that write the same relative path would corrupt each other's
+ * measurement. Each child runs in a private COPY of the working tree instead.
+ *
+ * A copy, deliberately, NOT a `git worktree`: a worktree checks out COMMITTED
+ * state, so it would measure code WITHOUT the uncommitted / untracked changes a
+ * study is usually iterating on — the wrong thing entirely. The copy preserves
+ * the exact tree, and `--reflink=auto` makes it copy-on-write-cheap where the
+ * filesystem supports it. Limitation: only relative-path writes are isolated; an
+ * arm that writes a fixed ABSOLUTE path (e.g. /tmp/out) still collides, so keep
+ * those per-invocation-unique (mktemp). BASI_STUDY_SHARE_CWD=1 opts out when the
+ * arms are already write-isolated by construction. */
+static bool study_isolation_on(void) {
+    const char *e = getenv("BASI_STUDY_SHARE_CWD");
+    return !(e && *e && atoi(e));            /* on by default; env opts out */
+}
+
+/* Copy `cwd`'s tree into `sandbox` (an existing empty dir) and chdir into it.
+ * Returns true on success; on failure the child simply keeps the shared cwd. */
+static bool study_sandbox_enter(const char *cwd, const char *sandbox) {
+    char cmd[8192];
+    /* `./.` copies dotfiles too; reflink where supported, else a plain copy. */
+    snprintf(cmd, sizeof(cmd),
+        "cp -a --reflink=auto '%s/.' '%s/' 2>/dev/null || cp -a '%s/.' '%s/' 2>/dev/null",
+        cwd, sandbox, cwd, sandbox);
+    if (system(cmd) != 0) return false;
+    return chdir(sandbox) == 0;
+}
+
+/* Copy the studies this child produced back into the real cwd so they persist
+ * for inspection, then delete the sandbox. Runs in the parent after the join. */
+static void study_sandbox_leave(const char *sandbox, const char *cwd) {
+    char cmd[8600];
+    snprintf(cmd, sizeof(cmd),
+        "mkdir -p '%s/%s' 2>/dev/null && cp -a '%s/%s/.' '%s/%s/' 2>/dev/null",
+        cwd, KB_STUDIES_DIR, sandbox, KB_STUDIES_DIR, cwd, KB_STUDIES_DIR);
+    (void) system(cmd);
+    snprintf(cmd, sizeof(cmd), "rm -rf '%s'", sandbox);
+    (void) system(cmd);
+}
+
+/* Concurrent trajectory dispatch — the fan-out the serial study_loop cannot do.
+ *
+ * study_loop runs its N trajectories one after another, on purpose: each is
+ * handed a brief of what the earlier ones covered so it explores elsewhere.
+ * That also serialises the LLM work — N trajectories take ~N times as long —
+ * even though one llama-server can decode several sequences at once through its
+ * parallel KV slots (`-np N --kv-unified`) and continuous batching.
+ *
+ * This variant forks one child per trajectory (in waves of STUDY_MAX_CONCURRENT)
+ * so their /v1/chat/completions requests are in flight together and the server
+ * batches them. fork() is the right primitive here, not threads:
+ *   - retrieval memory is an in-process array (memory.c g_chunks); the
+ *     copy-on-write fork gives each child its own view, so mem_add/mem_retrieve
+ *     cannot race and no index can be corrupted.
+ *   - the finds array and every StringBuf are per-child for free.
+ *   - study artifacts do not collide because slugs are per-trajectory (-tN).
+ * Each child ships its findings (a pointer-free POD) and its log back through a
+ * private temp file, and the parent merges and runs the same ranking synthesis.
+ * A temp file rather than a pipe because a multi-round log easily exceeds the
+ * pipe buffer, which would deadlock a child before the parent starts draining.
+ *
+ * WHAT THIS TRADES, stated plainly:
+ *   - Within one wave, trajectories are INDEPENDENT: they cannot see each
+ *     other's ground, so the serial path's "push elsewhere" diversity is only
+ *     enforced ACROSS waves (each wave is handed the prior waves' brief).
+ *   - Arm commands execute in a PRIVATE COPY of the working tree per child
+ *     (study_sandbox_enter), so relative-path writes no longer collide and the
+ *     studies are copied back afterward. Two sharp edges remain: an arm writing a
+ *     fixed ABSOLUTE path still collides (keep those mktemp-unique), and the copy
+ *     costs one working-tree copy per child (reflink-cheap where supported;
+ *     BASI_STUDY_SHARE_CWD=1 opts out when arms are already isolated).
+ *   - id_slot is left unset, so the server AUTO-ASSIGNS an idle slot per request.
+ *     Continuous batching load-balances better than static pinning, and a
+ *     crashed child cannot strand a pinned slot. To pin instead, set
+ *     req["id_slot"] in srvchat.cpp's build_request.
+ */
+static char *study_loop_concurrent(const char *seed_slug, const StudyLoopOpts *opts) {
+    int ntraj = opts->trajectories > 0 ? opts->trajectories : 1;
+
+    /* Spawn the retrieval embedder ONCE, here in the parent, so every child
+     * shares that single embedder server over HTTP. Without it, each child's
+     * first mem_retrieve would srvgen_spawn its own embedder — N model loads and
+     * a fight over the port. Best-effort: retrieval degrades gracefully if the
+     * embedder cannot start. */
+    (void) embed_init();
+
+    /* Working directory each child isolates a copy of. A path with a single quote
+     * would break the shell copy commands, so fall back to sharing it (rare). */
+    char cwdbuf[4096];
+    if (!getcwd(cwdbuf, sizeof(cwdbuf))) cwdbuf[0] = '\0';
+    bool isolate = study_isolation_on() && cwdbuf[0] && !strchr(cwdbuf, '\'');
+
+    StringBuf log, explored;
+    sb_init(&log);
+    sb_init(&explored);      /* carried across waves, not within one */
+    TrajFinding finds[20];
+    int nfind = 0;
+    const int maxfind = (int)(sizeof(finds) / sizeof(finds[0]));
+
+    {
+        char hdr[512];
+        snprintf(hdr, sizeof(hdr),
+            "\n████ dispatching %d trajectories, up to %d concurrent ████\n"
+            "The server needs `-np %d --kv-unified` or the requests serialise.\n"
+            "Arms run in %s.\n"
+            "Live progress below interleaves across trajectories.\n",
+            ntraj, STUDY_MAX_CONCURRENT,
+            ntraj < STUDY_MAX_CONCURRENT ? ntraj : STUDY_MAX_CONCURRENT,
+            isolate ? "a private copy of the working tree per trajectory"
+                    : "the SHARED working directory (BASI_STUDY_SHARE_CWD) — "
+                      "arms must be write-isolated by construction");
+        sb_append_str(&log, hdr);
+        fputs(hdr, stderr);
+    }
+
+    for (int base = 0; base < ntraj; base += STUDY_MAX_CONCURRENT) {
+        int wave = ntraj - base;
+        if (wave > STUDY_MAX_CONCURRENT) wave = STUDY_MAX_CONCURRENT;
+
+        pid_t pids[STUDY_MAX_CONCURRENT];
+        char  paths[STUDY_MAX_CONCURRENT][64];
+        char *sandboxes[STUDY_MAX_CONCURRENT] = {0};   /* per-child tree copy, or NULL */
+        /* Snapshot of what earlier waves covered — every child in this wave gets
+         * the same brief, so diversity is enforced wave-to-wave. */
+        char *wave_brief = explored.len ? strdup(explored.data) : NULL;
+
+        for (int k = 0; k < wave; k++) {
+            int t = base + k + 1;
+            pids[k] = -1;
+            paths[k][0] = '\0';
+
+            /* Create the result file in the PARENT so its path is known here; the
+             * forked child inherits nothing but the name and opens it fresh. */
+            snprintf(paths[k], sizeof(paths[k]), "/tmp/basi_study_traj_XXXXXX");
+            int fd = mkstemp(paths[k]);
+            if (fd < 0) { paths[k][0] = '\0'; continue; }
+            close(fd);
+
+            /* Empty sandbox dir, created in the PARENT so the path is known here
+             * for cleanup; the child fills it (concurrently) and chdir's in. */
+            if (isolate) {
+                char tmpl[] = "/tmp/basi-traj-XXXXXX";
+                char *d = mkdtemp(tmpl);
+                if (d) sandboxes[k] = strdup(d);
+            }
+
+            char tslug[192];
+            snprintf(tslug, sizeof(tslug), "%.150s-t%d", seed_slug, t);
+
+            pids[k] = fork();
+            if (pids[k] == 0) {
+                /* ── child: one independent trajectory ── */
+                if (sandboxes[k]) study_sandbox_enter(cwdbuf, sandboxes[k]);
+                TrajFinding cf[20];
+                int cn = 0;
+                StringBuf cfind;
+                sb_init(&cfind);
+                char *clog = study_trajectory(tslug, opts, wave_brief,
+                                              &cfind, NULL,
+                                              cf, &cn, (int)(sizeof(cf)/sizeof(cf[0])));
+                FILE *rf = fopen(paths[k], "wb");
+                if (rf) {
+                    /* frame: [int cn][cn × TrajFinding][int fl][fl brief bytes][log…] */
+                    fwrite(&cn, sizeof(cn), 1, rf);
+                    if (cn > 0) fwrite(cf, sizeof(TrajFinding), (size_t)cn, rf);
+                    int fl = (int)cfind.len;
+                    fwrite(&fl, sizeof(fl), 1, rf);
+                    if (fl > 0) fwrite(cfind.data, 1, (size_t)fl, rf);
+                    if (clog && *clog) fwrite(clog, 1, strlen(clog), rf);
+                    fclose(rf);
+                }
+                _exit(0);   /* _exit, not exit: never run atexit — the embedder is shared */
+            }
+            if (pids[k] < 0) { unlink(paths[k]); paths[k][0] = '\0'; }
+        }
+        free(wave_brief);
+
+        /* ── parent: join and merge, in trajectory order ── */
+        for (int k = 0; k < wave; k++) {
+            if (pids[k] > 0) {
+                waitpid(pids[k], NULL, 0);
+                FILE *rf = paths[k][0] ? fopen(paths[k], "rb") : NULL;
+                if (rf) {
+                    int cn = 0;
+                    if (fread(&cn, sizeof(cn), 1, rf) == 1 && cn >= 0) {
+                        for (int i = 0; i < cn; i++) {
+                            TrajFinding tf;
+                            if (fread(&tf, sizeof(tf), 1, rf) != 1) break;
+                            if (nfind < maxfind) finds[nfind++] = tf;
+                        }
+                        int fl = 0;
+                        if (fread(&fl, sizeof(fl), 1, rf) == 1 && fl > 0) {
+                            char *fb = malloc((size_t)fl);
+                            if (fb && fread(fb, 1, (size_t)fl, rf) == (size_t)fl)
+                                sb_append(&explored, fb, (size_t)fl);
+                            free(fb);
+                        }
+                        char buf[4096];
+                        size_t r;
+                        while ((r = fread(buf, 1, sizeof(buf), rf)) > 0) sb_append(&log, buf, r);
+                    }
+                    fclose(rf);
+                }
+            }
+            if (paths[k][0]) unlink(paths[k]);
+            /* Copy this child's studies back to the real cwd, then drop the copy. */
+            if (sandboxes[k]) {
+                study_sandbox_leave(sandboxes[k], cwdbuf);
+                free(sandboxes[k]);
+                sandboxes[k] = NULL;
+            }
+        }
+    }
+
+    study_rank_synthesis(&log, finds, nfind);
+    sb_free(&explored);
+    sb_append_str(&log, "\nloop finished.\n");
+    return sb_to_str(&log);
+}
+
 char *study_loop(const char *seed_slug, const StudyLoopOpts *opts) {
     int ntraj = opts->trajectories > 0 ? opts->trajectories : 1;
+    if (opts->concurrent && ntraj > 1)
+        return study_loop_concurrent(seed_slug, opts);
     StringBuf log, explored;
     sb_init(&log);
     sb_init(&explored);
@@ -2189,36 +2457,7 @@ char *study_loop(const char *seed_slug, const StudyLoopOpts *opts) {
      * model preference; these carry measured effect sizes and p-values, so they
      * are ordered by those instead — supported findings first, largest effect
      * first. Nothing here is a judgement call. */
-    if (nfind > 1) {
-        qsort(finds, (size_t)nfind, sizeof(finds[0]), cmp_finding);
-        sb_append_str(&log, "\n════ findings, ranked by measured effect ════\n\n");
-        char rl[1200];
-        int shown = 0;
-        for (int i = 0; i < nfind; i++) {
-            if (!finds[i].supported) continue;
-            snprintf(rl, sizeof(rl), "%d. WORKS  %+.1f%%  (%.4g vs %.4g, p=%.3g)\n"
-                                     "     tested: %.300s\n     %.180s\n",
-                     ++shown, finds[i].effect_pct, finds[i].best, finds[i].other,
-                     finds[i].p, finds[i].what, finds[i].slug);
-            sb_append_str(&log, rl);
-        }
-        if (!shown)
-            sb_append_str(&log, "Nothing beat the baseline. The measured negatives:\n\n");
-
-        /* Negative results are results. A knob that provably does nothing is
-         * worth as much as one that works — it stops the next person retrying
-         * it — so report what was tested and the numbers, not just a slug. */
-        for (int i = 0; i < nfind; i++) {
-            if (finds[i].supported) continue;
-            if (finds[i].measured)
-                snprintf(rl, sizeof(rl), "   %-12s no gain (%.4g vs %.4g)\n     tested: %.300s\n",
-                         finds[i].verdict, finds[i].best, finds[i].other, finds[i].what);
-            else
-                snprintf(rl, sizeof(rl), "   %-12s no usable measurement\n     tested: %.300s\n",
-                         finds[i].verdict, finds[i].what);
-            sb_append_str(&log, rl);
-        }
-    }
+    study_rank_synthesis(&log, finds, nfind);
     sb_free(&explored);
     sb_append_str(&log, "\nloop finished.\n");
     return sb_to_str(&log);
@@ -2270,6 +2509,8 @@ int cmd_study(int argc, char **argv) {
             "                study too, so any question can be run end to end\n"
             "                --trajectories N runs N INDEPENDENT explorations, each told\n"
             "                what the others covered so it probes a different dimension\n"
+            "                --concurrent dispatches those trajectories at once against one\n"
+            "                server (needs -np N --kv-unified); see study_loop_concurrent\n"
             "  list         list studies and their status\n"
             "  show <slug>  print the study artifact\n");
         return 2;
@@ -2291,7 +2532,8 @@ int cmd_study(int argc, char **argv) {
     if (strcmp(argv[0], "loop") == 0) {
         if (argc < 2) { fprintf(stderr, "study loop: missing seed slug\n"); return 2; }
         StudyLoopOpts o = { .max_rounds = 5, .port = 8181, .unsafe = false,
-                            .question = NULL, .allow = NULL, .trajectories = 1 };
+                            .question = NULL, .allow = NULL, .trajectories = 1,
+                            .concurrent = false };
         const char *pe = getenv("BASI_SERVER_PORT");
         if (pe && *pe) o.port = atoi(pe);
         for (int i = 2; i < argc; i++) {
@@ -2300,6 +2542,7 @@ int cmd_study(int argc, char **argv) {
             else if (strcmp(argv[i], "--question") == 0 && i + 1 < argc) o.question = argv[++i];
             else if (strcmp(argv[i], "--allow") == 0 && i + 1 < argc)  o.allow = argv[++i];
             else if (strcmp(argv[i], "--trajectories") == 0 && i + 1 < argc) o.trajectories = atoi(argv[++i]);
+            else if (strcmp(argv[i], "--concurrent") == 0)            o.concurrent = true;
             else if (strcmp(argv[i], "--unsafe") == 0)                o.unsafe = true;
             else { fprintf(stderr, "study loop: unknown option '%s'\n", argv[i]); return 2; }
         }
