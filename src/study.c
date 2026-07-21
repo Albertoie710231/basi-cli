@@ -1866,7 +1866,7 @@ static int cmp_finding(const void *x, const void *y) {
  * NULL) lists what EARLIER trajectories already covered, so this one is pushed
  * somewhere else. Appends its own one-line finding to `finding` if non-NULL. */
 static char *study_trajectory(const char *seed_slug, const StudyLoopOpts *opts,
-                              const char *explored, StringBuf *finding,
+                              const char *explored, const char *angle, StringBuf *finding,
                               char **final_slug,
                               TrajFinding *finds, int *nfind, int maxfind) {
     StringBuf log;
@@ -1922,6 +1922,18 @@ static char *study_trajectory(const char *seed_slug, const StudyLoopOpts *opts,
                           "command actually prints, an extract regex that matches it, two arms "
                           "differing in exactly ONE thing, and a decision rule you commit to "
                           "before seeing any data.\n");
+        /* Per-trajectory lens: shapes what THIS investigator looks at first so
+         * independent trajectories spread out instead of all chasing the model's
+         * favourite knob. A bias, not a rule — convergence on real evidence is fine. */
+        if (angle && *angle) {
+            sb_append_str(&u, "\nYOUR INVESTIGATIVE LENS (this shapes what you look at FIRST so "
+                              "independent investigators spread out rather than all testing the same "
+                              "obvious thing; it is a bias, not a rule — follow the evidence, and if "
+                              "it points where another investigator would also look, that convergence "
+                              "is corroboration worth having): ");
+            sb_append_str(&u, angle);
+            sb_append_char(&u, '\n');
+        }
         /* ROBIN generates N *distinct* ideas rather than iterating one — breadth
          * first, then rank. Without this a trajectory re-derives the previous
          * one's finding: the first run here found flash attention worth +1.5%
@@ -2063,6 +2075,11 @@ static char *study_trajectory(const char *seed_slug, const StudyLoopOpts *opts,
                           "measured Results and the computed Verdict:\n\n");
         sb_append(&u, content, len);
         sb_append_str(&u, "\n\nPropose the next study artifact, or reply STOP.\n");
+        if (angle && *angle) {
+            sb_append_str(&u, "\nStay within your investigative lens: ");
+            sb_append_str(&u, angle);
+            sb_append_char(&u, '\n');
+        }
         if (allow && !opts->unsafe) {
             sb_append_str(&u, "\nEvery arm command MUST begin with one of these exact "
                               "prefixes, and may not chain, pipe or redirect: ");
@@ -2184,6 +2201,24 @@ static void study_rank_synthesis(StringBuf *log, TrajFinding *finds, int nfind) 
  * shell builds), and the server's KV slots (-np N) are the real ceiling anyway.
  * More trajectories than this run in sequential waves. */
 #define STUDY_MAX_CONCURRENT 6
+
+/* Per-trajectory investigative lenses. Concurrent trajectories otherwise share one
+ * identical seed prompt and HERD on whatever dimension the model favours — measured
+ * ~1 duplicate per 4 trajectories, p=0.012, all piling onto the same knob. A different
+ * lens per trajectory spreads the search. Crucially these BIAS, they do not FORBID:
+ * two independent lenses that still converge on the same variable are corroborating
+ * it — a signal worth having; mechanical herding on a shared prompt is not. Assigned
+ * by trajectory index in BOTH loops. Domain-general on purpose — the loop investigates
+ * any question in any field. */
+static const char *const STUDY_ANGLES[] = {
+    "Go after the single change you believe has the LARGEST effect on the metric, even if it is the obvious one.",
+    "Investigate a variable the obvious approaches would SKIP — the overlooked, unglamorous, or non-obvious lever.",
+    "Test an INTERACTION or second-order effect — two things together, or a knock-on consequence — not one knob alone.",
+    "Question the BASELINE or a stated ASSUMPTION: is it measured correctly, and does a 'known' fact actually hold here?",
+    "Find the CHEAPEST viable win — the lowest-effort, lowest-risk change that could still move the metric.",
+    "Probe a LIMIT or failure mode: push a variable to its extreme, or test something you expect NOT to help, to rule it out.",
+};
+enum { STUDY_NUM_ANGLES = (int)(sizeof(STUDY_ANGLES) / sizeof(STUDY_ANGLES[0])) };
 
 /* ── Per-child working-tree isolation ──────────────────────────────────
  * Concurrent arms run shell commands in the working directory, so two
@@ -2345,6 +2380,7 @@ static char *study_loop_concurrent(const char *seed_slug, const StudyLoopOpts *o
                 StringBuf cfind;
                 sb_init(&cfind);
                 char *clog = study_trajectory(tslug, opts, wave_brief,
+                                              STUDY_ANGLES[(t - 1) % STUDY_NUM_ANGLES],
                                               &cfind, NULL,
                                               cf, &cn, (int)(sizeof(cf)/sizeof(cf[0])));
                 FILE *rf = fopen(paths[k], "wb");
@@ -2434,6 +2470,7 @@ char *study_loop(const char *seed_slug, const StudyLoopOpts *opts) {
         char *done = NULL;
         char *sub = study_trajectory(tslug, opts,
                                      explored.len ? explored.data : NULL,
+                                     STUDY_ANGLES[(t - 1) % STUDY_NUM_ANGLES],
                                      &finding, &done,
                                      finds, &nfind, (int)(sizeof(finds)/sizeof(finds[0])));
         sb_append_str(&log, sub ? sub : "");
