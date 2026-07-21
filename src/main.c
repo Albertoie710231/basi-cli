@@ -2986,6 +2986,18 @@ static void handle_slash_command(char *user_input,
 #define ELIDE_STUB_PREFIX "[earlier tool output elided to save context"
 #define ELIDE_KEEP_RECENT 4          /* most-recent tool results kept in full */
 
+/* ── Experiment enforcement (opt-in: BASI_FORCE_EXPERIMENT=1) ───────────
+ * A local model on an open optimization task inspects code forever and never
+ * tests a hypothesis — measured: a 40-min kernel run made 0 edits, only re-read
+ * source and re-measured the baseline. The system-prompt rule ("experiment, do
+ * not inspect") was necessary but not sufficient. This is the harness backstop:
+ * after N tool steps with no edit, INJECT a message forcing an edit-then-measure;
+ * and refuse a "final answer" that reports a conclusion with zero experiments run
+ * (bounded, so a genuinely stuck agent still terminates). Off by default so
+ * read-only tasks are never nagged to edit. */
+#define FORCE_EXPERIMENT_AFTER 12    /* no-edit tool steps before a forcing nudge */
+#define MAX_EXPERIMENT_BLOCKS  3     /* times a no-experiment conclusion is rejected */
+
 static char *g_journal_path = NULL;  /* .basi/journal-<pid>.md, created lazily */
 static int   g_journal_seq  = 0;
 
@@ -3128,15 +3140,23 @@ static void run_agentic_turn(char *user_input,
            remaining backstop against a loop that keeps eliding without converging. */
         int elision_resets = 0;
         int max_elision_resets = 12;
+        /* Experiment enforcement — see the FORCE_EXPERIMENT_* block above. */
+        int  edits_made = 0;
+        int  iters_since_edit = 0;
+        int  experiment_blocks = 0;
+        bool force_experiment = false;
         {
             const char *mi = getenv("BASI_MAX_TOOL_ITERS");
             if (mi) { int v = atoi(mi); if (v > 0 && v <= 200) max_tool_iterations = v; }
             const char *mr = getenv("BASI_MAX_ELISION_RESETS");
             if (mr) { int v = atoi(mr); if (v >= 0 && v <= 100) max_elision_resets = v; }
+            const char *fe = getenv("BASI_FORCE_EXPERIMENT");
+            force_experiment = fe && *fe && atoi(fe);
         }
 
         while (tool_iterations < max_tool_iterations) {
             tool_iterations++;
+            iters_since_edit++;   /* reset to 0 whenever an edit tool call lands */
 
             /* Reclaim INSIDE the tool loop too. A long agentic turn is one user
                turn with many tool calls, each appending a result — without an
@@ -3233,6 +3253,8 @@ static void run_agentic_turn(char *user_input,
 
             if (have_call) {
                 consec_parse_fail = 0;         /* parseable call — reset the retry counter */
+                /* An edit tool call is the experiment step the enforcement wants. */
+                if (call_name && strcmp(call_name, "edit") == 0) { edits_made++; iters_since_edit = 0; }
                 if (cmd_str) {                 /* legacy path: build → execute */
                     print_tool_activity_raw(cmd_str);
                     tool_result = execute_tool(cmd_str);
@@ -3312,6 +3334,23 @@ static void run_agentic_turn(char *user_input,
                    re-serializes them next iteration. No re-render needed. */
                 printf("\n");
                 fflush(stdout);
+
+                /* Enforcement: many steps with no edit -> inject a message forcing an
+                   experiment. Fires every FORCE_EXPERIMENT_AFTER no-edit steps, so it
+                   keeps pushing even after an earlier edit if it lapses into inspection. */
+                if (force_experiment &&
+                    iters_since_edit > 0 && iters_since_edit % FORCE_EXPERIMENT_AFTER == 0) {
+                    printf("\033[33m[Enforcement: %d steps without an edit — forcing an experiment]\033[0m\n",
+                           iters_since_edit);
+                    fflush(stdout);
+                    ADD_MESSAGE("user",
+                        "STOP exploring. You have gone many steps without changing anything, and you have the "
+                        "tools to TEST a hypothesis directly. Now, in this order: pick the single most promising "
+                        "change, apply it with the edit tool, run ./rebuild.sh, then ./bench.sh, and compare to "
+                        "the baseline. Do NOT read more code first — edit and measure. If it does not help, revert "
+                        "it (git checkout) and try another. Do not report a conclusion until you have measured at "
+                        "least one real change.");
+                }
             } else {
                 if (ncalls) basi_free_tool_calls(ncalls, n_ncalls);
                 /* Distinguish a genuine final answer from a MALFORMED tool call
@@ -3339,6 +3378,25 @@ static void run_agentic_turn(char *user_input,
                     printf("\n");
                     fflush(stdout);
                     continue;   /* re-serialized from messages next iteration */
+                }
+                /* Enforcement: refuse a conclusion reached with zero experiments run,
+                   up to MAX_EXPERIMENT_BLOCKS times, then let it finish so a genuinely
+                   stuck agent still terminates. */
+                if (force_experiment && edits_made == 0 &&
+                    experiment_blocks < MAX_EXPERIMENT_BLOCKS &&
+                    tool_iterations < max_tool_iterations) {
+                    experiment_blocks++;
+                    printf("\033[33m[Enforcement: conclusion rejected — 0 experiments run (%d/%d)]\033[0m\n",
+                           experiment_blocks, MAX_EXPERIMENT_BLOCKS);
+                    fflush(stdout);
+                    ADD_MESSAGE("assistant", result.text);
+                    ADD_MESSAGE("user",
+                        "You are concluding without having run a single experiment. Reading code is not enough — "
+                        "you have the tools to verify this empirically. Before you may finish: make ONE concrete "
+                        "change with the edit tool, run ./rebuild.sh, and ./bench.sh it against the baseline. If it "
+                        "does not help, revert it and report the measured before/after. Do that now.");
+                    free(result.text);
+                    continue;
                 }
                 /* genuine final answer (or gave up after repeated parse failures) */
                 ADD_MESSAGE("assistant", result.text);
