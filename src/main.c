@@ -182,6 +182,7 @@ static const char *SYSTEM_PROMPT_NATIVE =
     "- You MUST read a file (read/head/grep) before you edit it.\n"
     "- To change a file, call edit with the exact current text in 'search' and the new text in 'replace'. Do not re-read the file after a successful edit.\n"
     "- After a tool returns, base your answer on its ACTUAL output; never assume details.\n"
+    "- EXPERIMENT, do not just inspect. If a claim can be settled by RUNNING something — a build, a test, a benchmark, an edit-then-measure — run it and answer from the number; you have the tools to verify yourself, so measurement beats reasoning. When asked to make something faster/correct/better, actually make a candidate change, MEASURE it against the baseline, and keep or revert based on the result — trying several changes and reverting the ones that don't help is expected and good. Concluding 'no improvement found' or 'this would need other tools' from reading code alone, without having run a single experiment, is not an acceptable answer.\n"
     "- A web_search followed by one web_fetch of the best result is usually enough — then answer.\n"
     "- Cite ONLY URLs that appear in tool results; never invent or guess links.\n"
     "- When a tool reports 'User denied execution.', do not retry; explain why you need it.\n"
