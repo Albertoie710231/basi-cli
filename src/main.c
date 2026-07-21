@@ -186,6 +186,7 @@ static const char *SYSTEM_PROMPT_NATIVE =
     "- Cite ONLY URLs that appear in tool results; never invent or guess links.\n"
     "- When a tool reports 'User denied execution.', do not retry; explain why you need it.\n"
     "- Reference code locations as path:line so the user can jump to them.\n"
+    "- On a long task your earlier tool outputs may be replaced by an elision stub to save context; the FULL text of every tool result is kept in .basi/journal-*.md. To recall something you saw earlier, grep that file (e.g. bash `grep -n <term> .basi/journal-*.md`) instead of re-reading a large file from scratch.\n"
     "Be helpful, concise, and accurate.";
 
 
@@ -2968,6 +2969,69 @@ static void handle_slash_command(char *user_input,
  * call and feed the result back (up to max_tool_iterations), then a final
  * answer. State that outlives the turn is passed by pointer; user_input is
  * borrowed (the caller frees it). */
+/* ── Durable action journal + tool-result elision ──────────────────────
+ * A single agentic turn is ONE user message followed by many tool_call/
+ * tool_result pairs. reclaim_context_if_needed() only cuts at USER boundaries,
+ * so it can never reclaim INSIDE such a turn — measured: a long -p run climbed
+ * to 99% ctx with the compaction banner never once printing, then died. The tool
+ * RESULTS (sed/grep dumps) are what fill the window, and in native-tools mode
+ * they carry the role "tool_result", which reclaim's user-boundary walk skips.
+ *
+ * Fix (two coupled halves): every FULL tool result is appended to a plain-text
+ * JOURNAL on disk — lossless and grep-able — and once context is tight the OLD
+ * tool_result messages in the working set are replaced with a short stub that
+ * points at the journal. Context stays bounded; nothing is lost; the model greps
+ * the journal to recall one earlier output instead of holding all of them. */
+#define ELIDE_STUB_PREFIX "[earlier tool output elided to save context"
+#define ELIDE_KEEP_RECENT 4          /* most-recent tool results kept in full */
+
+static char *g_journal_path = NULL;  /* .basi/journal-<pid>.md, created lazily */
+static int   g_journal_seq  = 0;
+
+static const char *journal_path(void) {
+    if (!g_journal_path) {
+        mkdir(".basi", 0755);
+        char p[128];
+        snprintf(p, sizeof(p), ".basi/journal-%d.md", (int)getpid());
+        g_journal_path = strdup(p);
+    }
+    return g_journal_path;
+}
+
+/* Append one FULL tool result (called BEFORE truncation, so the journal keeps
+ * what the context does not). `tag` is the tool identity, for a grep-able header. */
+static void journal_append(const char *tag, const char *full_result) {
+    if (!full_result) return;
+    FILE *f = fopen(journal_path(), "a");
+    if (!f) return;
+    fprintf(f, "\n## [%d] %s\n\n", ++g_journal_seq, (tag && *tag) ? tag : "tool");
+    fwrite(full_result, 1, strlen(full_result), f);
+    fputc('\n', f);
+    fclose(f);
+}
+
+/* Replace the content of tool_result messages older than the most recent `keep`
+ * with a stub. Returns how many were elided. The journal holds the full text, so
+ * this loses nothing the model cannot grep back. This is the compaction reclaim
+ * cannot do inside a single agentic turn. */
+static int elide_old_tool_results(BasiMsg *messages, size_t mc, int keep) {
+    int seen = 0, elided = 0;
+    for (size_t i = mc; i-- > 0; ) {
+        const char *role = messages[i].role, *c = messages[i].content;
+        if (!role || strcmp(role, "tool_result") != 0) continue;
+        if (c && strncmp(c, ELIDE_STUB_PREFIX, strlen(ELIDE_STUB_PREFIX)) == 0) continue;
+        if (++seen <= keep) continue;
+        char stub[256];
+        snprintf(stub, sizeof(stub),
+            "%s — full output is in %s (grep it to recall this).]",
+            ELIDE_STUB_PREFIX, journal_path());
+        free((void *)messages[i].content);
+        messages[i].content = strdup(stub);
+        elided++;
+    }
+    return elided;
+}
+
 static void run_agentic_turn(char *user_input,
         bool native_tools, char *formatted_buf,
         BasiMsg **messages_p, size_t *msg_count_p,
@@ -3057,9 +3121,17 @@ static void run_agentic_turn(char *user_input,
         int tool_iterations = 0;
         int consec_parse_fail = 0;     /* consecutive unparseable tool-call outputs */
         int max_tool_iterations = 40;
+        /* The iteration cap used to double as a context-overflow guard; now that
+           elision bounds context, a compaction event resets the counter (it means
+           the agent did real work and earned fresh room). max_elision_resets is the
+           remaining backstop against a loop that keeps eliding without converging. */
+        int elision_resets = 0;
+        int max_elision_resets = 12;
         {
             const char *mi = getenv("BASI_MAX_TOOL_ITERS");
             if (mi) { int v = atoi(mi); if (v > 0 && v <= 200) max_tool_iterations = v; }
+            const char *mr = getenv("BASI_MAX_ELISION_RESETS");
+            if (mr) { int v = atoi(mr); if (v >= 0 && v <= 100) max_elision_resets = v; }
         }
 
         while (tool_iterations < max_tool_iterations) {
@@ -3073,6 +3145,28 @@ static void run_agentic_turn(char *user_input,
             if (tool_iterations > 1)
                 reclaim_context_if_needed(native_tools,
                                           formatted_buf, messages_p, msg_count_p, prev_len_p);
+
+            /* reclaim above cuts only at user boundaries, of which a single
+               agentic turn has none — so once the window is tight, elide OLD
+               tool RESULTS (which are what actually fill it) down to journal
+               stubs. Keeps context bounded where reclaim structurally cannot. */
+            if (context_used_tokens() > (basi_srv_ctx_total * 3) / 4) {
+                int e = elide_old_tool_results(*messages_p, *msg_count_p, ELIDE_KEEP_RECENT);
+                if (e > 0) {
+                    printf("\033[33m[Context: elided %d old tool result(s) -> %s; grep to recall]\033[0m\n",
+                           e, journal_path());
+                    /* Compaction => the agent filled the window with real work and now
+                       has room again; refresh the iteration budget so the cap (meant to
+                       bound context) does not kill a productive long task. Bounded by
+                       max_elision_resets so a non-converging loop still terminates. */
+                    if (elision_resets < max_elision_resets) {
+                        elision_resets++;
+                        tool_iterations = 0;
+                        printf("\033[33m[Tool budget refreshed after compaction (reset %d/%d)]\033[0m\n",
+                               elision_resets, max_elision_resets);
+                    }
+                }
+            }
 
             /* Server-chat path (item 6b, opt-in via BASI_SERVER_CHAT): the server
                templates from the message array, owns the tool grammar, and returns
@@ -3150,6 +3244,11 @@ static void run_agentic_turn(char *user_input,
                 }
                 free(unknown_tool);
                 if (ncalls) basi_free_tool_calls(ncalls, n_ncalls);
+
+                /* Journal the FULL result before truncation, so the on-disk log
+                   is lossless even when the in-context copy is trimmed or later
+                   elided. The model can grep it to recall anything. */
+                journal_append(call_name, tool_result);
 
                 /* Truncate tool result if too large — line-aware, head+tail.
                    The dim "└ <summary>" sub-line reports the outcome (and any
