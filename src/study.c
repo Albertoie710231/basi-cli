@@ -890,11 +890,17 @@ void study_execute(Study *s, StudyProgressFn progress, void *ud) {
     regex_t re;
     if (regcomp(&re, s->extract, REG_EXTENDED) != 0) return;  /* validated already */
 
-    for (int a = 0; a < s->narms; a++) {
-        StudyArm *arm = &s->arms[a];
-        arm->nruns = 0;
-        arm->tree_hash = tree_fingerprint();
-        for (int i = 0; i < s->runs && i < STUDY_MAX_RUNS; i++) {
+    /* Interleave arms round by round (A,B,A,B,…) instead of all of A then all of
+     * B, so any systematic drift over the session — GPU thermal warm-up, memory
+     * state, background load — hits both arms equally and cancels in the compare.
+     * All-A-then-all-B lets a warm-up bias masquerade as a real and even
+     * statistically SIGNIFICANT arm difference (measured: a Q4_K kernel no-op read
+     * as +2 tok/s because the baseline was benched cold and the patch warm). */
+    for (int a = 0; a < s->narms; a++) s->arms[a].nruns = 0;
+    for (int i = 0; i < s->runs && i < STUDY_MAX_RUNS; i++) {
+        for (int a = 0; a < s->narms; a++) {
+            StudyArm *arm = &s->arms[a];
+            if (i == 0) arm->tree_hash = tree_fingerprint();
             /* Wrap so we learn the exit status through a stdout-only channel:
              * run_command_timeout merges stderr and does not report it. */
             size_t need = strlen(arm->command) + 128;
