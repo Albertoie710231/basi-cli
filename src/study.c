@@ -606,7 +606,12 @@ char *validate_study_artifact(const char *content, size_t content_len) {
     const char *extract = kb_fm_get(&fm, "extract");
     if (extract) {
         regex_t re;
-        int erc = regcomp(&re, extract, REG_EXTENDED);
+        /* REG_NEWLINE so ^ and $ anchor to LINE boundaries, not just string start/
+         * end. A model naturally writes the metric regex as ^<number>$ meaning "a
+         * line that is exactly the number"; without REG_NEWLINE, POSIX $ matches
+         * only at end-of-string, so a metric printed with a trailing newline (the
+         * common case) never matches and every run scores no-metric. */
+        int erc = regcomp(&re, extract, REG_EXTENDED | REG_NEWLINE);
         if (erc != 0) {
             char ebuf[160];
             regerror(erc, &re, ebuf, sizeof(ebuf));
@@ -893,7 +898,9 @@ static char *abbrev_cmd(const char *cmd) {
 
 void study_execute(Study *s, StudyProgressFn progress, void *ud) {
     regex_t re;
-    if (regcomp(&re, s->extract, REG_EXTENDED) != 0) return;  /* validated already */
+    /* REG_NEWLINE: match ^/$ at line boundaries so a metric on its own line (with a
+     * trailing newline) is found — see the note at the validation-time regcomp. */
+    if (regcomp(&re, s->extract, REG_EXTENDED | REG_NEWLINE) != 0) return;  /* validated already */
 
     /* Interleave arms round by round (A,B,A,B,…) instead of all of A then all of
      * B, so any systematic drift over the session — GPU thermal warm-up, memory
