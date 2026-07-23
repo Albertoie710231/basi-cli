@@ -171,6 +171,18 @@ typedef struct {
      * study_loop_concurrent() for the full set of trade-offs. Ignored unless
      * trajectories > 1. */
     bool concurrent;
+
+    /* Phase-wave dispatch: run the phases at DIFFERENT concurrency widths instead of
+     * forking one flat-width ground->propose->execute trajectory per agent. Measured
+     * rationale: a no-think grounding request batches well (4 concurrent ~78 tok/s
+     * aggregate) but a thinking-heavy propose builds a large per-slot KV and craters
+     * under width (~8 tok/s each) — so read WIDE, theorise NARROW. `ground_agents`
+     * readers build an evidence pool; `review_agents` verify its citations against the
+     * code; then `trajectories` theory-makers propose from the VALIDATED evidence.
+     * Requires --question. Ignored by the serial/concurrent paths. */
+    bool phase_wave;
+    int  ground_agents;     /* wide reading wave; <=0 => default 6 */
+    int  review_agents;     /* verification gate; <=0 => default 2 */
 } StudyLoopOpts;
 
 /* seed_slug names an existing artifact, or is the slug to CREATE when

@@ -1672,6 +1672,30 @@ static bool study_grounding_on(void) {
 "Report ONLY what the tools showed you — never invent a filename, number, or\n" \
 "citation. If the tools found nothing useful, say that plainly. <=12 bullets.\n"
 
+/* Review gate: the investigators' briefs are handed here to be VERIFIED against the
+ * real code before any hypothesis is built on them. Same read-only tools, same
+ * <evidence> output shape — so the review reuses study_react_brief unchanged. */
+#define GROUND_REVIEW_PROMPT \
+"You are the REVIEW gate of a discovery loop. Investigators wrote the evidence\n" \
+"briefs below; theory-makers are about to build hypotheses on them. VERIFY those\n" \
+"briefs against the ACTUAL code first — a wrong fact here poisons every theory.\n" \
+"\n" \
+"For each claim that cites a path:line, a number, or a file, RE-READ that location\n" \
+"with the read-only tools (exactly ONE per turn, in <tool></tool>) and confirm it\n" \
+"says what the brief claims. Do not take a brief's word for it — check it:\n" \
+"  <tool>read work.c 20 12</tool>          re-read the cited lines\n" \
+"  <tool>grep \"for\" work.c</tool>          confirm a pattern is really there\n" \
+"  <tool>list .</tool>                     confirm a cited file exists\n" \
+"\n" \
+"Then emit the validated brief:\n" \
+"  <evidence>\n" \
+"  - <fact you CONFIRMED>; cite the path:line you actually checked\n" \
+"  - UNVERIFIED: <claim you could not confirm, or that the code contradicts>\n" \
+"  </evidence>\n" \
+"\n" \
+"Keep only facts you personally verified. Mark anything you could not confirm as\n" \
+"UNVERIFIED — never silently drop it, never invent a new fact. <=12 bullets.\n"
+
 /* Body of <evidence>...</evidence>, trimmed, or NULL. Caller frees. */
 static char *ground_extract_evidence(const char *text) {
     const char *o = strstr(text, "<evidence>");
@@ -1815,11 +1839,15 @@ static char *ground_dispatch(const ArgList *al, const char **phase) {
     return m;
 }
 
-/* Bounded, read-only investigation of the system under test. Returns a malloc'd
- * evidence brief (caller frees) or NULL if grounding produced nothing usable.
- * `context` is the same text the proposer will see (the question or prior verdict). */
+/* Bounded, read-only ReAct investigation. Drives the model with `sys` as the system
+ * prompt and `user_intro`+`context` as the task, executing read/grep/list/symbols/web
+ * tool calls via ground_dispatch until it emits <evidence>...</evidence> or the round
+ * budget runs out. `label` tags the progress lines. no-think + no tool grammar for the
+ * duration (both restored). Returns a malloc'd brief (caller frees) or NULL. Shared by
+ * grounding (investigate the system) and review (verify a pooled brief's citations). */
 typedef struct { const char *role; char *content; } GTurn;
-static char *study_ground(int port, const char *context, StringBuf *log) {
+static char *study_react_brief(int port, const char *sys, const char *user_intro,
+                               const char *context, const char *label, StringBuf *log) {
     /* Keep the native tool grammar out of the <tool> ReAct format, same reason
      * deepsearch does: a native-tools model otherwise emits its trained tool-call
      * syntax and extract_tool_call (legacy <tool>) can't parse it. Restored below. */
@@ -1839,10 +1867,10 @@ static char *study_ground(int port, const char *context, StringBuf *log) {
         if (nt == cap) { cap = cap ? cap*2 : 8; turns = realloc(turns, (size_t)cap*sizeof(*turns)); } \
         turns[nt].role = (R); turns[nt].content = (C); nt++; } while (0)
 
-    GPUSH("system", strdup(GROUND_SYSTEM_PROMPT));
+    GPUSH("system", strdup(sys));
     {
         StringBuf u; sb_init(&u);
-        sb_append_str(&u, "Question the hypothesis will address:\n\n");
+        sb_append_str(&u, user_intro);
         sb_append_str(&u, context);
         GPUSH("user", sb_to_str(&u));
     }
@@ -1853,8 +1881,8 @@ static char *study_ground(int port, const char *context, StringBuf *log) {
     unsigned long *seen = NULL; int nseen = 0, capseen = 0;
 
     char *evidence = NULL;
-    printf("\033[36m[study/ground] investigating the system before proposing "
-           "(up to %d tool calls)\033[0m\n", GROUND_MAX_ROUNDS);
+    printf("\033[36m[study/%s] read-only investigation (up to %d tool calls)\033[0m\n",
+           label, GROUND_MAX_ROUNDS);
     fflush(stdout);
 
     for (int round = 1; round <= GROUND_MAX_ROUNDS && !evidence; round++) {
@@ -1902,8 +1930,8 @@ static char *study_ground(int port, const char *context, StringBuf *log) {
         }
         const char *phase = "?";
         char *raw = ground_dispatch(&al, &phase);
-        printf("\033[90m[study/ground %d/%d] %s: %.70s\033[0m\n",
-               round, GROUND_MAX_ROUNDS, phase, al.count >= 2 ? al.args[1] : "");
+        printf("\033[90m[study/%s %d/%d] %s: %.70s\033[0m\n",
+               label, round, GROUND_MAX_ROUNDS, phase, al.count >= 2 ? al.args[1] : "");
         fflush(stdout);
         arglist_free(&al);
         if (!raw) raw = strdup("(no result)");
@@ -1915,8 +1943,8 @@ static char *study_ground(int port, const char *context, StringBuf *log) {
         bool dup = false;
         for (int i = 0; i < nseen; i++) if (seen[i] == h) { dup = true; break; }
         if (dup) {
-            printf("\033[33m[study/ground %d/%d] duplicate result — nudging\033[0m\n",
-                   round, GROUND_MAX_ROUNDS);
+            printf("\033[33m[study/%s %d/%d] duplicate result — nudging\033[0m\n",
+                   label, round, GROUND_MAX_ROUNDS);
             fflush(stdout);
             GPUSH("user", strdup(
                 "That returned content IDENTICAL to a result you already have — no new "
@@ -1951,8 +1979,10 @@ static char *study_ground(int port, const char *context, StringBuf *log) {
         sb_append_char(log, '\n');
     }
     if (!evidence) {
-        sb_append_str(log, "\n[study/ground] no evidence brief produced; proposing ungrounded.\n");
-        printf("\033[33m[study/ground] no brief produced; proposing ungrounded\033[0m\n");
+        char nb[128];
+        snprintf(nb, sizeof(nb), "\n[study/%s] no evidence brief produced.\n", label);
+        if (log) sb_append_str(log, nb);
+        printf("\033[33m[study/%s] no brief produced\033[0m\n", label);
         fflush(stdout);
     }
     for (int i = 0; i < nt; i++) free(turns[i].content);
@@ -1967,6 +1997,27 @@ static char *study_ground(int port, const char *context, StringBuf *log) {
     if (evidence && !*evidence) { free(evidence); evidence = NULL; }
     return evidence;
 }
+
+/* Investigate the system under test for the given question/verdict context. */
+static char *study_ground(int port, const char *context, StringBuf *log) {
+    return study_react_brief(port, GROUND_SYSTEM_PROMPT,
+        "Question the hypothesis will address:\n\n", context, "ground", log);
+}
+
+/* Verify a pool of investigator briefs against the actual code (the review gate). */
+static char *study_review(int port, const char *pooled_briefs, StringBuf *log) {
+    return study_react_brief(port, GROUND_REVIEW_PROMPT,
+        "Evidence briefs from the investigators — verify each against the actual "
+        "code before any hypothesis is built on them:\n\n", pooled_briefs, "review", log);
+}
+
+/* When non-NULL, propose_artifact uses THIS evidence (borrowed, never freed) instead
+ * of running study_ground itself. The phase-wave propose children set it — they
+ * ground+review ONCE, wide, in earlier phases and inject the validated pool, so the
+ * narrow theory-makers do not each re-read the same files. A file-static toggle in
+ * the same spirit as basi_srv_no_think; a forked child sets it before study_trajectory
+ * and never clears it (the child _exit()s). */
+static const char *study_injected_evidence = NULL;
 
 /* Ask the model for a study artifact and keep asking, up to LOOP_MAX_ATTEMPTS,
  * feeding the validator's own errors back each time. Returns a malloc'd,
@@ -1985,8 +2036,17 @@ static char *propose_artifact(const StudyLoopOpts *opts, const char *user_msg,
     if (said_stop) *said_stop = false;
 
     /* Gap ①: ground the hypothesis in the real system before proposing it. Done
-     * ONCE (not per retry attempt) — the evidence does not change between retries. */
-    char *evidence = study_grounding_on() ? study_ground(opts->port, user_msg, log) : NULL;
+     * ONCE (not per retry attempt) — the evidence does not change between retries.
+     * In the phase-wave, grounding+review already ran wide in earlier phases and the
+     * validated pool is injected here, so this trajectory does NOT re-ground. */
+    char *evidence = NULL;
+    bool evidence_owned = false;
+    if (study_injected_evidence && *study_injected_evidence) {
+        evidence = (char *) study_injected_evidence;      /* borrowed — do not free */
+    } else if (study_grounding_on()) {
+        evidence = study_ground(opts->port, user_msg, log);
+        evidence_owned = true;
+    }
 
     for (int attempt = 1; attempt <= LOOP_MAX_ATTEMPTS && !out; attempt++) {
         Msgs m;
@@ -2133,7 +2193,7 @@ static char *propose_artifact(const StudyLoopOpts *opts, const char *user_msg,
         }
         free(artifact); free(a1); free(a2); free(a3); free(a4);
     }
-    free(prev_reply); free(feedback); free(evidence);
+    free(prev_reply); free(feedback); if (evidence_owned) free(evidence);
     return out;
 }
 
@@ -2678,7 +2738,8 @@ static void study_sandbox_leave(const char *sandbox, const char *cwd) {
  *     crashed child cannot strand a pinned slot. To pin instead, set
  *     req["id_slot"] in srvchat.cpp's build_request.
  */
-static char *study_loop_concurrent(const char *seed_slug, const StudyLoopOpts *opts) {
+static char *study_loop_concurrent(const char *seed_slug, const StudyLoopOpts *opts,
+                                   const char *inject_evidence) {
     int ntraj = opts->trajectories > 0 ? opts->trajectories : 1;
 
     /* Spawn the retrieval embedder ONCE, here in the parent, so every child
@@ -2755,6 +2816,9 @@ static char *study_loop_concurrent(const char *seed_slug, const StudyLoopOpts *o
             if (pids[k] == 0) {
                 /* ── child: one independent trajectory ── */
                 if (sandboxes[k]) study_sandbox_enter(cwdbuf, sandboxes[k]);
+                /* Phase-wave: build from the pre-validated evidence rather than
+                 * re-grounding. Set in the child only; it _exit()s without clearing. */
+                if (inject_evidence) study_injected_evidence = inject_evidence;
                 TrajFinding cf[20];
                 int cn = 0;
                 StringBuf cfind;
@@ -2823,10 +2887,196 @@ static char *study_loop_concurrent(const char *seed_slug, const StudyLoopOpts *o
     return sb_to_str(&log);
 }
 
+/* ── Phase-wave: per-phase concurrency width ────────────────────────────────
+ * The concurrent path above forks one FULL trajectory per agent at a flat width.
+ * But the phases do not cost the same: no-think READING batches cheaply, while a
+ * thinking-heavy PROPOSE builds a big per-slot KV and craters under concurrency
+ * (measured this session: 4 concurrent readers ~78 tok/s aggregate; 4 concurrent
+ * thinkers ~8 tok/s each). So this path runs the phases at DIFFERENT widths —
+ * wide reading, a review gate, narrow theory-making. */
+
+typedef char *(*StudyWorkerFn)(const StudyLoopOpts *opts, int idx, const char *arg,
+                               StringBuf *clog);
+
+/* Fork `n` READ-ONLY LLM workers (no sandbox — grounding/review never write the
+ * tree), in waves of STUDY_MAX_CONCURRENT. Child i runs fn(opts, i, arg, &clog),
+ * frames [int rl][rl result][clog] to a temp file; the parent reads out[i] (malloc'd,
+ * or NULL) and appends each child's log to `log`. Returns the count of non-NULL
+ * results — the wide, cheap half of the phase-wave. */
+static int study_worker_wave(const StudyLoopOpts *opts, StudyWorkerFn fn,
+                             const char *arg, int n, char **out, StringBuf *log) {
+    for (int i = 0; i < n; i++) out[i] = NULL;
+    int got = 0;
+    for (int base = 0; base < n; base += STUDY_MAX_CONCURRENT) {
+        int wave = n - base;
+        if (wave > STUDY_MAX_CONCURRENT) wave = STUDY_MAX_CONCURRENT;
+        pid_t pids[STUDY_MAX_CONCURRENT];
+        char  paths[STUDY_MAX_CONCURRENT][64];
+        for (int k = 0; k < wave; k++) {
+            int idx = base + k;
+            pids[k] = -1; paths[k][0] = '\0';
+            snprintf(paths[k], sizeof(paths[k]), "/tmp/basi_study_wrk_XXXXXX");
+            int fd = mkstemp(paths[k]);
+            if (fd < 0) { paths[k][0] = '\0'; continue; }
+            close(fd);
+            pids[k] = fork();
+            if (pids[k] == 0) {
+                StringBuf clog; sb_init(&clog);
+                char *res = fn(opts, idx, arg, &clog);
+                FILE *rf = fopen(paths[k], "wb");
+                if (rf) {
+                    int rl = res ? (int) strlen(res) : 0;
+                    fwrite(&rl, sizeof(rl), 1, rf);
+                    if (rl > 0) fwrite(res, 1, (size_t) rl, rf);
+                    if (clog.len) fwrite(clog.data, 1, clog.len, rf);
+                    fclose(rf);
+                }
+                _exit(0);   /* _exit: never run atexit — the embedder may be shared */
+            }
+            if (pids[k] < 0) { unlink(paths[k]); paths[k][0] = '\0'; }
+        }
+        for (int k = 0; k < wave; k++) {
+            int idx = base + k;
+            if (pids[k] > 0) {
+                waitpid(pids[k], NULL, 0);
+                FILE *rf = paths[k][0] ? fopen(paths[k], "rb") : NULL;
+                if (rf) {
+                    int rl = 0;
+                    if (fread(&rl, sizeof(rl), 1, rf) == 1 && rl > 0) {
+                        char *res = malloc((size_t) rl + 1);
+                        if (res && fread(res, 1, (size_t) rl, rf) == (size_t) rl) {
+                            res[rl] = '\0'; out[idx] = res; got++;
+                        } else free(res);
+                    }
+                    char buf[4096]; size_t r;
+                    while ((r = fread(buf, 1, sizeof(buf), rf)) > 0) sb_append(log, buf, r);
+                    fclose(rf);
+                }
+            }
+            if (paths[k][0]) unlink(paths[k]);
+        }
+    }
+    return got;
+}
+
+/* Reader i: investigate the question through a distinct lens, return an evidence brief. */
+static char *study_ground_worker(const StudyLoopOpts *opts, int idx, const char *question,
+                                 StringBuf *clog) {
+    StringBuf u; sb_init(&u);
+    sb_append_str(&u, question);
+    sb_append_str(&u, "\n\nYOUR INVESTIGATIVE LENS (bias what you look at FIRST so the readers "
+                      "spread out; follow the evidence, and convergence is corroboration): ");
+    sb_append_str(&u, STUDY_ANGLES[idx % STUDY_NUM_ANGLES]);
+    char *ctx = sb_to_str(&u);
+    char *brief = study_ground(opts->port, ctx, clog);
+    free(ctx);
+    return brief;
+}
+
+/* Reviewer i: verify the pooled briefs against the code, return a validated brief. */
+static char *study_review_worker(const StudyLoopOpts *opts, int idx, const char *pooled,
+                                 StringBuf *clog) {
+    (void) idx;
+    return study_review(opts->port, pooled, clog);
+}
+
+/* Phase-wave orchestrator. ground (wide) -> review (gate) -> propose (narrow), then
+ * the unchanged deterministic decide + arithmetic synthesis inside the propose wave.
+ * The ground/review workers are read-only (they read the REAL tree); only the propose
+ * theory-makers get COW sandboxes, so they edit copies while reading the true code. */
+static char *study_loop_phasewave(const char *seed_slug, const StudyLoopOpts *opts) {
+    const char *question = opts->question;
+    if (!question || !*question)
+        return strdup("phase-wave needs --question: the ground/review waves investigate the "
+                      "question before any theory is proposed.\n");
+    int kg = opts->ground_agents > 0 ? opts->ground_agents : 6;
+    int kr = opts->review_agents > 0 ? opts->review_agents : 2;
+    if (kg > 12) kg = 12;
+    if (kr > 6)  kr = 6;
+    int kp = opts->trajectories > 0 ? opts->trajectories : 1;
+
+    StringBuf log; sb_init(&log);
+    char hdr[512];
+    snprintf(hdr, sizeof(hdr),
+        "\n████ phase-wave: %d readers → %d reviewers → %d theory-makers ████\n"
+        "Reading is wide and cheap; theory-making is narrow and expensive.\n"
+        "The server needs `-np N --kv-unified` or the waves serialise.\n", kg, kr, kp);
+    sb_append_str(&log, hdr);
+    fputs(hdr, stderr);
+
+    /* ── Phase 1: wide grounding ── */
+    sb_append_str(&log, "\n══ phase 1: grounding (wide) ══\n");
+    fputs("\n══ phase 1: grounding (wide) ══\n", stderr);
+    char **briefs = calloc((size_t) kg, sizeof(char *));
+    (void) study_worker_wave(opts, study_ground_worker, question, kg, briefs, &log);
+
+    StringBuf pool; sb_init(&pool);
+    int npooled = 0;
+    for (int i = 0; i < kg; i++) {
+        if (!briefs[i]) continue;
+        char lbl[160];
+        snprintf(lbl, sizeof(lbl), "--- investigator %d (lens: %.60s) ---\n",
+                 i + 1, STUDY_ANGLES[i % STUDY_NUM_ANGLES]);
+        sb_append_str(&pool, lbl);
+        sb_append_str(&pool, briefs[i]);
+        sb_append_str(&pool, "\n\n");
+        npooled++;
+    }
+    for (int i = 0; i < kg; i++) free(briefs[i]);
+    free(briefs);
+
+    char *validated = NULL;
+    if (npooled == 0) {
+        sb_append_str(&log, "\n[phase-wave] grounding produced no briefs — theory-makers will "
+                            "ground themselves (fallback).\n");
+    } else {
+        char *pooled = sb_to_str(&pool);
+        /* ── Phase 2: review gate ── */
+        char rh[96];
+        snprintf(rh, sizeof(rh), "\n══ phase 2: review (%d verifiers) ══\n", kr);
+        sb_append_str(&log, rh); fputs(rh, stderr);
+        char **reviews = calloc((size_t) kr, sizeof(char *));
+        int nr = study_worker_wave(opts, study_review_worker, pooled, kr, reviews, &log);
+        /* pooled aliases pool.data (sb_to_str returns the buffer in place, it does NOT
+         * transfer ownership) — so it is NOT freed here; the single sb_free(&pool)
+         * below owns it. Freeing both double-frees. */
+
+        if (nr == 0) {
+            validated = strdup(pooled);   /* independent copy; survives sb_free(&pool) */
+            sb_append_str(&log, "\n[phase-wave] no review passed; using the raw evidence pool.\n");
+        } else {
+            StringBuf v; sb_init(&v);
+            for (int i = 0; i < kr; i++) {
+                if (!reviews[i]) continue;
+                char lbl[64];
+                snprintf(lbl, sizeof(lbl), "--- verified by reviewer %d ---\n", i + 1);
+                sb_append_str(&v, lbl);
+                sb_append_str(&v, reviews[i]);
+                sb_append_str(&v, "\n\n");
+            }
+            validated = sb_to_str(&v);
+        }
+        for (int i = 0; i < kr; i++) free(reviews[i]);
+        free(reviews);
+    }
+    sb_free(&pool);
+
+    /* ── Phase 3: narrow propose (+ execute/decide/synth) over the validated
+     * evidence, reusing the concurrent trajectory machinery with injection. ── */
+    sb_append_str(&log, "\n══ phase 3: theory-making (narrow) ══\n");
+    fputs("\n══ phase 3: theory-making (narrow) ══\n", stderr);
+    char *proprep = study_loop_concurrent(seed_slug, opts, validated);
+    if (proprep) { sb_append_str(&log, proprep); free(proprep); }
+    free(validated);
+    return sb_to_str(&log);
+}
+
 char *study_loop(const char *seed_slug, const StudyLoopOpts *opts) {
+    if (opts->phase_wave)
+        return study_loop_phasewave(seed_slug, opts);
     int ntraj = opts->trajectories > 0 ? opts->trajectories : 1;
     if (opts->concurrent && ntraj > 1)
-        return study_loop_concurrent(seed_slug, opts);
+        return study_loop_concurrent(seed_slug, opts, NULL);
     StringBuf log, explored;
     sb_init(&log);
     sb_init(&explored);
@@ -2928,6 +3178,9 @@ int cmd_study(int argc, char **argv) {
             "                what the others covered so it probes a different dimension\n"
             "                --concurrent dispatches those trajectories at once against one\n"
             "                server (needs -np N --kv-unified); see study_loop_concurrent\n"
+            "                --phase-wave runs the phases at DIFFERENT widths: wide reading,\n"
+            "                a review gate, then narrow theory-making (--ground N readers,\n"
+            "                --review N verifiers, --trajectories N theory-makers)\n"
             "  list         list studies and their status\n"
             "  show <slug>  print the study artifact\n");
         return 2;
@@ -2960,6 +3213,9 @@ int cmd_study(int argc, char **argv) {
             else if (strcmp(argv[i], "--allow") == 0 && i + 1 < argc)  o.allow = argv[++i];
             else if (strcmp(argv[i], "--trajectories") == 0 && i + 1 < argc) o.trajectories = atoi(argv[++i]);
             else if (strcmp(argv[i], "--concurrent") == 0)            o.concurrent = true;
+            else if (strcmp(argv[i], "--phase-wave") == 0)            o.phase_wave = true;
+            else if (strcmp(argv[i], "--ground") == 0 && i + 1 < argc) o.ground_agents = atoi(argv[++i]);
+            else if (strcmp(argv[i], "--review") == 0 && i + 1 < argc) o.review_agents = atoi(argv[++i]);
             else if (strcmp(argv[i], "--unsafe") == 0)                o.unsafe = true;
             else { fprintf(stderr, "study loop: unknown option '%s'\n", argv[i]); return 2; }
         }
