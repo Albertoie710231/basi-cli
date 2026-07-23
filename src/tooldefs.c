@@ -17,8 +17,11 @@
 #define INT(name, desc) "\"" name "\":{\"type\":\"integer\",\"description\":\"" desc "\"}"
 
 static const BasiToolDef TOOLS[] = {
-    { "read", "Read an entire small file (<~2000 tokens). For larger files use head/grep.",
-      OBJ(STR("file", "Path to the file"), "[\"file\"]") },
+    { "read", "Read a file. A small file is returned whole; a large file returns a window of "
+              "`count` lines from line `start`, with a footer telling you how to read the next window.",
+      OBJ(STR("file", "Path to the file") ","
+          INT("start", "1-based line to start at (optional; default 1)") ","
+          INT("count", "number of lines to read (optional; default 400)"), "[\"file\"]") },
     { "head", "Read the first N lines of a file.",
       OBJ(STR("file", "Path to the file") "," INT("lines", "Number of lines (default 10)"), "[\"file\"]") },
     { "tail", "Read the last N lines of a file.",
@@ -94,6 +97,13 @@ char *basi_build_command(const char *name, const char *args) {
     if (strcmp(name, "read") == 0) {
         sb_append_str(&sb, "read");
         append_arg(&sb, args, "file", false);
+        long start = jx_get_int(args, "start");
+        long count = jx_get_int(args, "count");
+        if (start > 0 || count > 0) {                 /* paging a large file */
+            if (start < 1) start = 1;
+            char b[48]; snprintf(b, sizeof(b), " %ld", start); sb_append_str(&sb, b);
+            if (count > 0) { snprintf(b, sizeof(b), " %ld", count); sb_append_str(&sb, b); }
+        }
     } else if (strcmp(name, "head") == 0 || strcmp(name, "tail") == 0) {
         sb_append_str(&sb, name);
         long lines = jx_get_int(args, "lines");

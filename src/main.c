@@ -70,7 +70,8 @@ static const char *SYSTEM_PROMPT_FMT =
     "When you need to read files, search the web, or fetch URLs, use these tools by wrapping commands in <tool> tags:\n"
     "\n"
     "FILE TOOLS:\n"
-    "- read <file> : Read entire file (only for small files <2000 tokens)\n"
+    "- read <file> [start] [count] : Read a file. Small files come whole; a large file returns a\n"
+    "                line window and a footer showing how to read the next one (read <file> <start> <count>)\n"
     "- head -n <N> <file> : Read first N lines\n"
     "- grep <pattern> <file> : Search for pattern (use quotes for multi-word)\n"
     "- grep -n <pattern> <file> : Search with line numbers\n"
@@ -697,10 +698,20 @@ int request_approval(const char *tool_label, const char *cmd) {
 
 /* ── Execute tool command ──────────────────────────────────────────── */
 
-/* Read a small file with the `read` tool's token-budget guard. Returns
- * malloc'd content on success (and marks the path read), or a malloc'd
- * "Error: …" string. Caller frees either way. */
-static char *read_small_file(const char *filepath) {
+#define READ_WHOLE_MAX_BYTES   24000   /* <= this AND no window: return the file whole (~6k tokens) */
+#define READ_WINDOW_LINES        400   /* default lines per window for a larger file */
+#define READ_WINDOW_MAX_BYTES  24000   /* hard byte cap on one window */
+
+/* Read a WINDOW of a file's lines. 1-based `start`, `count` lines (<=0 => defaults).
+ * A file that fits whole (<= READ_WHOLE_MAX_BYTES) and was requested without an
+ * explicit window is returned IN FULL, unchanged — so the edit tool's verbatim
+ * SEARCH-copy still matches. A larger file is PAGED: raw window content, with a
+ * header giving the line range and a footer telling the model exactly how to read
+ * the next window. This replaces the old hard "file too large — use head" rejection,
+ * which left the agent unable to read a real source file at all (a 13k-30k-token
+ * kernel file was simply refused). Windows carry NO line-number prefixes on purpose,
+ * so text copied into an edit SEARCH block still matches. Caller frees. */
+static char *read_file_window(const char *filepath, long start, long count) {
     FILE *f = fopen(filepath, "r");
     if (!f) {
         char *msg = malloc(512);
@@ -709,27 +720,60 @@ static char *read_small_file(const char *filepath) {
     }
     struct stat st;
     fstat(fileno(f), &st);
-    size_t estimated_tokens = st.st_size / 4;
-    if (estimated_tokens > MAX_FILE_TOKENS) {
-        size_t lines = count_lines(f);
-        char *msg = malloc(512);
-        snprintf(msg, 512,
-            "Error: File too large (~%zu tokens, max %d). Use 'head', 'tail', or 'grep' to read in chunks.\n"
-            "File has %ld bytes, %zu lines (use 'wc %s' for exact count)",
-            estimated_tokens, MAX_FILE_TOKENS, (long)st.st_size, lines, filepath);
-        fclose(f);
-        return msg;
-    }
-    char *content = malloc(st.st_size + 1);
-    if (!content) {
-        fclose(f);
-        return strdup("Error: out of memory reading file");
-    }
-    size_t nread = fread(content, 1, st.st_size, f);
-    content[nread] = '\0';
+    size_t sz = (size_t)st.st_size;
+    char *buf = malloc(sz + 1);
+    if (!buf) { fclose(f); return strdup("Error: out of memory reading file"); }
+    size_t n = fread(buf, 1, sz, f);
+    buf[n] = '\0';
     fclose(f);
+
+    bool explicit_window = (start > 0 || count > 0);
+    if (!explicit_window && n <= READ_WHOLE_MAX_BYTES) {
+        read_tracker_mark(filepath);
+        return buf;                          /* small file: whole, unchanged */
+    }
+
+    if (start < 1) start = 1;
+    if (count <= 0) count = READ_WINDOW_LINES;
+
+    long total = 0;
+    for (size_t i = 0; i < n; i++) if (buf[i] == '\n') total++;
+    if (n > 0 && buf[n-1] != '\n') total++;
+    if (total == 0) total = 1;
+
+    /* byte offset of the first byte of line `start` */
+    long line = 1; size_t off = 0;
+    while (line < start && off < n) { if (buf[off] == '\n') line++; off++; }
+    size_t ws = off;
+
+    /* emit up to `count` whole lines, capped by bytes */
+    size_t q = off, win_end = off;
+    long emitted = 0;
+    while (q < n && emitted < count && (q - ws) < READ_WINDOW_MAX_BYTES) {
+        if (buf[q] == '\n') { emitted++; win_end = q + 1; }
+        q++;
+    }
+    if (win_end == off) win_end = (q < n) ? q : n;   /* one very long line / no '\n' */
+    long last_line = start + emitted - 1;
+    if (last_line < start) last_line = start;
+
+    StringBuf out; sb_init(&out);
+    if (start > 1 || last_line < total) {
+        char h[512];
+        snprintf(h, sizeof(h), "%s (lines %ld-%ld of %ld):\n", filepath, start, last_line, total);
+        sb_append_str(&out, h);
+    }
+    sb_append(&out, buf + ws, win_end - ws);
+    if (last_line < total) {
+        char ftr[512];
+        snprintf(ftr, sizeof(ftr),
+            "\n[... %ld more lines below. Continue: read %s %ld %ld]\n",
+            total - last_line, filepath, last_line + 1, count);
+        sb_append_str(&out, ftr);
+    }
+    free(buf);
     read_tracker_mark(filepath);
-    return content;
+    return sb_to_str(&out);
 }
 
 /* Truncate an oversized tool result keeping the HEAD and the TAIL — the middle
@@ -1051,7 +1095,9 @@ static char *execute_tool(const char *command) {
             arglist_free(&al);
             return strdup("Error: read requires a file path");
         }
-        char *content = read_small_file(al.args[1]);
+        long start = (al.count >= 3) ? atol(al.args[2]) : 0;
+        long count = (al.count >= 4) ? atol(al.args[3]) : 0;
+        char *content = read_file_window(al.args[1], start, count);
         arglist_free(&al);
         return content;
     }
@@ -1206,7 +1252,9 @@ static char *execute_tool_native(const char *name, const char *args_json) {
     if (strcmp(name, "read") == 0) {
         char *file = jx_get_string(args_json, "file");
         if (!file) return strdup("Error: read requires a file path");
-        char *r = read_small_file(file);
+        long start = jx_get_int(args_json, "start");   /* 0 if absent */
+        long count = jx_get_int(args_json, "count");   /* 0 if absent */
+        char *r = read_file_window(file, start, count);
         free(file);
         return r;
     }
