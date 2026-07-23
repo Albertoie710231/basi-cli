@@ -777,6 +777,15 @@ static char *read_file_window(const char *filepath, long start, long count) {
     return sb_to_str(&out);
 }
 
+/* djb2 hash of a tool result, for the re-read dedup: a tool call that returns bytes
+   IDENTICAL to a prior result gave the model no new information, so it is a flail (a
+   phase measured re-reading .basi/findings.md 8 times without ever acting). */
+static unsigned long tool_result_hash(const char *s) {
+    unsigned long h = 5381; int c;
+    while ((c = (unsigned char)*s++)) h = ((h << 5) + h) + (unsigned long)c;
+    return h;
+}
+
 /* Restrict the active tool schemas to a comma-separated subset — a hard per-phase
  * scope for factory pipelines. An "implement" phase gets only read+edit, a "build"
  * phase only bash, so the model physically CANNOT drift into other activities (the
@@ -3218,6 +3227,13 @@ static void run_agentic_turn(char *user_input,
            remaining backstop against a loop that keeps eliding without converging. */
         int elision_resets = 0;
         int max_elision_resets = 12;
+
+        /* Re-read dedup: hashes of substantial tool results already returned this turn.
+           A tool call that returns bytes identical to one of these fed the model nothing
+           new, so its context copy is replaced with a nudge to act instead of re-reading
+           (a phase was measured re-reading .basi/findings.md 8x without ever editing). */
+        unsigned long seen_results[256];
+        int n_seen_results = 0;
         {
             const char *mi = getenv("BASI_MAX_TOOL_ITERS");
             if (mi) { int v = atoi(mi); if (v > 0 && v <= 200) max_tool_iterations = v; }
@@ -3340,6 +3356,28 @@ static void run_agentic_turn(char *user_input,
                    is lossless even when the in-context copy is trimmed or later
                    elided. The model can grep it to recall anything. */
                 journal_append(call_name, tool_result);
+
+                /* Re-read dedup: if this substantial result is byte-identical to one the
+                   model already received this turn, re-reading it added nothing — replace
+                   its context copy with a nudge to act, so a phase cannot burn its budget
+                   re-reading one file. Journaled above first, so the log stays lossless. */
+                if (tool_result && strlen(tool_result) > 200) {
+                    unsigned long h = tool_result_hash(tool_result);
+                    bool dup = false;
+                    for (int i = 0; i < n_seen_results; i++)
+                        if (seen_results[i] == h) { dup = true; break; }
+                    if (dup) {
+                        free(tool_result);
+                        tool_result = strdup(
+                            "[IDENTICAL to a result you already have — re-reading it gives you "
+                            "nothing new. Do NOT read it again. Act on what you know: make the "
+                            "edit / run the command, or read a DIFFERENT file.]");
+                        printf("\033[33m[dedup: identical re-read — nudging toward action]\033[0m\n");
+                        fflush(stdout);
+                    } else if (n_seen_results < (int)(sizeof(seen_results)/sizeof(seen_results[0]))) {
+                        seen_results[n_seen_results++] = h;
+                    }
+                }
 
                 /* Truncate tool result if too large — line-aware, head+tail.
                    The dim "└ <summary>" sub-line reports the outcome (and any
