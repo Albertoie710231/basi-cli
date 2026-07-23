@@ -5,6 +5,7 @@
 /* sentinel: no --seed given → let the server pick a random seed */
 #define BASI_DEFAULT_SEED 0xFFFFFFFFu
 #include <string.h>
+#include <ctype.h>
 #include <stdbool.h>
 #include <signal.h>
 #include <time.h>
@@ -776,6 +777,36 @@ static char *read_file_window(const char *filepath, long start, long count) {
     return sb_to_str(&out);
 }
 
+/* Restrict the active tool schemas to a comma-separated subset — a hard per-phase
+ * scope for factory pipelines. An "implement" phase gets only read+edit, a "build"
+ * phase only bash, so the model physically CANNOT drift into other activities (the
+ * server derives the tool grammar from the registered set, so an unlisted tool can't
+ * even be emitted). Returns a malloc'd array of the matched defs and sets *out_n;
+ * the process keeps it alive. Unknown names are ignored. */
+static BasiToolDef *filter_tool_defs(const char *csv, int *out_n) {
+    int n; const BasiToolDef *all = basi_tool_defs(&n);
+    BasiToolDef *sub = malloc(sizeof(BasiToolDef) * (size_t)n);
+    int m = 0;
+    for (int i = 0; i < n; i++) {
+        const char *nm = all[i].name;
+        size_t nl = strlen(nm);
+        const char *p = csv;
+        bool keep = false;
+        while (*p) {
+            while (*p == ' ' || *p == ',') p++;
+            const char *e = p;
+            while (*e && *e != ',') e++;
+            size_t len = (size_t)(e - p);
+            while (len && p[len-1] == ' ') len--;
+            if (len == nl && strncmp(nm, p, nl) == 0) { keep = true; break; }
+            p = e;
+        }
+        if (keep) sub[m++] = all[i];
+    }
+    *out_n = m;
+    return sub;
+}
+
 /* Truncate an oversized tool result keeping the HEAD and the TAIL — the middle
  * of long output is usually noise, while test runners put the first failures at
  * the top and the pass/fail summary at the bottom. Line-aware (keeps at most
@@ -848,15 +879,24 @@ static size_t truncate_tool_result(char *s, int head_lines, int tail_lines,
  * the native structured-dispatch path. */
 static void sh_append_arg(StringBuf *sb, const char *arg) {
     sb_append_char(sb, ' ');
-    if (strpbrk(arg, " \t\"'$`\\")) {
+    /* Quote UNLESS every character is shell-safe unquoted. The old test only quoted
+       on space/quote/$/backtick/backslash, so a grep pattern like "A|B" (or one with
+       & ; < > * ? ( ) etc.) slipped through UNquoted and the shell interpreted the
+       metachar — measured: `grep "GGML_OP_MUL_MAT|GGML_OP_MUL_MAT_ID"` was split into
+       a pipe and every alternation search returned nothing. */
+    bool safe = (*arg != '\0');
+    for (const char *c = arg; *c; c++) {
+        if (!(isalnum((unsigned char)*c) || strchr("_-./,=+:@%", *c))) { safe = false; break; }
+    }
+    if (safe) {
+        sb_append_str(sb, arg);
+    } else {
         sb_append_char(sb, '\'');
         for (const char *c = arg; *c; c++) {
             if (*c == '\'') sb_append_str(sb, "'\"'\"'");
             else sb_append_char(sb, *c);
         }
         sb_append_char(sb, '\'');
-    } else {
-        sb_append_str(sb, arg);
     }
 }
 
@@ -1411,6 +1451,7 @@ typedef struct {
     uint32_t    cli_seed;           /* --seed: RNG seed for sampling */
     bool        bypass;             /* --yolo/--bypass: auto-approve all tool actions */
     const char *resume_path;        /* --resume: reload this session file, skip picker */
+    const char *tool_subset;        /* --tools a,b,c: hard-scope the active tool set (factory phase) */
     bool        pick;               /* --pick: force the model picker (used by /model) */
     bool        want_exit;          /* -h/--help: caller should return exit_code */
     int         exit_code;
@@ -1459,6 +1500,8 @@ static Cli parse_args(int argc, char **argv) {
             c.bypass = true;
         } else if (strcmp(argv[i], "--resume") == 0 && i + 1 < argc) {
             c.resume_path = argv[++i];
+        } else if (strcmp(argv[i], "--tools") == 0 && i + 1 < argc) {
+            c.tool_subset = argv[++i];   /* factory: hard-scope this phase's tools */
         } else if (strcmp(argv[i], "--pick") == 0) {
             c.pick = true;
         } else if ((strcmp(argv[i], "-s") == 0 || strcmp(argv[i], "--system") == 0)
@@ -3869,6 +3912,11 @@ int main(int argc, char **argv) {
        tools are always "native" (the /v1/chat/completions path owns the format). */
     int tool_n = 0;
     const BasiToolDef *tool_defs = basi_tool_defs(&tool_n);
+    if (cli.tool_subset && *cli.tool_subset) {         /* --tools: hard-scope this phase */
+        tool_defs = filter_tool_defs(cli.tool_subset, &tool_n);
+        printf("\033[36m[Tools scoped to: %s (%d tool%s)]\033[0m\n",
+               cli.tool_subset, tool_n, tool_n == 1 ? "" : "s");
+    }
     basi_set_tools(tool_defs, tool_n);
     int native_tools = 1;
     generate_native_tools = native_tools;
