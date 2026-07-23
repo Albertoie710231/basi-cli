@@ -1076,10 +1076,10 @@ static char *execute_tool(const char *command) {
                 else sb_append_char(&wrapped, *c);
             }
             sb_append_str(&wrapped, "' 2>&1");
-            int bash_tmo = 120;            /* seconds; override via env, cap 600 */
+            int bash_tmo = 120;            /* seconds; override via env, cap 2400 */
             const char *tenv = getenv("BASI_BASH_TIMEOUT");
             if (tenv) { int v = atoi(tenv); if (v > 0) bash_tmo = v; }
-            if (bash_tmo > 600) bash_tmo = 600;
+            if (bash_tmo > 2400) bash_tmo = 2400;   /* 40 min: an experiment phase may build */
             int timed_out = 0;
             char *result = run_command_timeout(sb_to_str(&wrapped), 512 * 1024,
                                                bash_tmo, &timed_out);
