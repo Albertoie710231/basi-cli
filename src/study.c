@@ -18,6 +18,11 @@
 #include "memory.h"
 #include "embed.h"    /* embed_init — spawn the shared embedder before forking */
 #include "study.h"
+#include "model.h"      /* extract_tool_call, basi_srv_suppress_grammar (grounding) */
+#include "web.h"        /* execute_readfile / execute_web_search / execute_web_fetch */
+#include "symbols.h"    /* execute_symbols */
+#include "chat_tmpl.h"  /* basi_set_tools / basi_tools_registered */
+#include "tooldefs.h"   /* basi_tool_defs — restore tool grammar after grounding */
 
 static void cli_progress(const char *arm, int run, int of, void *ud);
 
@@ -1613,6 +1618,356 @@ static char *msgs_done(Msgs *m) {
 }
 
 
+/* ── Evidence grounding (gap ①: ROBIN's load-bearing pillar) ──────────────
+ * ROBIN grounds every hypothesis in retrieved literature; strip that and its
+ * hallucinated-citation rate goes 0%->45% (arXiv:2505.13400). BASI's proposal
+ * step had the same hole — it invented mechanisms with no look at the actual
+ * system (the "confident nonsense about L3 cache" false explanation). This is
+ * the code-domain analog of ROBIN's Crow literature review: a bounded, READ-ONLY
+ * investigation of the real system (source, symbols, and the web for prior art)
+ * that returns a short factual brief. It gathers FACTS; it does not propose the
+ * fix — proposing stays propose_artifact's job, exactly as ROBIN keeps its
+ * literature review and its generation step separate.
+ *
+ * Gated by BASI_STUDY_GROUND so grounded vs ungrounded is one flag apart — which
+ * is also the experimental control for measuring whether grounding actually
+ * lowers the hallucinated-mechanism rate rather than assuming it. */
+#define GROUND_MAX_ROUNDS 6
+#define GROUND_MAX_TOKENS 8192
+#define GROUND_OBS_CAP    4000   /* per-tool-result chars fed back into the chat */
+
+static bool study_grounding_on(void) {
+    const char *e = getenv("BASI_STUDY_GROUND");
+    return e && *e && strcmp(e, "0") != 0;
+}
+
+#define GROUND_SYSTEM_PROMPT \
+"You are the EVIDENCE step of a discovery loop. A hypothesis is about to be\n" \
+"proposed for the question below. Do NOT propose it. Establish what is ACTUALLY\n" \
+"TRUE about the system under test, so the hypothesis is grounded in reality\n" \
+"instead of guessed from memory.\n" \
+"\n" \
+"Investigate with read-only tools, exactly ONE per turn, inside <tool></tool>.\n" \
+"Write REAL arguments, never the placeholder brackets. Concrete examples:\n" \
+"  <tool>list .</tool>                     list files in the current directory\n" \
+"  <tool>read work.c</tool>                read a file (line-numbered)\n" \
+"  <tool>read work.c 40 60</tool>          read 60 lines of work.c starting at line 40\n" \
+"  <tool>grep \"for\" work.c</tool>          a file's lines matching a regex\n" \
+"  <tool>symbols work.c</tool>             functions/types in a source file\n" \
+"  <tool>web_search \"loop tiling cache\"</tool>   known techniques / prior art\n" \
+"\n" \
+"When the question is about local code, list then READ THE CODE before you\n" \
+"web_search and before you theorise. Do not name a path you have not seen.\n" \
+"\n" \
+"A long file is returned one window at a time with a line count; page to a later\n" \
+"section with e.g. read work.c 200 200. Re-fetching the SAME section teaches\n" \
+"nothing and is rejected as a duplicate. Once you have seen the relevant code and\n" \
+"the measure script, conclude — do not keep re-listing or re-reading.\n" \
+"\n" \
+"After a few tool calls, STOP investigating and emit the brief:\n" \
+"  <evidence>\n" \
+"  - <fact>; each cites a path:line, a measured number, or a source URL\n" \
+"  </evidence>\n" \
+"\n" \
+"Report ONLY what the tools showed you — never invent a filename, number, or\n" \
+"citation. If the tools found nothing useful, say that plainly. <=12 bullets.\n"
+
+/* Body of <evidence>...</evidence>, trimmed, or NULL. Caller frees. */
+static char *ground_extract_evidence(const char *text) {
+    const char *o = strstr(text, "<evidence>");
+    if (!o) return NULL;
+    o += strlen("<evidence>");
+    const char *c = strstr(o, "</evidence>");
+    size_t n = c ? (size_t)(c - o) : strlen(o);
+    return trim_dup(o, n);
+}
+
+/* djb2 hash, for detecting a grounding result identical to one already seen. */
+static unsigned long ground_hash(const char *s) {
+    unsigned long h = 5381; int c;
+    while ((c = (unsigned char)*s++)) h = ((h << 5) + h) + (unsigned long)c;
+    return h;
+}
+
+/* Read a line-numbered WINDOW of a text file. `start` 1-based (<=0 => 1); `count`
+ * lines (<=0 => default). A long file returns one window plus a footer telling the
+ * model exactly how to page to the next — so different sections are reachable, and
+ * the head-only limitation of execute_readfile (cat|head -c) is gone. */
+#define GROUND_WIN_DEFAULT 200
+static char *ground_read_window(const char *path, int start, int count) {
+    if (access(path, R_OK) != 0) {
+        char *m = malloc(320);
+        if (m) snprintf(m, 320, "Error: cannot read '%.240s' (does it exist? try list).", path);
+        return m ? m : strdup("Error: cannot read file.");
+    }
+    size_t len = 0;
+    char *buf = kb_read_file(path, &len);
+    if (!buf) return strdup("Error: could not read file.");
+    int total = 0;
+    for (size_t i = 0; i < len; i++) if (buf[i] == '\n') total++;
+    if (len > 0 && buf[len - 1] != '\n') total++;
+    if (total == 0) total = 1;
+    if (start < 1) start = 1;
+    if (count < 1) count = GROUND_WIN_DEFAULT;
+    int end = start + count - 1;
+
+    StringBuf o; sb_init(&o);
+    char hdr[360];
+    snprintf(hdr, sizeof(hdr), "%.256s (lines %d-%d of %d):\n",
+             path, start, end < total ? end : total, total);
+    sb_append_str(&o, hdr);
+
+    int line = 1;
+    const char *p = buf, *fend = buf + len;
+    while (p < fend && line <= end) {
+        const char *nl = memchr(p, '\n', (size_t)(fend - p));
+        size_t ll = nl ? (size_t)(nl - p) : (size_t)(fend - p);
+        if (line >= start) {
+            char num[16];
+            snprintf(num, sizeof(num), "%6d\t", line);
+            sb_append_str(&o, num);
+            char *tmp = malloc(ll + 1);
+            if (tmp) { memcpy(tmp, p, ll); tmp[ll] = '\0'; sb_append_str(&o, tmp); free(tmp); }
+            sb_append_char(&o, '\n');
+        }
+        p = nl ? nl + 1 : fend;
+        line++;
+    }
+    free(buf);
+    if (end < total) {
+        char foot[200];
+        snprintf(foot, sizeof(foot),
+                 "[...%d more lines below. To continue: read %.120s %d %d]\n",
+                 total - end, path, end + 1, count);
+        sb_append_str(&o, foot);
+    }
+    return sb_to_str(&o);
+}
+
+/* List a directory so the model can discover files instead of guessing paths. */
+static char *ground_list_dir(const char *dir) {
+    const char *d = (dir && dir[0]) ? dir : ".";
+    if (strchr(d, '\'')) return strdup("Error: path must not contain a single quote.");
+    char cmd[1300];
+    snprintf(cmd, sizeof(cmd), "ls -la '%.1024s' 2>&1 | head -c 3000", d);
+    char *r = run_command(cmd, 3400);
+    return (r && r[0]) ? r : (free(r), strdup("(empty or unreadable directory)"));
+}
+
+/* Strip placeholder metacharacters a model may copy from the tool syntax
+ * (<path>, [dir]) and surrounding quotes, so `read <work.c>` == `read work.c`
+ * and `list [.]` == `list .`. Writes into buf, returns buf. */
+static const char *ground_clean_arg(const char *a, char *buf, size_t bufsz) {
+    if (!a) { buf[0] = '\0'; return buf; }
+    while (*a == '<' || *a == '[' || *a == '"' || *a == '\'' || *a == ' ') a++;
+    size_t n = strlen(a);
+    while (n > 0 && (a[n-1] == '>' || a[n-1] == ']' || a[n-1] == '"' ||
+                     a[n-1] == '\'' || a[n-1] == ' ')) n--;
+    if (n >= bufsz) n = bufsz - 1;
+    memcpy(buf, a, n); buf[n] = '\0';
+    return buf;
+}
+
+/* Read-only tool surface for grounding. Returns a malloc'd result (caller frees). */
+static char *ground_dispatch(const ArgList *al, const char **phase) {
+    const char *name = al->args[0];
+    char b1[1024], b2[1024], b3[64];
+    const char *a1 = ground_clean_arg(al->count >= 2 ? al->args[1] : "", b1, sizeof(b1));
+    const char *a2 = ground_clean_arg(al->count >= 3 ? al->args[2] : "", b2, sizeof(b2));
+    const char *a3 = ground_clean_arg(al->count >= 4 ? al->args[3] : "", b3, sizeof(b3));
+    if (strcasecmp(name, "list") == 0 || strcasecmp(name, "ls") == 0) {
+        *phase = "list";
+        return ground_list_dir(a1);
+    }
+    if (strcasecmp(name, "read") == 0) {
+        *phase = "read";
+        if (!a1[0]) return strdup("Error: read needs a path, e.g. read work.c");
+        return ground_read_window(a1, a2[0] ? atoi(a2) : 0, a3[0] ? atoi(a3) : 0);
+    }
+    if (strcasecmp(name, "grep") == 0) {
+        *phase = "grep";
+        /* Keep the regex RAW — a legit pattern can start with '[' (a char class),
+         * which ground_clean_arg would strip. Only the path is cleaned. */
+        const char *regex = al->count >= 2 ? al->args[1] : "";
+        if (!regex[0] || !a2[0])
+            return strdup("Error: grep needs a regex AND a path, e.g. grep \"for\" work.c");
+        return execute_readfile(a2, regex);
+    }
+    if (strcasecmp(name, "symbols") == 0) {
+        *phase = "symbols";
+        return a1[0] ? execute_symbols(a1, NULL)
+                     : strdup("Error: symbols needs a path, e.g. symbols work.c");
+    }
+    if (strcasecmp(name, "web_search") == 0) {
+        *phase = "web_search";
+        return a1[0] ? execute_web_search(a1, NULL)
+                     : strdup("Error: web_search needs a query: web_search \"<query>\"");
+    }
+    if (strcasecmp(name, "web_fetch") == 0) {
+        *phase = "web_fetch";
+        return a1[0] ? execute_web_fetch(a1)
+                     : strdup("Error: web_fetch needs a url: web_fetch \"<url>\"");
+    }
+    char *m = malloc(160);
+    if (m) snprintf(m, 160,
+        "Error: unknown tool '%.32s'. Use list | read | grep | symbols | web_search | web_fetch.", name);
+    *phase = "?";
+    return m;
+}
+
+/* Bounded, read-only investigation of the system under test. Returns a malloc'd
+ * evidence brief (caller frees) or NULL if grounding produced nothing usable.
+ * `context` is the same text the proposer will see (the question or prior verdict). */
+typedef struct { const char *role; char *content; } GTurn;
+static char *study_ground(int port, const char *context, StringBuf *log) {
+    /* Keep the native tool grammar out of the <tool> ReAct format, same reason
+     * deepsearch does: a native-tools model otherwise emits its trained tool-call
+     * syntax and extract_tool_call (legacy <tool>) can't parse it. Restored below. */
+    int prev_suppress = basi_srv_suppress_grammar;
+    basi_srv_suppress_grammar = 1;
+    /* Grounding is mechanical navigation (read/grep/list) — a <think> block per
+     * tool call is pure latency here (measured ~2 min/round on a reasoning model).
+     * Scope enable_thinking=false to this loop only; the hypothesis step that
+     * consumes the brief keeps full reasoning. Restored below. */
+    int prev_no_think = basi_srv_no_think;
+    basi_srv_no_think = 1;
+    int prev_tool_n = basi_tools_registered();
+    basi_set_tools(NULL, 0);
+
+    GTurn *turns = NULL; int nt = 0, cap = 0;
+#define GPUSH(R,C) do { \
+        if (nt == cap) { cap = cap ? cap*2 : 8; turns = realloc(turns, (size_t)cap*sizeof(*turns)); } \
+        turns[nt].role = (R); turns[nt].content = (C); nt++; } while (0)
+
+    GPUSH("system", strdup(GROUND_SYSTEM_PROMPT));
+    {
+        StringBuf u; sb_init(&u);
+        sb_append_str(&u, "Question the hypothesis will address:\n\n");
+        sb_append_str(&u, context);
+        GPUSH("user", sb_to_str(&u));
+    }
+
+    /* Hashes of results already returned, so a re-fetch of the SAME section is
+     * caught and nudged rather than silently burning a round. Reading a DIFFERENT
+     * section of a long file produces different bytes → different hash → allowed. */
+    unsigned long *seen = NULL; int nseen = 0, capseen = 0;
+
+    char *evidence = NULL;
+    printf("\033[36m[study/ground] investigating the system before proposing "
+           "(up to %d tool calls)\033[0m\n", GROUND_MAX_ROUNDS);
+    fflush(stdout);
+
+    for (int round = 1; round <= GROUND_MAX_ROUNDS && !evidence; round++) {
+        /* On the final round, force the brief instead of another tool. */
+        if (round == GROUND_MAX_ROUNDS && nt > 0 && strcmp(turns[nt-1].role, "user") == 0) {
+            const char *force = "\n\n[Investigation budget reached — emit the "
+                "<evidence>...</evidence> brief now from what you found; do not call another tool.]";
+            size_t ol = strlen(turns[nt-1].content);
+            char *nc = malloc(ol + strlen(force) + 1);
+            if (nc) { memcpy(nc, turns[nt-1].content, ol); strcpy(nc + ol, force);
+                      free(turns[nt-1].content); turns[nt-1].content = nc; }
+        }
+
+        Msgs m; msgs_init(&m);
+        for (int i = 0; i < nt; i++) msgs_add(&m, turns[i].role, turns[i].content);
+        char *msgs = msgs_done(&m);
+
+        SrvChatResult *r = srvchat_complete(port, msgs, NULL, NULL, GROUND_MAX_TOKENS, NULL, NULL, NULL);
+        free(msgs);
+        if (!r || !r->content || !*r->content) { if (r) srvchat_free(r); break; }
+        char *reply = trim_dup(r->content, strlen(r->content));
+        srvchat_free(r);
+        GPUSH("assistant", strdup(reply));
+
+        evidence = ground_extract_evidence(reply);
+        if (evidence) { free(reply); break; }
+
+        size_t tlen = 0;
+        const char *tbody = extract_tool_call(reply, &tlen);
+        if (!tbody) {
+            GPUSH("user", strdup("Emit exactly one <tool>...</tool> action, or the "
+                                 "<evidence>...</evidence> brief if you have enough facts."));
+            free(reply);
+            continue;
+        }
+        char *cmd = malloc(tlen + 1);
+        memcpy(cmd, tbody, tlen); cmd[tlen] = '\0';
+        ArgList al = tokenize_command(cmd);
+        free(cmd);
+        if (al.count < 1) {
+            arglist_free(&al);
+            GPUSH("user", strdup("That tool call was empty. Use e.g. <tool>read src/foo.c</tool>."));
+            free(reply);
+            continue;
+        }
+        const char *phase = "?";
+        char *raw = ground_dispatch(&al, &phase);
+        printf("\033[90m[study/ground %d/%d] %s: %.70s\033[0m\n",
+               round, GROUND_MAX_ROUNDS, phase, al.count >= 2 ? al.args[1] : "");
+        fflush(stdout);
+        arglist_free(&al);
+        if (!raw) raw = strdup("(no result)");
+
+        /* Same-section re-read guard: identical bytes to a prior result → no new
+         * information. Nudge toward a different section / file / the brief instead
+         * of feeding the duplicate back (which is what made it churn). */
+        unsigned long h = ground_hash(raw);
+        bool dup = false;
+        for (int i = 0; i < nseen; i++) if (seen[i] == h) { dup = true; break; }
+        if (dup) {
+            printf("\033[33m[study/ground %d/%d] duplicate result — nudging\033[0m\n",
+                   round, GROUND_MAX_ROUNDS);
+            fflush(stdout);
+            GPUSH("user", strdup(
+                "That returned content IDENTICAL to a result you already have — no new "
+                "information. Do not repeat it. Read a DIFFERENT section (read <path> "
+                "<start> <count>), investigate a different file, or emit the "
+                "<evidence>...</evidence> brief now."));
+            free(raw); free(reply);
+            continue;
+        }
+        if (nseen == capseen) { capseen = capseen ? capseen * 2 : 8;
+                                seen = realloc(seen, (size_t)capseen * sizeof(*seen)); }
+        seen[nseen++] = h;
+
+        StringBuf ob; sb_init(&ob);
+        sb_append_str(&ob, "Result:\n");
+        if (strlen(raw) > GROUND_OBS_CAP) {
+            char *tmp = malloc(GROUND_OBS_CAP + 1);
+            if (tmp) { memcpy(tmp, raw, GROUND_OBS_CAP); tmp[GROUND_OBS_CAP] = '\0';
+                       sb_append_str(&ob, tmp); free(tmp); }
+            sb_append_str(&ob, "\n...[truncated]");
+        } else {
+            sb_append_str(&ob, raw);
+        }
+        free(raw);
+        GPUSH("user", sb_to_str(&ob));
+        free(reply);
+    }
+
+    if (evidence && log) {
+        sb_append_str(log, "\n-- grounded evidence --\n");
+        sb_append_str(log, evidence);
+        sb_append_char(log, '\n');
+    }
+    if (!evidence) {
+        sb_append_str(log, "\n[study/ground] no evidence brief produced; proposing ungrounded.\n");
+        printf("\033[33m[study/ground] no brief produced; proposing ungrounded\033[0m\n");
+        fflush(stdout);
+    }
+    for (int i = 0; i < nt; i++) free(turns[i].content);
+    free(turns);
+    free(seen);
+#undef GPUSH
+
+    basi_srv_suppress_grammar = prev_suppress;
+    basi_srv_no_think = prev_no_think;
+    if (prev_tool_n > 0) { int n; const BasiToolDef *d = basi_tool_defs(&n); basi_set_tools(d, n); }
+
+    if (evidence && !*evidence) { free(evidence); evidence = NULL; }
+    return evidence;
+}
+
 /* Ask the model for a study artifact and keep asking, up to LOOP_MAX_ATTEMPTS,
  * feeding the validator's own errors back each time. Returns a malloc'd,
  * VALIDATED and safety-gated artifact, or NULL. *said_stop is set when the model
@@ -1628,6 +1983,10 @@ static char *propose_artifact(const StudyLoopOpts *opts, const char *user_msg,
     char *prev_reply = NULL, *feedback = NULL, *out = NULL;
     char line[1024];
     if (said_stop) *said_stop = false;
+
+    /* Gap ①: ground the hypothesis in the real system before proposing it. Done
+     * ONCE (not per retry attempt) — the evidence does not change between retries. */
+    char *evidence = study_grounding_on() ? study_ground(opts->port, user_msg, log) : NULL;
 
     for (int attempt = 1; attempt <= LOOP_MAX_ATTEMPTS && !out; attempt++) {
         Msgs m;
@@ -1659,6 +2018,21 @@ static char *propose_artifact(const StudyLoopOpts *opts, const char *user_msg,
                 msgs_add(&m, "user", hs);
                 free(hs);
             }
+        }
+
+        /* Inject the grounded evidence brief just before the proposal request, so
+         * the model writes its hypothesis, metric, and arms FROM these facts —
+         * ROBIN interpolates its literature review into the generation prompt the
+         * same way. */
+        if (evidence && *evidence) {
+            StringBuf eb; sb_init(&eb);
+            sb_append_str(&eb, "GROUNDED EVIDENCE about the system under test, gathered by "
+                               "read-only investigation just now. Base the hypothesis, the "
+                               "metric, and the arms on these FACTS — not on assumptions:\n\n");
+            sb_append_str(&eb, evidence);
+            char *es = sb_to_str(&eb);
+            msgs_add(&m, "user", es);
+            free(es);
         }
 
         msgs_add(&m, "user", user_msg);
@@ -1759,7 +2133,7 @@ static char *propose_artifact(const StudyLoopOpts *opts, const char *user_msg,
         }
         free(artifact); free(a1); free(a2); free(a3); free(a4);
     }
-    free(prev_reply); free(feedback);
+    free(prev_reply); free(feedback); free(evidence);
     return out;
 }
 

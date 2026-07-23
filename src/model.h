@@ -50,6 +50,12 @@ extern SrvSampling basi_srv_sampling;
 /* When nonzero, generate_server() omits the tool-call grammar (deepsearch sets it
    around its own ReAct loop so the main tool grammar can't leak in). */
 extern int basi_srv_suppress_grammar;
+/* When nonzero, build_request() sets chat_template_kwargs.enable_thinking=false on
+   every /v1/chat/completions request — the scoped, per-request form of
+   BASI_NO_THINK. study_ground sets it around its grounding ReAct loop so the model
+   navigates the code without a <think> block per tool call; the hypothesis step
+   leaves it 0 and keeps reasoning. Caller-scoped, always restored (never setenv). */
+extern int basi_srv_no_think;
 
 /* Server-chat generation (item 6b): serialize `messages` (+ registered tools) and
    drive /v1/chat/completions. Returns the answer text (res.text) + the server's

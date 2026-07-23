@@ -14,6 +14,10 @@
 
 using json = nlohmann::json;
 
+/* Defined in model.c. When nonzero, a caller (study_ground) has scoped a no-think
+   region: add enable_thinking=false to every request until it clears the flag. */
+extern "C" int basi_srv_no_think;
+
 static double srvchat_now_s(void) {
     struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
     return ts.tv_sec + ts.tv_nsec / 1e9;
@@ -45,7 +49,9 @@ static std::string build_request(const char *messages_json, const char *tools_js
      * reasoning-tuned model (Qwen3.x) the per-turn <think> span dominates
      * generation time; disabling it via the chat template's enable_thinking=false
      * kwarg makes the agent loop several times faster at some accuracy cost. */
-    if (const char *nt = getenv("BASI_NO_THINK"); nt && *nt && atoi(nt)) {
+    const char *nt = getenv("BASI_NO_THINK");
+    bool no_think = basi_srv_no_think || (nt && *nt && atoi(nt));
+    if (no_think) {
         req["chat_template_kwargs"] = json{{"enable_thinking", false}};
         req["reasoning_budget"] = 0;   /* llama-server native no-think, if supported */
     }

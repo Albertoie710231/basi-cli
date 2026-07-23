@@ -89,6 +89,14 @@ SrvSampling basi_srv_sampling = { .temperature = 0.4, .repeat_penalty = 1.1, .re
    grammar; this flag reproduces that on the server path so the main tool grammar
    can't leak into deepsearch's rounds or its final synthesis. */
 int basi_srv_suppress_grammar = 0;
+/* When set, build_request() adds chat_template_kwargs.enable_thinking=false to
+   every chat-completions request — the per-request equivalent of BASI_NO_THINK,
+   scoped by a caller that sets it around a sub-loop. study_ground sets it around
+   its ReAct grounding turns: a Gemma-4 / Qwen3.x model then investigates the
+   codebase WITHOUT a multi-thousand-token <think> per tool call, while the
+   hypothesis step (which does NOT set it) keeps full reasoning. Not process-wide:
+   it is a scoped toggle, restored by the caller — never a global setenv. */
+int basi_srv_no_think = 0;
 
 
 /* ── Chat-completions path (item 6b): server templates from messages, owns the
