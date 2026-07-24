@@ -3276,9 +3276,17 @@ static int factory_parse(const char *text, FactoryTheory *out, int max) {
 }
 
 /* Measure with theory `t` applied (or baseline if NULL): back up file, apply exact
- * SEARCH->REPLACE, run measure, restore. 1=ok, 0=measure/extract failed, -1=SEARCH not found. */
+ * SEARCH->REPLACE, optionally gate on a correctness command, run measure, restore.
+ *   1=ok, 0=measure/extract failed, -1=SEARCH not found, -2=correctness (--verify) failed.
+ * The correctness gate is the same principle as BASI's behavior-preservation guard
+ * (reuse_regress_guard, wired into the interactive `edit` path): a performance edit may
+ * only count as a win if it PRESERVES behavior. `verify` (may be NULL) is a shell command
+ * that must exit 0 on the edited file; a non-zero exit means the edit changed what the
+ * program does (e.g. "reduce N" computes a different result), so the theory is rejected
+ * instead of being measured as a speedup. We validate `verify` passes on the pristine
+ * baseline before the loop, so a failure here is attributable to THIS edit. */
 static int factory_trial(const FactoryTheory *t, const char *measure, const regex_t *re,
-                         int timeout_s, double *out) {
+                         int timeout_s, const char *verify, double *out) {
     char *orig = NULL; size_t ol = 0;
     if (t) {
         orig = kb_read_file(t->file, &ol);
@@ -3291,6 +3299,17 @@ static int factory_trial(const FactoryTheory *t, const char *measure, const rege
         fwrite(t->replace, 1, strlen(t->replace), f);
         fputs(pos + strlen(t->search), f);
         fclose(f);
+
+        if (verify && *verify) {
+            int vec = -1;
+            char *vout = run_command_status(verify, 64 * 1024, &vec);
+            free(vout);
+            if (vec != 0) {                                  /* correctness broken by this edit */
+                FILE *r = fopen(t->file, "w"); if (r) { fwrite(orig, 1, ol, r); fclose(r); }
+                free(orig);
+                return -2;
+            }
+        }
     }
     int to = 0;
     char *outp = run_command_timeout(measure, 512 * 1024, timeout_s, &to);
@@ -3300,7 +3319,7 @@ static int factory_trial(const FactoryTheory *t, const char *measure, const rege
     return rc;
 }
 
-typedef struct { int idx, ok; double val; } FacRank;
+typedef struct { int idx, ok, rc; double val; } FacRank;
 static int fac_cmp_hi(const void *a, const void *b) { double x=((const FacRank*)a)->val,y=((const FacRank*)b)->val; return (x<y)-(x>y); }
 static int fac_cmp_lo(const void *a, const void *b) { double x=((const FacRank*)a)->val,y=((const FacRank*)b)->val; return (x>y)-(x<y); }
 
@@ -3482,13 +3501,14 @@ static char *factory_retrieve_big(const char *path, const char *question, size_t
 }
 
 int cmd_factory(int argc, char **argv) {
-    const char *question = NULL, *measure = NULL, *extract = "([0-9]+\\.[0-9]+)";
+    const char *question = NULL, *measure = NULL, *extract = "([0-9]+\\.[0-9]+)", *verify = NULL;
     int port = 8181, timeout_s = 1800, maxth = 6; bool minimize = false;
     const char *files[FACTORY_MAX_FILES]; int nfiles = 0;
     { const char *pe = getenv("BASI_SERVER_PORT"); if (pe && *pe) port = atoi(pe); }
     for (int i = 0; i < argc; i++) {   /* argv[0] is already the first flag (dispatch passed argv+2) */
         if      (!strcmp(argv[i], "--question") && i+1 < argc) question = argv[++i];
         else if (!strcmp(argv[i], "--measure")  && i+1 < argc) measure  = argv[++i];
+        else if (!strcmp(argv[i], "--verify")   && i+1 < argc) verify   = argv[++i];
         else if (!strcmp(argv[i], "--extract")  && i+1 < argc) extract  = argv[++i];
         else if (!strcmp(argv[i], "--theories") && i+1 < argc) maxth    = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--timeout")  && i+1 < argc) timeout_s= atoi(argv[++i]);
@@ -3512,6 +3532,9 @@ int cmd_factory(int argc, char **argv) {
           "                 context-compaction embedder/BM25): ctags symbol map + verbatim windows\n"
           "                 around the chunks most relevant to the question\n"
           "  --extract <regex>  capture group 1 = the metric (default: the last N.N in output)\n"
+          "  --verify <cmd> correctness gate: must exit 0 on the edited file, else the theory is\n"
+          "                 REJECTED (a speedup that changes behavior is not a win). Same principle\n"
+          "                 as BASI's edit-path behavior guard; validated on the baseline first.\n"
           "  --theories N   cap candidates (default 6)    --minimize   lower metric is better\n"
           "  --timeout S    per-measure seconds (default 1800; builds are slow)\n");
         return 2;
@@ -3577,19 +3600,33 @@ int cmd_factory(int argc, char **argv) {
 
     printf("-- measuring baseline --\n"); fflush(stdout);
     double base = 0;
-    if (factory_trial(NULL, measure, &re, timeout_s, &base) != 1) {
+    if (factory_trial(NULL, measure, &re, timeout_s, NULL, &base) != 1) {
         fprintf(stderr, "factory: baseline measure produced no number matching the extract regex.\n");
         for (int i=0;i<nth;i++) { fac_free(&th[i]); }
         free(th_txt); regfree(&re); sb_free(&log); return 1;
     }
     printf("  baseline = %g\n", base);
 
+    /* The correctness gate is only trustworthy if it PASSES on the unedited baseline —
+     * else a failure during a trial can't be blamed on the edit. Validate it once here. */
+    if (verify && *verify) {
+        int vec = -1; char *vout = run_command_status(verify, 64 * 1024, &vec); free(vout);
+        if (vec != 0) {
+            fprintf(stderr, "factory: --verify must pass on the UNEDITED baseline, but it exited %d.\n"
+                            "  It is the correctness oracle; fix it so it succeeds before any edit.\n", vec);
+            for (int i=0;i<nth;i++) fac_free(&th[i]);
+            free(th_txt); regfree(&re); sb_free(&log); return 1;
+        }
+        printf("  --verify passes on baseline; theories that break correctness will be rejected\n");
+    }
+
     FacRank rank[FACTORY_MAX_THEORIES];
     for (int i = 0; i < nth; i++) {
         printf("-- T%d/%d --\n", i+1, nth); fflush(stdout);
-        double v = 0; int rc = factory_trial(&th[i], measure, &re, timeout_s, &v);
-        rank[i].idx = i; rank[i].ok = (rc == 1); rank[i].val = v;
+        double v = 0; int rc = factory_trial(&th[i], measure, &re, timeout_s, verify, &v);
+        rank[i].idx = i; rank[i].ok = (rc == 1); rank[i].rc = rc; rank[i].val = v;
         if (rc == 1) printf("  T%d  metric=%g  (%+.2f%% vs %g)  ::  %s\n", i+1, v, base!=0?(v-base)/base*100:0, base, th[i].desc?th[i].desc:"");
+        else if (rc == -2) printf("  T%d  REJECTED -- edit changes behavior (--verify failed)  ::  %s\n", i+1, th[i].desc?th[i].desc:"");
         else if (rc == -1) printf("  T%d  SEARCH not found -- could not apply  ::  %s\n", i+1, th[i].desc?th[i].desc:"");
         else printf("  T%d  measure failed  ::  %s\n", i+1, th[i].desc?th[i].desc:"");
     }
@@ -3598,8 +3635,9 @@ int cmd_factory(int argc, char **argv) {
     printf("\n==== CONCLUSION (baseline %g; %s is better) ====\n", base, minimize ? "lower" : "higher");
     for (int i = 0; i < nth; i++) {
         int k = rank[i].idx;
-        if (rank[i].ok) printf("  %+.2f%%  metric=%g  ::  %s\n", base!=0?(rank[i].val-base)/base*100:0, rank[i].val, th[k].desc?th[k].desc:"");
-        else            printf("  (n/a)  ::  %s\n", th[k].desc?th[k].desc:"");
+        if (rank[i].ok)              printf("  %+.2f%%  metric=%g  ::  %s\n", base!=0?(rank[i].val-base)/base*100:0, rank[i].val, th[k].desc?th[k].desc:"");
+        else if (rank[i].rc == -2)   printf("  (rejected: changes behavior)  ::  %s\n", th[k].desc?th[k].desc:"");
+        else                         printf("  (n/a)  ::  %s\n", th[k].desc?th[k].desc:"");
     }
     printf("Note: a delta within your measurement noise is not a real win.\n");
 
