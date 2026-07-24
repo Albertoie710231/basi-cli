@@ -3307,6 +3307,138 @@ static int fac_cmp_lo(const void *a, const void *b) { double x=((const FacRank*)
 #define FACTORY_MAX_THEORIES 12
 #define FACTORY_MAX_FILES     8
 #define FACTORY_INJECT_CAP (48*1024)   /* per-file byte cap when injecting source into the theory prompt */
+
+/* ── Big-file retrieval fallback ──────────────────────────────────────────────
+ * When a --file is larger than the verbatim-inject budget, do NOT truncate to the
+ * head — that silently drops the region that matters. Instead RETRIEVE the relevant
+ * parts, reusing the code subsystems: the ctags symbol map (execute_symbols) for
+ * structure, plus raw windows around every line that greps a question keyword. The
+ * windows are emitted VERBATIM (no line-number prefix) so the model's @@SEARCH@@
+ * copies still match the file byte-for-byte on apply. */
+
+static int fac_wordch(char c) {
+    return (c>='a'&&c<='z')||(c>='A'&&c<='Z')||(c>='0'&&c<='9')||c=='_';
+}
+
+/* Question -> distinct code-ish keywords (len>=4, minus English glue words). Kept in
+ * original case; matching is case-insensitive via strcasestr. */
+static int factory_keywords(const char *q, char **kw, int maxkw) {
+    static const char *stop[] = {
+        "make","made","the","that","this","with","from","into","should","which","what",
+        "when","where","have","your","their","them","then","than","using","used","uses",
+        "faster","slower","lower","higher","better","worse","prints","print","number",
+        "value","metric","given","here","must","most","more","less","code","file","some",
+        "each","any","are","for","and","not","but","its","the", NULL };
+    int n = 0;
+    const char *p = q;
+    while (*p && n < maxkw) {
+        while (*p && !fac_wordch(*p)) p++;
+        const char *s = p;
+        while (*p && fac_wordch(*p)) p++;
+        size_t l = (size_t)(p - s);
+        if (l < 4) continue;
+        char *w = malloc(l + 1);
+        if (!w) break;
+        memcpy(w, s, l); w[l] = '\0';
+        int skip = 0;
+        for (int i = 0; stop[i]; i++) if (!strcasecmp(w, stop[i])) { skip = 1; break; }
+        for (int i = 0; !skip && i < n; i++) if (!strcasecmp(w, kw[i])) { skip = 1; break; }
+        if (skip) { free(w); continue; }
+        kw[n++] = w;
+    }
+    return n;
+}
+
+#define FAC_CTX_LINES 8   /* verbatim context lines on each side of a keyword hit */
+
+static char *factory_retrieve_big(const char *path, const char *question, size_t cap) {
+    size_t len = 0;
+    char *buf = kb_read_file(path, &len);
+    if (!buf) return NULL;
+
+    /* line-start offset table (lstart[k]..lstart[k+1] spans line k) */
+    int total = 1;
+    for (size_t i = 0; i < len; i++) if (buf[i] == '\n') total++;
+    size_t *lstart = malloc((size_t)(total + 1) * sizeof(*lstart));
+    if (!lstart) { free(buf); return NULL; }
+    int nl = 0; lstart[nl++] = 0;
+    for (size_t i = 0; i < len; i++) if (buf[i] == '\n') lstart[nl++] = i + 1;
+    lstart[nl] = len;   /* sentinel */
+    total = nl;
+
+    char *kw[16];
+    int nkw = factory_keywords(question, kw, 16);
+
+    /* grep: mark every line that contains a question keyword */
+    char *hit = calloc((size_t)total, 1);
+    int nhits = 0;
+    if (hit && nkw > 0) {
+        for (int L = 0; L < total; L++) {
+            size_t s = lstart[L], e = lstart[L + 1];
+            size_t ll = e > s ? e - s : 0;
+            if (!ll) continue;
+            char *line = malloc(ll + 1);
+            if (!line) break;
+            memcpy(line, buf + s, ll); line[ll] = '\0';
+            for (int k = 0; k < nkw; k++)
+                if (strcasestr(line, kw[k])) { hit[L] = 1; nhits++; break; }
+            free(line);
+        }
+    }
+
+    StringBuf o; sb_init(&o);
+
+    /* structure: the ctags symbol map (capped to a third of the budget) */
+    char *sym = execute_symbols(path, NULL);
+    if (sym) {
+        sb_append_str(&o, "\n----- symbol map (");
+        sb_append_str(&o, path);
+        sb_append_str(&o, ", ctags) -----\n");
+        size_t symcap = cap / 3, sl = strlen(sym);
+        sb_append(&o, sym, sl < symcap ? sl : symcap);
+        sb_append_char(&o, '\n');
+        free(sym);
+    }
+
+    if (nhits == 0) {
+        /* No keyword landed — inject the head as a last resort (still better than a
+         * silently-partial verbatim dump the model can't reason about). */
+        sb_append_str(&o, "\n----- head of ");
+        sb_append_str(&o, path);
+        sb_append_str(&o, " (no question keyword matched; showing the top) -----\n");
+        size_t room = o.len < cap ? cap - o.len : 0;
+        sb_append(&o, buf, len < room ? len : room);
+    } else {
+        /* merge nearby hits into windows; emit each VERBATIM until the budget is spent */
+        int L = 0;
+        while (L < total && o.len < cap) {
+            if (!hit[L]) { L++; continue; }
+            int ws = L - FAC_CTX_LINES; if (ws < 0) ws = 0;
+            int we = L + FAC_CTX_LINES;
+            int j = L + 1;
+            while (j < total && j <= we + FAC_CTX_LINES) {   /* extend to swallow adjacent hits */
+                if (hit[j]) we = j + FAC_CTX_LINES;
+                j++;
+            }
+            if (we >= total) we = total - 1;
+            char hdr[360];
+            snprintf(hdr, sizeof(hdr),
+                     "\n----- %.256s lines %d-%d (verbatim; copy SEARCH text from here) -----\n",
+                     path, ws + 1, we + 1);
+            sb_append_str(&o, hdr);
+            size_t bs = lstart[ws], be = lstart[we + 1];
+            size_t blen = be > bs ? be - bs : 0;
+            size_t room = o.len < cap ? cap - o.len : 0;
+            sb_append(&o, buf + bs, blen < room ? blen : room);
+            L = we + 1;
+        }
+    }
+
+    for (int i = 0; i < nkw; i++) free(kw[i]);
+    free(hit); free(lstart); free(buf);
+    return sb_to_str(&o);
+}
+
 int cmd_factory(int argc, char **argv) {
     const char *question = NULL, *measure = NULL, *extract = "([0-9]+\\.[0-9]+)";
     int port = 8181, timeout_s = 1800, maxth = 6; bool minimize = false;
@@ -3333,7 +3465,9 @@ int cmd_factory(int argc, char **argv) {
           "  runs (it builds/tests and PRINTS A NUMBER), the file is restored, and the\n"
           "  theories are ranked by the metric vs a no-edit baseline.\n"
           "  --file <path>  inject this source VERBATIM into the theory prompt (repeatable);\n"
-          "                 grounds the proposals in the real code so SEARCH text actually matches\n"
+          "                 grounds the proposals in the real code so SEARCH text actually matches.\n"
+          "                 A file too big to inject whole falls back to retrieval: the ctags\n"
+          "                 symbol map + verbatim windows around question-keyword hits\n"
           "  --extract <regex>  capture group 1 = the metric (default: the last N.N in output)\n"
           "  --theories N   cap candidates (default 6)    --minimize   lower metric is better\n"
           "  --timeout S    per-measure seconds (default 1800; builds are slow)\n");
@@ -3355,21 +3489,36 @@ int cmd_factory(int argc, char **argv) {
      * the exact-match apply lands. Files present => pre_grounded (skip the read gate). */
     StringBuf ctx; sb_init(&ctx);
     sb_append_str(&ctx, question);
+    int retrieved = 0;
     for (int i = 0; i < nfiles; i++) {
         size_t fl = 0; char *fc = kb_read_file(files[i], &fl);
         if (!fc) { fprintf(stderr, "factory: --file '%s' not readable\n", files[i]); sb_free(&ctx); regfree(&re); return 1; }
-        int truncd = 0;
-        if (fl > FACTORY_INJECT_CAP) { fl = FACTORY_INJECT_CAP; truncd = 1; }
-        sb_append_str(&ctx, "\n\n===== FILE: ");
-        sb_append_str(&ctx, files[i]);
-        sb_append_str(&ctx, " (your @@SEARCH@@ text must match these bytes VERBATIM) =====\n");
-        sb_append(&ctx, fc, fl);
-        if (truncd) sb_append_str(&ctx, "\n...[truncated]...");
-        free(fc);
+        if (fl <= FACTORY_INJECT_CAP) {
+            /* small enough: inject the whole file verbatim */
+            sb_append_str(&ctx, "\n\n===== FILE: ");
+            sb_append_str(&ctx, files[i]);
+            sb_append_str(&ctx, " (your @@SEARCH@@ text must match these bytes VERBATIM) =====\n");
+            sb_append(&ctx, fc, fl);
+            free(fc);
+        } else {
+            /* too big to inject whole: fall back to retrieval (symbol map + verbatim
+             * windows around question-keyword hits) instead of a blind head-truncation. */
+            free(fc);
+            char *r = factory_retrieve_big(files[i], question, FACTORY_INJECT_CAP);
+            if (!r) { fprintf(stderr, "factory: retrieval of '%s' failed\n", files[i]); sb_free(&ctx); regfree(&re); return 1; }
+            sb_append_str(&ctx, "\n\n===== FILE (too large to show whole; RETRIEVED excerpts — "
+                                "your @@SEARCH@@ text must match a verbatim window below): ");
+            sb_append_str(&ctx, files[i]);
+            sb_append_str(&ctx, " =====\n");
+            sb_append(&ctx, r, strlen(r));
+            free(r);
+            retrieved++;
+        }
     }
     char *ctx_s = sb_to_str(&ctx);
 
-    fprintf(stderr, "factory: generating theories...%s\n", nfiles ? " (source injected)" : "");
+    fprintf(stderr, "factory: generating theories...%s\n",
+            nfiles ? (retrieved ? " (source injected; large files retrieved by keyword)" : " (source injected)") : "");
     StringBuf log; sb_init(&log);
     char *th_txt = study_react_brief(port, FACTORY_THEORY_PROMPT,
         "Optimization question — find code changes that improve the metric:\n\n",
