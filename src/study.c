@@ -3275,9 +3275,22 @@ static int factory_parse(const char *text, FactoryTheory *out, int max) {
     return n;
 }
 
+#define FACTORY_MAX_REPEAT 25
+
+static int fac_cmp_dbl(const void *a, const void *b) {
+    double x = *(const double*)a, y = *(const double*)b; return (x>y)-(x<y);
+}
+/* Median of a sample (sorts `v` in place). Median, not mean: one cold or descheduled
+ * run is a fat outlier, and the mean would carry it into the verdict. */
+static double fac_median(double *v, int n) {
+    qsort(v, (size_t)n, sizeof *v, fac_cmp_dbl);
+    return (n & 1) ? v[n/2] : (v[n/2 - 1] + v[n/2]) / 2.0;
+}
+
 /* Measure with theory `t` applied (or baseline if NULL): back up file, apply exact
- * SEARCH->REPLACE, run measure once, restore.
+ * SEARCH->REPLACE, run measure `warmup + repeat` times, restore.
  *   1=ok, 0=measure/extract failed, -1=SEARCH not found, -2=correctness failed.
+ *
  * Correctness (behavior-preservation, same principle as reuse_regress_guard):
  *   PREFERRED — `expect_re`: one regex that must match the measure output (stdout+stderr
  *     merged). The measure cmd emits BOTH the metric and a correctness token in a single
@@ -3285,10 +3298,20 @@ static int factory_parse(const char *text, FactoryTheory *out, int max) {
  *   LEGACY    — `verify` shell cmd (exit 0), run BEFORE measure when expect_re is NULL.
  *     Two full build+runs per theory; expensive on kernels. Prefer --expect.
  * Baseline is validated the same way before the trial loop, so a -2 is attributable to
- * THIS edit. */
+ * THIS edit. Every repeat is gated, so a theory that is only *intermittently* correct
+ * is rejected rather than being ranked on the run that happened to pass.
+ *
+ * WHY REPEAT (measured 07-23, small fixture, nothing edited): 9 back-to-back baseline
+ * runs gave 92.0 92.0 | 71.4 71.7 72.6 71.6 72.3 71.3 71.3 — a cold regime ~28% above a
+ * warm steady state whose own spread is ~1.8%. Measuring the baseline ONCE and FIRST
+ * therefore put a directional thumb on the scale: every theory ran warm against a cold
+ * baseline and looked faster. That is not noise that averages out over theories, so the
+ * caller discards `warmup` leading runs and ranks on the median of the rest. */
 static int factory_trial(const FactoryTheory *t, const char *measure, const regex_t *re,
                          int timeout_s, const char *verify, const regex_t *expect_re,
-                         double *out) {
+                         int warmup, int repeat, double *out, double *spread_out) {
+    if (repeat < 1) repeat = 1;
+    if (repeat > FACTORY_MAX_REPEAT) repeat = FACTORY_MAX_REPEAT;
     char *orig = NULL; size_t ol = 0;
     if (t) {
         orig = kb_read_file(t->file, &ol);
@@ -3314,23 +3337,31 @@ static int factory_trial(const FactoryTheory *t, const char *measure, const rege
             }
         }
     }
-    int to = 0;
-    char *outp = run_command_timeout(measure, 512 * 1024, timeout_s, &to);
-    int rc = 0;
-    if (outp && !to && extract_metric(re, outp, out, NULL, NULL, NULL)) {
-        if (expect_re) {
-            /* single-run gate: metric extracted AND correctness token present */
-            rc = (regexec(expect_re, outp, 0, NULL, 0) == 0) ? 1 : -2;
-        } else {
-            rc = 1;
-        }
+
+    double s[FACTORY_MAX_REPEAT]; int ns = 0, rc = 1;
+    for (int i = 0; i < warmup + repeat; i++) {
+        int to = 0;
+        char *outp = run_command_timeout(measure, 512 * 1024, timeout_s, &to);
+        double v = 0;
+        if (!outp || to || !extract_metric(re, outp, &v, NULL, NULL, NULL)) { rc = 0; free(outp); break; }
+        if (expect_re && regexec(expect_re, outp, 0, NULL, 0) != 0) { rc = -2; free(outp); break; }
+        free(outp);
+        if (i >= warmup) s[ns++] = v;      /* leading `warmup` runs are thrown away */
     }
-    free(outp);
+    if (rc == 1 && ns > 0) {
+        double lo = s[0], hi = s[0];                /* range computed before fac_median sorts s[] */
+        for (int i = 1; i < ns; i++) { if (s[i] < lo) lo = s[i]; if (s[i] > hi) hi = s[i]; }
+        *out = fac_median(s, ns);
+        if (spread_out) *spread_out = hi - lo;
+    } else if (rc == 1) {
+        rc = 0;                                     /* no samples kept */
+    }
+
     if (t && orig) { FILE *f = fopen(t->file, "w"); if (f) { fwrite(orig, 1, ol, f); fclose(f); } free(orig); }
     return rc;
 }
 
-typedef struct { int idx, ok, rc; double val; } FacRank;
+typedef struct { int idx, ok, rc, noise; double val; } FacRank;
 static int fac_cmp_hi(const void *a, const void *b) { double x=((const FacRank*)a)->val,y=((const FacRank*)b)->val; return (x<y)-(x>y); }
 static int fac_cmp_lo(const void *a, const void *b) { double x=((const FacRank*)a)->val,y=((const FacRank*)b)->val; return (x>y)-(x<y); }
 
@@ -3514,7 +3545,7 @@ static char *factory_retrieve_big(const char *path, const char *question, size_t
 int cmd_factory(int argc, char **argv) {
     const char *question = NULL, *measure = NULL, *extract = "([0-9]+\\.[0-9]+)", *verify = NULL;
     const char *expect = NULL;
-    int port = 8181, timeout_s = 1800, maxth = 6; bool minimize = false;
+    int port = 8181, timeout_s = 1800, maxth = 6, repeat = 3; bool minimize = false;
     const char *files[FACTORY_MAX_FILES]; int nfiles = 0;
     { const char *pe = getenv("BASI_SERVER_PORT"); if (pe && *pe) port = atoi(pe); }
     for (int i = 0; i < argc; i++) {   /* argv[0] is already the first flag (dispatch passed argv+2) */
@@ -3524,6 +3555,7 @@ int cmd_factory(int argc, char **argv) {
         else if (!strcmp(argv[i], "--expect")   && i+1 < argc) expect   = argv[++i];
         else if (!strcmp(argv[i], "--extract")  && i+1 < argc) extract  = argv[++i];
         else if (!strcmp(argv[i], "--theories") && i+1 < argc) maxth    = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--repeat")   && i+1 < argc) repeat   = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--timeout")  && i+1 < argc) timeout_s= atoi(argv[++i]);
         else if (!strcmp(argv[i], "--port")     && i+1 < argc) port     = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--file")     && i+1 < argc) {
@@ -3551,6 +3583,11 @@ int cmd_factory(int argc, char **argv) {
           "  --verify <cmd> correctness gate (LEGACY): separate cmd must exit 0 (a second full\n"
           "                 build+run per theory). Prefer --expect for heavy pipelines.\n"
           "  --theories N   cap candidates (default 6)    --minimize   lower metric is better\n"
+          "  --repeat N     scored measure runs per candidate (default 3). The baseline also\n"
+          "                 gets one DISCARDED warm-up run first (a cold first run measured ~28%%\n"
+          "                 high here), and the spread of the baseline's scored runs becomes the\n"
+          "                 noise band: a delta inside it is reported as no win. --repeat 1\n"
+          "                 restores the old single-shot behaviour and measures no band.\n"
           "  --timeout S    per-measure seconds (default 1800; builds are slow)\n");
         return 2;
     }
@@ -3559,6 +3596,8 @@ int cmd_factory(int argc, char **argv) {
 
     char hc[192]; snprintf(hc, sizeof(hc), "curl -sf -o /dev/null http://127.0.0.1:%d/health", port);
     if (system(hc) != 0) { fprintf(stderr, "factory: no healthy llama-server on :%d (the theory step needs one).\n", port); return 1; }
+    if (repeat < 1) repeat = 1;
+    if (repeat > FACTORY_MAX_REPEAT) repeat = FACTORY_MAX_REPEAT;
     regex_t re;
     if (regcomp(&re, extract, REG_EXTENDED | REG_NEWLINE) != 0) { fprintf(stderr, "factory: --extract regex does not compile\n"); return 2; }
     regex_t expect_re_storage, *expect_re = NULL;
@@ -3622,11 +3661,16 @@ int cmd_factory(int argc, char **argv) {
     printf("factory: %d theories\n", nth);
     for (int i = 0; i < nth; i++) printf("  T%d: %s\n", i+1, th[i].desc ? th[i].desc : "(no desc)");
 
-    printf("-- measuring baseline --\n"); fflush(stdout);
-    double base = 0;
-    /* Baseline measure ALSO runs the --expect gate (same single run). A failure here means
-     * the oracle is broken on the pristine tree, not that an edit is wrong. */
-    int brc = factory_trial(NULL, measure, &re, timeout_s, NULL, expect_re, &base);
+    printf("-- measuring baseline (%d warm-up + %d scored runs) --\n", repeat > 1 ? 1 : 0, repeat);
+    fflush(stdout);
+    double base = 0, band = 0;
+    /* Baseline measure ALSO runs the --expect gate (same runs). A failure here means the
+     * oracle is broken on the pristine tree, not that an edit is wrong.
+     * The first run is discarded: it is cold, and every theory after it would otherwise be
+     * compared against an inflated baseline. The spread of the scored runs IS the noise
+     * band that a theory must beat to count as a win. */
+    int brc = factory_trial(NULL, measure, &re, timeout_s, NULL, expect_re,
+                            repeat > 1 ? 1 : 0, repeat, &base, &band);
     if (brc == -2) {
         fprintf(stderr, "factory: --expect regex did not match the UNEDITED baseline measure output.\n"
                         "  The measure cmd must emit the correctness token even before any edit.\n");
@@ -3638,7 +3682,20 @@ int cmd_factory(int argc, char **argv) {
         for (int i=0;i<nth;i++) { fac_free(&th[i]); }
         free(th_txt); regfree(&re); if (expect_re) regfree(expect_re); sb_free(&log); return 1;
     }
-    printf("  baseline = %g\n", base);
+    printf("  baseline = %g  (median of %d)\n", base, repeat);
+    if (repeat > 1) {
+        printf("  noise band = %g (%.2f%%) -- a delta this small is NOT a win\n",
+               band, base != 0 ? band / base * 100 : 0);
+        /* The band is the RANGE of `repeat` samples, so it is itself a noisy estimate that
+         * grows with n. Measured on ONE unedited fixture: 1.04% at --repeat 3, then 4.20%
+         * and 1.47% on two separate --repeat 5 runs. A bigger --repeat is more conservative,
+         * but no small n makes the band stable — a delta that only just clears it is not a
+         * result, it is a coin flip. Say so rather than let the number look authoritative. */
+        printf("  (band = range of %d samples; it is an ESTIMATE that grows with --repeat."
+               " A delta that only just clears it is not a result.)\n", repeat);
+    } else {
+        printf("  WARNING: --repeat 1 measures no noise band, so any delta will look like a win.\n");
+    }
     if (expect_re)
         printf("  --expect matched on baseline; theories whose measure drops the token will be rejected\n");
 
@@ -3658,23 +3715,34 @@ int cmd_factory(int argc, char **argv) {
     const char *vcmd = expect_re ? NULL : verify;   /* trials: expect folds verify away */
     for (int i = 0; i < nth; i++) {
         printf("-- T%d/%d --\n", i+1, nth); fflush(stdout);
-        double v = 0; int rc = factory_trial(&th[i], measure, &re, timeout_s, vcmd, expect_re, &v);
+        /* No warm-up for a theory: the process is already warm by now, and a warm-up here
+         * would only re-introduce the asymmetry the baseline warm-up exists to remove. */
+        double v = 0; int rc = factory_trial(&th[i], measure, &re, timeout_s, vcmd, expect_re, 0, repeat, &v, NULL);
         rank[i].idx = i; rank[i].ok = (rc == 1); rank[i].rc = rc; rank[i].val = v;
-        if (rc == 1) printf("  T%d  metric=%g  (%+.2f%% vs %g)  ::  %s\n", i+1, v, base!=0?(v-base)/base*100:0, base, th[i].desc?th[i].desc:"");
+        rank[i].noise = (rc == 1 && fabs(v - base) <= band);
+        if (rc == 1) printf("  T%d  metric=%g  (%+.2f%% vs %g)%s  ::  %s\n", i+1, v,
+                            base!=0?(v-base)/base*100:0, base,
+                            rank[i].noise ? "  [INSIDE NOISE]" : "", th[i].desc?th[i].desc:"");
         else if (rc == -2) printf("  T%d  REJECTED -- edit changes behavior  ::  %s\n", i+1, th[i].desc?th[i].desc:"");
         else if (rc == -1) printf("  T%d  SEARCH not found -- could not apply  ::  %s\n", i+1, th[i].desc?th[i].desc:"");
         else printf("  T%d  measure failed  ::  %s\n", i+1, th[i].desc?th[i].desc:"");
     }
 
     qsort(rank, (size_t)nth, sizeof(rank[0]), minimize ? fac_cmp_lo : fac_cmp_hi);
-    printf("\n==== CONCLUSION (baseline %g; %s is better) ====\n", base, minimize ? "lower" : "higher");
+    printf("\n==== CONCLUSION (baseline %g, noise band %g; %s is better) ====\n",
+           base, band, minimize ? "lower" : "higher");
+    int nwin = 0;
     for (int i = 0; i < nth; i++) {
         int k = rank[i].idx;
-        if (rank[i].ok)              printf("  %+.2f%%  metric=%g  ::  %s\n", base!=0?(rank[i].val-base)/base*100:0, rank[i].val, th[k].desc?th[k].desc:"");
-        else if (rank[i].rc == -2)   printf("  (rejected: changes behavior)  ::  %s\n", th[k].desc?th[k].desc:"");
-        else                         printf("  (n/a)  ::  %s\n", th[k].desc?th[k].desc:"");
+        double d = base != 0 ? (rank[i].val - base) / base * 100 : 0;
+        if (rank[i].ok && rank[i].noise) printf("  (inside noise)  metric=%g  %+.2f%%  ::  %s\n", rank[i].val, d, th[k].desc?th[k].desc:"");
+        else if (rank[i].ok)             { printf("  %+.2f%%  metric=%g  ::  %s\n", d, rank[i].val, th[k].desc?th[k].desc:"");
+                                           if (minimize ? (rank[i].val < base) : (rank[i].val > base)) nwin++; }
+        else if (rank[i].rc == -2)       printf("  (rejected: changes behavior)  ::  %s\n", th[k].desc?th[k].desc:"");
+        else                             printf("  (n/a)  ::  %s\n", th[k].desc?th[k].desc:"");
     }
-    printf("Note: a delta within your measurement noise is not a real win.\n");
+    if (nwin == 0)
+        printf("\nNo theory beat the noise band. The honest answer is NO WIN, not the top row.\n");
 
     for (int i = 0; i < nth; i++) fac_free(&th[i]);
     free(th_txt); regfree(&re); if (expect_re) regfree(expect_re); sb_free(&log);
