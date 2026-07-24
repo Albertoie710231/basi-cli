@@ -3351,9 +3351,18 @@ static int factory_keywords(const char *q, char **kw, int maxkw) {
 
 #define FAC_CTX_LINES 8   /* verbatim context lines on each side of a keyword hit */
 
+/* byte offset -> 0-based line index (largest k with lstart[k] <= off). */
+static int fac_off_to_line(const size_t *lstart, int total, size_t off) {
+    int lo = 0, hi = total - 1, ans = 0;
+    while (lo <= hi) {
+        int mid = (lo + hi) / 2;
+        if (lstart[mid] <= off) { ans = mid; lo = mid + 1; } else hi = mid - 1; }
+    return ans;
+}
+
 static char *factory_retrieve_big(const char *path, const char *question, size_t cap) {
     size_t len = 0;
-    char *buf = kb_read_file(path, &len);
+    char *buf = kb_read_file(path, &len);   /* read_file_all NUL-terminates buf */
     if (!buf) return NULL;
 
     /* line-start offset table (lstart[k]..lstart[k+1] spans line k) */
@@ -3366,14 +3375,43 @@ static char *factory_retrieve_big(const char *path, const char *question, size_t
     lstart[nl] = len;   /* sentinel */
     total = nl;
 
-    char *kw[16];
-    int nkw = factory_keywords(question, kw, 16);
-
-    /* grep: mark every line that contains a question keyword */
     char *hit = calloc((size_t)total, 1);
+    if (!hit) { free(lstart); free(buf); return NULL; }
     int nhits = 0;
-    if (hit && nkw > 0) {
-        for (int L = 0; L < total; L++) {
+    const char *how = "none";
+
+    /* PREFERRED: reuse the context-compaction retrieval (memory.h). Embed the file's
+     * chunks and pull the ones most relevant to the question — dense (semantic) when the
+     * embedder server is up, BM25 (exact-token, ranked by IDF) otherwise, hybrid fuses
+     * both. Each retrieved chunk is a verbatim substring; we locate it back in the file
+     * and mark its line, then expand to a verbatim window below (so @@SEARCH@@ matches).
+     * This is a real ranked retrieval, not the substring grep it replaces. */
+    if (len > 0) {
+        if (!getenv("BASI_RETRIEVE_SCORE"))
+            setenv("BASI_RETRIEVE_SCORE", embed_available() ? "hybrid" : "bm25", 1);
+        mem_clear();
+        mem_add(buf);                     /* chunks + embeds/tokenizes the whole file */
+        char *rtx[24]; float rsc[24];
+        int got = mem_retrieve(question, 24, 0.0f, rtx, rsc);
+        for (int i = 0; i < got; i++) {
+            char *pos = (rtx[i] && rtx[i][0]) ? strstr(buf, rtx[i]) : NULL;
+            if (pos) {
+                int L = fac_off_to_line(lstart, total, (size_t)(pos - buf));
+                if (!hit[L]) { hit[L] = 1; nhits++; }
+            }
+            free(rtx[i]);
+        }
+        mem_clear();
+        embed_shutdown();                 /* free the embedder's VRAM before theory/measure */
+        if (nhits > 0) how = getenv("BASI_RETRIEVE_SCORE");
+    }
+
+    /* FALLBACK: substring keyword grep, if retrieval returned nothing (e.g. no embedder
+     * AND no shared BM25 term — rare). */
+    char *kw[16]; int nkw = 0;
+    if (nhits == 0) {
+        nkw = factory_keywords(question, kw, 16);
+        for (int L = 0; L < total && nkw > 0; L++) {
             size_t s = lstart[L], e = lstart[L + 1];
             size_t ll = e > s ? e - s : 0;
             if (!ll) continue;
@@ -3384,28 +3422,32 @@ static char *factory_retrieve_big(const char *path, const char *question, size_t
                 if (strcasestr(line, kw[k])) { hit[L] = 1; nhits++; break; }
             free(line);
         }
+        if (nhits > 0) how = "keyword-grep";
     }
 
     StringBuf o; sb_init(&o);
 
-    /* structure: the ctags symbol map (capped to a third of the budget) */
+    /* structure: the ctags symbol map (a small share; the windows carry the real signal) */
     char *sym = execute_symbols(path, NULL);
     if (sym) {
         sb_append_str(&o, "\n----- symbol map (");
         sb_append_str(&o, path);
         sb_append_str(&o, ", ctags) -----\n");
-        size_t symcap = cap / 3, sl = strlen(sym);
+        size_t symcap = cap / 4, sl = strlen(sym);
         sb_append(&o, sym, sl < symcap ? sl : symcap);
         sb_append_char(&o, '\n');
         free(sym);
     }
+    { char note[128];
+      snprintf(note, sizeof(note), "\n[%d relevant region(s), %s retrieval]\n", nhits, how);
+      sb_append_str(&o, note); }
 
     if (nhits == 0) {
-        /* No keyword landed — inject the head as a last resort (still better than a
+        /* Nothing matched at all — inject the head as a last resort (still better than a
          * silently-partial verbatim dump the model can't reason about). */
         sb_append_str(&o, "\n----- head of ");
         sb_append_str(&o, path);
-        sb_append_str(&o, " (no question keyword matched; showing the top) -----\n");
+        sb_append_str(&o, " (nothing matched; showing the top) -----\n");
         size_t room = o.len < cap ? cap - o.len : 0;
         sb_append(&o, buf, len < room ? len : room);
     } else {
@@ -3466,8 +3508,9 @@ int cmd_factory(int argc, char **argv) {
           "  theories are ranked by the metric vs a no-edit baseline.\n"
           "  --file <path>  inject this source VERBATIM into the theory prompt (repeatable);\n"
           "                 grounds the proposals in the real code so SEARCH text actually matches.\n"
-          "                 A file too big to inject whole falls back to retrieval: the ctags\n"
-          "                 symbol map + verbatim windows around question-keyword hits\n"
+          "                 A file too big to inject whole falls back to ranked retrieval (the\n"
+          "                 context-compaction embedder/BM25): ctags symbol map + verbatim windows\n"
+          "                 around the chunks most relevant to the question\n"
           "  --extract <regex>  capture group 1 = the metric (default: the last N.N in output)\n"
           "  --theories N   cap candidates (default 6)    --minimize   lower metric is better\n"
           "  --timeout S    per-measure seconds (default 1800; builds are slow)\n");
@@ -3518,7 +3561,7 @@ int cmd_factory(int argc, char **argv) {
     char *ctx_s = sb_to_str(&ctx);
 
     fprintf(stderr, "factory: generating theories...%s\n",
-            nfiles ? (retrieved ? " (source injected; large files retrieved by keyword)" : " (source injected)") : "");
+            nfiles ? (retrieved ? " (source injected; large files ranked-retrieved)" : " (source injected)") : "");
     StringBuf log; sb_init(&log);
     char *th_txt = study_react_brief(port, FACTORY_THEORY_PROMPT,
         "Optimization question — find code changes that improve the metric:\n\n",
