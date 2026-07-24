@@ -7,10 +7,12 @@
 #include <signal.h>
 #include <time.h>
 
-#include "llama.h"
+#include "basi_types.h"
 
 #include "util.h"
 #include "globals.h"
+#include "chat_tmpl.h"   /* basi_set_tools / basi_tools_registered */
+#include "tooldefs.h"    /* basi_tool_defs (restore after deepsearch) */
 #include "model.h"
 #include "web.h"
 #include "kb.h"
@@ -29,7 +31,7 @@
    bulky thing — raw page text — never enters the chat), so the history stays
    small and fits a 32k context many rounds deep.
 
-   Runs in its OWN isolated llama_context built from the loaded model, so it
+   Runs server-backed via generate_chat (its own message history), so it
    never perturbs the chat session's KV cache (precedent: src/embed.c). Tools:
    web_search / web_fetch / docs_search / docs_get. Actions use BASI's native
    <tool>…</tool> convention; the final answer is <answer>…</answer>.
@@ -140,7 +142,7 @@ static char *trim(char *s) {
 
 /* Appends a turn, TAKING OWNERSHIP of `content` (already malloc'd). `role` is a
    string literal ("system"/"user"/"assistant"), not owned. */
-static void msgs_add(struct llama_chat_message **m, size_t *n, size_t *cap,
+static void msgs_add(BasiMsg **m, size_t *n, size_t *cap,
                      const char *role, char *content) {
     if (*n >= *cap) {
         *cap = *cap ? *cap * 2 : 16;
@@ -151,17 +153,13 @@ static void msgs_add(struct llama_chat_message **m, size_t *n, size_t *cap,
     (*n)++;
 }
 
-/* Single-shot quiet generation over a message list. Clears the KV first so
-   generate()'s is_first logic restarts cleanly, then templates + decodes the
-   whole conversation. Returns malloc'd model output (caller frees), or NULL on
-   template failure. */
-static char *ds_generate(struct llama_context *dctx, const struct llama_vocab *vocab,
-                         struct llama_sampler *smpl, const struct llama_model *model,
-                         const struct llama_chat_message *msgs, size_t nmsg, char *fmt_buf) {
-    int len = apply_template(model, msgs, nmsg, true, fmt_buf, DEEPSEARCH_FMT_SZ);
-    if (len < 0) return NULL;
-    llama_memory_clear(llama_get_memory(dctx), true);
-    GenerateResult r = generate(dctx, vocab, smpl, fmt_buf, (size_t)len);
+/* Single-shot quiet generation over a message list, server-backed. deepsearch has
+   cleared g_tools, so generate_chat() advertises no tools and the model emits its
+   own <tool>…</tool> / <answer> ReAct format in the content (or, if it lands in the
+   reasoning stream, generate_chat promotes that to the text) — which the loop below
+   parses. Returns malloc'd model output (caller frees). */
+static char *ds_generate(const BasiMsg *msgs, size_t nmsg) {
+    GenerateResult r = generate_chat(msgs, nmsg, NULL, NULL);
     return r.text;
 }
 
@@ -181,9 +179,7 @@ static char *dispatch_research_tool(const char *name, const char *arg, const cha
 
 /* Distill a raw tool result into goal-relevant evidence (the only thing that
    enters the chat). Tiny results pass through verbatim. Returns malloc'd. */
-static char *distill_result(struct llama_context *dctx, const struct llama_vocab *vocab,
-                            struct llama_sampler *xsmpl, const struct llama_model *model,
-                            const char *question, const char *raw, char *fmt_buf) {
+static char *distill_result(const char *question, const char *raw) {
     if (strlen(raw) < EXTRACT_SKIP_BELOW) return cap_dup(raw, OBS_MAX_CHARS);
 
     char *capped = cap_dup(raw, RAW_FEED_MAX);
@@ -197,10 +193,10 @@ static char *distill_result(struct llama_context *dctx, const struct llama_vocab
                       "Be faithful and compact; if nothing is relevant, say so.");
     free(capped);
 
-    struct llama_chat_message xm[2];
+    BasiMsg xm[2];
     xm[0].role = "system"; xm[0].content = (char *)EXTRACTOR_SYSTEM;
     xm[1].role = "user";   xm[1].content = x.data;
-    char *distilled = ds_generate(dctx, vocab, xsmpl, model, xm, 2, fmt_buf);
+    char *distilled = ds_generate(xm, 2);
     sb_free(&x);
 
     if (distilled && distilled[0]) { trim(distilled); char *c = cap_dup(distilled, OBS_MAX_CHARS); free(distilled); return c; }
@@ -214,10 +210,8 @@ static void ds_sigint(int sig) { (void)sig; generation_interrupted = 1; }
 
 /* ── main entry ─────────────────────────────────────────────────────── */
 
-char *execute_deep_search(struct llama_model *model,
-                          const struct llama_vocab *vocab,
-                          const char *question) {
-    if (!model || !vocab || !question || !question[0])
+char *execute_deep_search(const char *question) {
+    if (!question || !question[0])
         return strdup("Error: deep_search requires a question.");
 
     int max_rounds = DEEPSEARCH_MAX_ROUNDS;
@@ -227,53 +221,8 @@ char *execute_deep_search(struct llama_model *model,
         if (v >= 1 && v <= 50) max_rounds = v;
     }
 
-    /* Isolated context over the same model, with the main context's VRAM
-       halving-retry backoff so tight-VRAM boxes degrade instead of failing.
-       BASI_DEEPSEARCH_CTX overrides the size — lower it (e.g. 8192) for
-       interactive /deepsearch on a single GPU, where the full-size chat context
-       must coexist with the main conversation's context. */
-    uint32_t want_ctx = DEEPSEARCH_CTX;
-    const char *ctx_env = getenv("BASI_DEEPSEARCH_CTX");
-    if (ctx_env && ctx_env[0]) {
-        int v = atoi(ctx_env);
-        if (v >= (int)DEEPSEARCH_MIN_CTX && v <= 131072) want_ctx = (uint32_t)v;
-    }
-    struct llama_context_params cp = llama_context_default_params();
-    cp.n_ctx = want_ctx;
-    cp.n_batch = cp.n_ctx;
-    int n_cores = (int)sysconf(_SC_NPROCESSORS_ONLN);
-    if (n_cores > 2) { cp.n_threads = n_cores / 2; cp.n_threads_batch = n_cores / 2; }
-
-    struct llama_context *dctx = NULL;
-    while (1) {
-        dctx = llama_init_from_model(model, cp);
-        if (dctx) break;
-        if (cp.n_ctx <= DEEPSEARCH_MIN_CTX) break;
-        uint32_t reduced = cp.n_ctx / 2;
-        if (reduced < DEEPSEARCH_MIN_CTX) reduced = DEEPSEARCH_MIN_CTX;
-        cp.n_ctx = reduced; cp.n_batch = reduced;
-    }
-    if (!dctx)
-        return strdup("Error: deep_search could not allocate a research context (out of VRAM).");
-
-    /* Two sampler chains (not the chat session's): mild-temp reasoning and
-       near-deterministic, faithful extraction. */
-    struct llama_sampler *dsmpl = llama_sampler_chain_init(llama_sampler_chain_default_params());
-    llama_sampler_chain_add(dsmpl, llama_sampler_init_min_p(0.05f, 1));
-    llama_sampler_chain_add(dsmpl, llama_sampler_init_temp(0.4f));
-    llama_sampler_chain_add(dsmpl, llama_sampler_init_dist(LLAMA_DEFAULT_SEED));
-
-    struct llama_sampler *xsmpl = llama_sampler_chain_init(llama_sampler_chain_default_params());
-    llama_sampler_chain_add(xsmpl, llama_sampler_init_min_p(0.05f, 1));
-    llama_sampler_chain_add(xsmpl, llama_sampler_init_temp(0.1f));
-    llama_sampler_chain_add(xsmpl, llama_sampler_init_dist(LLAMA_DEFAULT_SEED));
-
-    char *fmt_buf = malloc(DEEPSEARCH_FMT_SZ);
-    if (!fmt_buf) {
-        llama_sampler_free(xsmpl); llama_sampler_free(dsmpl); llama_free(dctx);
-        return strdup("Error: out of memory.");
-    }
-
+    /* Generation is server-backed (generate_chat) — no isolated in-process context
+       or sampler chains needed anymore; the server holds the weights + KV. */
     char system_prompt[4096];
     {
         time_t t = time(NULL);
@@ -288,6 +237,21 @@ char *execute_deep_search(struct llama_model *model,
     /* Keep <think> in the model's turns so reasoning models stay consistent. */
     sig_atomic_t prev_keep_think = generate_keep_think;
     generate_keep_think = 1;
+    /* Server mode: keep the MAIN tool-call grammar out of deepsearch's rounds and
+       synthesis — deepsearch drives its own ReAct format, and in native mode its
+       sampler carries no grammar. Without this the grammar leaks in and the final
+       synthesis degenerates into a stray tool query instead of an answer. */
+    int prev_suppress_grammar = basi_srv_suppress_grammar;
+    basi_srv_suppress_grammar = 1;
+
+    /* Clear the main tool schemas for deepsearch's own renders. deepsearch is a
+       self-contained sub-agent whose system prompt already teaches the <tool>
+       ReAct format; leaving the native schemas advertised makes a native-tools
+       model emit its trained <tool_call>/<function=> format instead, which
+       extract_tool_call (legacy <tool>...</tool>) can't parse → "no action" every
+       round. Same pattern as the summary sub-generation in main.c. Restored below. */
+    int prev_tool_n = basi_tools_registered();
+    basi_set_tools(NULL, 0);
 
     struct sigaction old_sa, sa;
     memset(&sa, 0, sizeof(sa));
@@ -301,7 +265,7 @@ char *execute_deep_search(struct llama_model *model,
     fflush(stdout);
 
     /* The research chat: system, question, then assistant(action)/user(result). */
-    struct llama_chat_message *msgs = NULL;
+    BasiMsg *msgs = NULL;
     size_t nmsg = 0, capmsg = 0;
     msgs_add(&msgs, &nmsg, &capmsg, "system", strdup(system_prompt));
     msgs_add(&msgs, &nmsg, &capmsg, "user",   strdup(question));
@@ -310,7 +274,7 @@ char *execute_deep_search(struct llama_model *model,
     int tools_run = 0;   /* must-search-before-answer guard: # of real searches/fetches done */
     int round;
     for (round = 1; round <= max_rounds; round++) {
-        char *out = ds_generate(dctx, vocab, dsmpl, model, msgs, nmsg, fmt_buf);
+        char *out = ds_generate(msgs, nmsg);
         if (!out) { printf("\033[31m[deepsearch] template error; stopping.\033[0m\n"); fflush(stdout); break; }
         if (generation_interrupted) { free(out); printf("\033[33m[deepsearch] interrupted.\033[0m\n"); fflush(stdout); break; }
 
@@ -402,7 +366,7 @@ char *execute_deep_search(struct llama_model *model,
 
         if (generation_interrupted) { free(raw); arglist_free(&al); printf("\033[33m[deepsearch] interrupted.\033[0m\n"); fflush(stdout); break; }
 
-        char *obs = distill_result(dctx, vocab, xsmpl, model, question, raw, fmt_buf);
+        char *obs = distill_result(question, raw);
         free(raw);
 
         /* Record the result as a user turn, prefixed with the action it answers
@@ -442,7 +406,7 @@ char *execute_deep_search(struct llama_model *model,
                      strdup("[Research budget reached. Give your final, thorough, cited <answer> now.]"));
         }
         generation_interrupted = 0;   /* let the synthesis run even after a Ctrl+C */
-        char *out = ds_generate(dctx, vocab, dsmpl, model, msgs, nmsg, fmt_buf);
+        char *out = ds_generate(msgs, nmsg);
         if (out) {
             /* Prefer <answer>; the 4B sometimes emits <report> instead — use that
                body then, never raw tagged text. */
@@ -464,12 +428,10 @@ char *execute_deep_search(struct llama_model *model,
     generation_interrupted = 0;
     generate_quiet = prev_quiet;
     generate_keep_think = prev_keep_think;
+    basi_srv_suppress_grammar = prev_suppress_grammar;
+    if (prev_tool_n > 0) { int n; const BasiToolDef *d = basi_tool_defs(&n); basi_set_tools(d, n); }
     for (size_t i = 0; i < nmsg; i++) free((void *)msgs[i].content);
     free(msgs);
-    free(fmt_buf);
-    llama_sampler_free(xsmpl);
-    llama_sampler_free(dsmpl);
-    llama_free(dctx);
 
     return answer;
 }

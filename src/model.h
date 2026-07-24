@@ -2,10 +2,9 @@
 #define BASI_MODEL_H
 
 #include <stddef.h>
-#include "llama.h"
+#include "basi_types.h"
+#include "srvgen.h"   /* SrvSampling (server-backed generation knobs) */
 
-/* One-shot init: registers the llama log callback + loads ggml backends. */
-void model_init(void);
 
 /* ── Launch config (returned by interactive picker) ────────────────── */
 typedef struct {
@@ -13,6 +12,9 @@ typedef struct {
     int   gpu_layers;
     int   ctx_size;
     float temperature;
+    int   spec_draft_mtp;  /* 1 = launch llama-server with --spec-type draft-mtp (MTP models) */
+    int   flash_attn;      /* 1 = -fa on */
+    int   cpu_moe;         /* 1 = --cpu-moe (MoE: experts to RAM, attention to GPU) */
 } LaunchConfig;
 
 LaunchConfig pick_model(void);
@@ -22,31 +24,46 @@ LaunchConfig pick_model(void);
  * count. Used by the /model command to resolve a name substring to a path. */
 int basi_list_models(char ***out);
 
-/* ── Chat template wrapper (handles non-Jinja fallback) ────────────── */
-/* Renders the conversation using the model's own chat template (jinja engine,
-   via the chat_tmpl shim), falling back to llama_chat_apply_template + ChatML
-   only if that fails. Returns the formatted length, or <0 on error. buf may be
-   NULL to query the length only. */
-int apply_template(const struct llama_model *model,
-                   const struct llama_chat_message *msgs, size_t n_msgs,
-                   bool add_gen_prompt,
-                   char *buf, size_t buf_size);
 
 /* ── Generation ────────────────────────────────────────────────────── */
 typedef struct {
     char  *text;          /* malloc'd, caller frees */
-    size_t prompt_tokens;
+    size_t prompt_tokens; /* whole prompt, incl. the KV-cache-hit prefix — this is
+                             context OCCUPANCY, and not the work the server did */
     size_t gen_tokens;
-    double prompt_time_s;
+    size_t prompt_n;      /* prompt tokens actually EVALUATED (cache misses only) */
+    double prompt_time_s; /* real seconds spent prefilling, measured by the server.
+                             Do NOT reconstruct it as prompt_tokens/prompt_tps: those
+                             have different denominators and the result is ~800x high
+                             on a cache hit. Pair it with prompt_n, never prompt_tokens. */
+    double prompt_tps;    /* server's prefill rate, over prompt_n */
     double gen_time_s;
 } GenerateResult;
 
-GenerateResult generate(
-    struct llama_context *ctx,
-    const struct llama_vocab *vocab,
-    struct llama_sampler *smpl,
-    const char *prompt,
-    size_t prompt_len);
+/* Server-backed generation: when basi_srv_port>0, generate() delegates to a
+   spawned llama-server (set by main.c). basi_srv_model = a vocab_only handle for
+   deriving the tool grammar. */
+extern int basi_srv_port;
+/* Sampling knobs for the server /completion request (filled by main.c to mirror
+   the native sampler chain). */
+extern SrvSampling basi_srv_sampling;
+/* When nonzero, generate_server() omits the tool-call grammar (deepsearch sets it
+   around its own ReAct loop so the main tool grammar can't leak in). */
+extern int basi_srv_suppress_grammar;
+/* When nonzero, build_request() sets chat_template_kwargs.enable_thinking=false on
+   every /v1/chat/completions request — the scoped, per-request form of
+   BASI_NO_THINK. study_ground sets it around its grounding ReAct loop so the model
+   navigates the code without a <think> block per tool call; the hypothesis step
+   leaves it 0 and keeps reasoning. Caller-scoped, always restored (never setenv). */
+extern int basi_srv_no_think;
+
+/* Server-chat generation (item 6b): serialize `messages` (+ registered tools) and
+   drive /v1/chat/completions. Returns the answer text (res.text) + the server's
+   prompt token count (res.prompt_tokens) and fills tc_out/n_tc_out with the
+   STRUCTURED tool calls (caller frees via basi_free_tool_calls). */
+struct BasiToolCall;
+GenerateResult generate_chat(const BasiMsg *messages, size_t msg_count,
+                             struct BasiToolCall **tc_out, int *n_tc_out);
 
 /* Locate a "<tool>...</tool>" tag in the model's output text.
  * Returns a pointer into `text` to the byte after "<tool>", with *out_len

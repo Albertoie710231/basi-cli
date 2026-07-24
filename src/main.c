@@ -1,6 +1,11 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
+
+/* sentinel: no --seed given → let the server pick a random seed */
+#define BASI_DEFAULT_SEED 0xFFFFFFFFu
 #include <string.h>
+#include <ctype.h>
 #include <stdbool.h>
 #include <signal.h>
 #include <time.h>
@@ -18,7 +23,7 @@
 #include <sys/utsname.h>
 #include <sys/ioctl.h>
 
-#include "llama.h"
+#include "basi_types.h"
 
 #include "util.h"
 #include "globals.h"
@@ -26,6 +31,8 @@
 #include "plan.h"
 #include "web.h"
 #include "lsp.h"
+#include "symbols.h"
+#include "study.h"
 #include "patch.h"
 #include "scaffold.h"
 #include "session.h"
@@ -38,6 +45,8 @@
 #include "tooldefs.h"
 #include "cookbook.h"
 #include "slashmenu.h"
+#include "srvgen.h"
+#include "srvchat.h"
 
 /* MAX_TOKENS, CONTEXT_SIZE → globals.h */
 #define MAX_FILE_TOKENS     2000
@@ -62,7 +71,8 @@ static const char *SYSTEM_PROMPT_FMT =
     "When you need to read files, search the web, or fetch URLs, use these tools by wrapping commands in <tool> tags:\n"
     "\n"
     "FILE TOOLS:\n"
-    "- read <file> : Read entire file (only for small files <2000 tokens)\n"
+    "- read <file> [start] [count] : Read a file. Small files come whole; a large file returns a\n"
+    "                line window and a footer showing how to read the next one (read <file> <start> <count>)\n"
     "- head -n <N> <file> : Read first N lines\n"
     "- grep <pattern> <file> : Search for pattern (use quotes for multi-word)\n"
     "- grep -n <pattern> <file> : Search with line numbers\n"
@@ -178,6 +188,7 @@ static const char *SYSTEM_PROMPT_NATIVE =
     "- Cite ONLY URLs that appear in tool results; never invent or guess links.\n"
     "- When a tool reports 'User denied execution.', do not retry; explain why you need it.\n"
     "- Reference code locations as path:line so the user can jump to them.\n"
+    "- On a long task your earlier tool outputs may be replaced by an elision stub to save context; the FULL text of every tool result is kept in .basi/journal-*.md. To recall something you saw earlier, grep that file (e.g. bash `grep -n <term> .basi/journal-*.md`) instead of re-reading a large file from scratch.\n"
     "Be helpful, concise, and accurate.";
 
 
@@ -190,11 +201,11 @@ volatile sig_atomic_t generate_keep_think = 0;
 volatile sig_atomic_t generate_native_tools = 0;
 volatile sig_atomic_t generate_markdown = 0;
 
-/* Tool-call grammar sampler (phase 2b): built once when native tools are active,
-   inserted into the sampler chain, and reset before each generation (it is lazy
-   and stateful — without a reset it would carry a prior turn's trigger state).
-   NULL when the model's format has no tool grammar or tools are inactive. */
-static struct llama_sampler *g_tool_grammar = NULL;
+
+/* Server-backed mode: the spawned llama-server holding the weights, killed on
+   exit so a 30 GB process never leaks. */
+static pid_t g_srv_pid = 0;
+static void kill_srv(void) { if (g_srv_pid > 0) { srvgen_kill(g_srv_pid); g_srv_pid = 0; } }
 
 static void sigint_handler(int sig) {
     (void)sig;
@@ -688,10 +699,20 @@ int request_approval(const char *tool_label, const char *cmd) {
 
 /* ── Execute tool command ──────────────────────────────────────────── */
 
-/* Read a small file with the `read` tool's token-budget guard. Returns
- * malloc'd content on success (and marks the path read), or a malloc'd
- * "Error: …" string. Caller frees either way. */
-static char *read_small_file(const char *filepath) {
+#define READ_WHOLE_MAX_BYTES   24000   /* <= this AND no window: return the file whole (~6k tokens) */
+#define READ_WINDOW_LINES        400   /* default lines per window for a larger file */
+#define READ_WINDOW_MAX_BYTES  24000   /* hard byte cap on one window */
+
+/* Read a WINDOW of a file's lines. 1-based `start`, `count` lines (<=0 => defaults).
+ * A file that fits whole (<= READ_WHOLE_MAX_BYTES) and was requested without an
+ * explicit window is returned IN FULL, unchanged — so the edit tool's verbatim
+ * SEARCH-copy still matches. A larger file is PAGED: raw window content, with a
+ * header giving the line range and a footer telling the model exactly how to read
+ * the next window. This replaces the old hard "file too large — use head" rejection,
+ * which left the agent unable to read a real source file at all (a 13k-30k-token
+ * kernel file was simply refused). Windows carry NO line-number prefixes on purpose,
+ * so text copied into an edit SEARCH block still matches. Caller frees. */
+static char *read_file_window(const char *filepath, long start, long count) {
     FILE *f = fopen(filepath, "r");
     if (!f) {
         char *msg = malloc(512);
@@ -700,27 +721,99 @@ static char *read_small_file(const char *filepath) {
     }
     struct stat st;
     fstat(fileno(f), &st);
-    size_t estimated_tokens = st.st_size / 4;
-    if (estimated_tokens > MAX_FILE_TOKENS) {
-        size_t lines = count_lines(f);
-        char *msg = malloc(512);
-        snprintf(msg, 512,
-            "Error: File too large (~%zu tokens, max %d). Use 'head', 'tail', or 'grep' to read in chunks.\n"
-            "File has %ld bytes, %zu lines (use 'wc %s' for exact count)",
-            estimated_tokens, MAX_FILE_TOKENS, (long)st.st_size, lines, filepath);
-        fclose(f);
-        return msg;
-    }
-    char *content = malloc(st.st_size + 1);
-    if (!content) {
-        fclose(f);
-        return strdup("Error: out of memory reading file");
-    }
-    size_t nread = fread(content, 1, st.st_size, f);
-    content[nread] = '\0';
+    size_t sz = (size_t)st.st_size;
+    char *buf = malloc(sz + 1);
+    if (!buf) { fclose(f); return strdup("Error: out of memory reading file"); }
+    size_t n = fread(buf, 1, sz, f);
+    buf[n] = '\0';
     fclose(f);
+
+    bool explicit_window = (start > 0 || count > 0);
+    if (!explicit_window && n <= READ_WHOLE_MAX_BYTES) {
+        read_tracker_mark(filepath);
+        return buf;                          /* small file: whole, unchanged */
+    }
+
+    if (start < 1) start = 1;
+    if (count <= 0) count = READ_WINDOW_LINES;
+
+    long total = 0;
+    for (size_t i = 0; i < n; i++) if (buf[i] == '\n') total++;
+    if (n > 0 && buf[n-1] != '\n') total++;
+    if (total == 0) total = 1;
+
+    /* byte offset of the first byte of line `start` */
+    long line = 1; size_t off = 0;
+    while (line < start && off < n) { if (buf[off] == '\n') line++; off++; }
+    size_t ws = off;
+
+    /* emit up to `count` whole lines, capped by bytes */
+    size_t q = off, win_end = off;
+    long emitted = 0;
+    while (q < n && emitted < count && (q - ws) < READ_WINDOW_MAX_BYTES) {
+        if (buf[q] == '\n') { emitted++; win_end = q + 1; }
+        q++;
+    }
+    if (win_end == off) win_end = (q < n) ? q : n;   /* one very long line / no '\n' */
+    long last_line = start + emitted - 1;
+    if (last_line < start) last_line = start;
+
+    StringBuf out; sb_init(&out);
+    if (start > 1 || last_line < total) {
+        char h[512];
+        snprintf(h, sizeof(h), "%s (lines %ld-%ld of %ld):\n", filepath, start, last_line, total);
+        sb_append_str(&out, h);
+    }
+    sb_append(&out, buf + ws, win_end - ws);
+    if (last_line < total) {
+        char ftr[512];
+        snprintf(ftr, sizeof(ftr),
+            "\n[... %ld more lines below. Continue: read %s %ld %ld]\n",
+            total - last_line, filepath, last_line + 1, count);
+        sb_append_str(&out, ftr);
+    }
+    free(buf);
     read_tracker_mark(filepath);
-    return content;
+    return sb_to_str(&out);
+}
+
+/* djb2 hash of a tool result, for the re-read dedup: a tool call that returns bytes
+   IDENTICAL to a prior result gave the model no new information, so it is a flail (a
+   phase measured re-reading .basi/findings.md 8 times without ever acting). */
+static unsigned long tool_result_hash(const char *s) {
+    unsigned long h = 5381; int c;
+    while ((c = (unsigned char)*s++)) h = ((h << 5) + h) + (unsigned long)c;
+    return h;
+}
+
+/* Restrict the active tool schemas to a comma-separated subset — a hard per-phase
+ * scope for factory pipelines. An "implement" phase gets only read+edit, a "build"
+ * phase only bash, so the model physically CANNOT drift into other activities (the
+ * server derives the tool grammar from the registered set, so an unlisted tool can't
+ * even be emitted). Returns a malloc'd array of the matched defs and sets *out_n;
+ * the process keeps it alive. Unknown names are ignored. */
+static BasiToolDef *filter_tool_defs(const char *csv, int *out_n) {
+    int n; const BasiToolDef *all = basi_tool_defs(&n);
+    BasiToolDef *sub = malloc(sizeof(BasiToolDef) * (size_t)n);
+    int m = 0;
+    for (int i = 0; i < n; i++) {
+        const char *nm = all[i].name;
+        size_t nl = strlen(nm);
+        const char *p = csv;
+        bool keep = false;
+        while (*p) {
+            while (*p == ' ' || *p == ',') p++;
+            const char *e = p;
+            while (*e && *e != ',') e++;
+            size_t len = (size_t)(e - p);
+            while (len && p[len-1] == ' ') len--;
+            if (len == nl && strncmp(nm, p, nl) == 0) { keep = true; break; }
+            p = e;
+        }
+        if (keep) sub[m++] = all[i];
+    }
+    *out_n = m;
+    return sub;
 }
 
 /* Truncate an oversized tool result keeping the HEAD and the TAIL — the middle
@@ -749,10 +842,21 @@ static size_t truncate_tool_result(char *s, int head_lines, int tail_lines,
     for (size_t i = len; i-- > 0; )
         if (s[i] == '\n') { if (++tl > tail_lines) { tail_start = i + 1; break; } }
 
-    /* enforce the byte ceiling: split the budget between head and tail */
+    /* enforce the byte ceiling: split the budget between head and tail.
+       The cut MUST land on a UTF-8 character boundary. Slicing mid-codepoint
+       yields invalid UTF-8, which makes nlohmann's dump() throw when the message
+       array is serialized — killing the whole turn with an empty request (seen
+       for real: a fetched page with box-drawing glyphs ended three runs at
+       prompt_tokens=0 with no error shown). Continuation bytes are 10xxxxxx. */
     size_t half = max_bytes / 2;
-    if (head_end > half) head_end = half;
-    if (len - tail_start > half) tail_start = len - half;
+    if (head_end > half) {
+        head_end = half;
+        while (head_end > 0 && ((unsigned char) s[head_end] & 0xC0) == 0x80) head_end--;
+    }
+    if (len - tail_start > half) {
+        tail_start = len - half;
+        while (tail_start < len && ((unsigned char) s[tail_start] & 0xC0) == 0x80) tail_start++;
+    }
     if (tail_start <= head_end) return 0;          /* nothing left to drop */
 
     size_t dropped_bytes = tail_start - head_end;
@@ -784,15 +888,24 @@ static size_t truncate_tool_result(char *s, int head_lines, int tail_lines,
  * the native structured-dispatch path. */
 static void sh_append_arg(StringBuf *sb, const char *arg) {
     sb_append_char(sb, ' ');
-    if (strpbrk(arg, " \t\"'$`\\")) {
+    /* Quote UNLESS every character is shell-safe unquoted. The old test only quoted
+       on space/quote/$/backtick/backslash, so a grep pattern like "A|B" (or one with
+       & ; < > * ? ( ) etc.) slipped through UNquoted and the shell interpreted the
+       metachar — measured: `grep "GGML_OP_MUL_MAT|GGML_OP_MUL_MAT_ID"` was split into
+       a pipe and every alternation search returned nothing. */
+    bool safe = (*arg != '\0');
+    for (const char *c = arg; *c; c++) {
+        if (!(isalnum((unsigned char)*c) || strchr("_-./,=+:@%", *c))) { safe = false; break; }
+    }
+    if (safe) {
+        sb_append_str(sb, arg);
+    } else {
         sb_append_char(sb, '\'');
         for (const char *c = arg; *c; c++) {
             if (*c == '\'') sb_append_str(sb, "'\"'\"'");
             else sb_append_char(sb, *c);
         }
         sb_append_char(sb, '\'');
-    } else {
-        sb_append_str(sb, arg);
     }
 }
 
@@ -836,6 +949,45 @@ static char *execute_tool(const char *command) {
         char after = command[11];
         if (after == ' ' || after == '\t' || after == '\n' || after == '\0') {
             return execute_spike_write(command + 11);
+        }
+    }
+
+    /* study_write: persist a falsifiable experiment. Not phase-gated — a study
+     * is a way to settle a question by measurement, useful in any phase. */
+    if (strncmp(command, "study_write", 11) == 0) {
+        char after = command[11];
+        if (after == ' ' || after == '\t' || after == '\n' || after == '\0') {
+            return execute_study_write(command + 11);
+        }
+    }
+
+    /* study_run: execute a study's arms and hand back the COMPUTED verdict.
+     *
+     * This is what closes the loop. study_write alone let the model author an
+     * experiment it could never learn the outcome of; with this it can edit
+     * code, measure, and be told by a number it does not control whether the
+     * change survived.
+     *
+     * Gated like bash, and for the same reason: it runs commands out of the
+     * artifact. It grants no NEW power — the model already has bash in this
+     * loop — so there is deliberately no allow_commands allowlist here. That
+     * belongs to `study loop`, which runs unattended with nobody watching. */
+    if (strncmp(command, "study_run", 9) == 0) {
+        char after = command[9];
+        if (after == ' ' || after == '\t' || after == '\n' || after == '\0') {
+            const char *slug = command + 9;
+            while (*slug == ' ' || *slug == '\t' || *slug == '\n') slug++;
+            if (!*slug) return strdup("Error: study_run requires a study slug.");
+
+            bool auto_approve = (permission_mode == PERM_BYPASS) || bash_always_allowed;
+            if (!auto_approve) {
+                char label[256];
+                snprintf(label, sizeof(label), "study_run %s", slug);
+                int decision = request_approval("study_run", label);
+                if (decision == 0) return strdup("User denied execution.");
+                if (decision == 2) bash_always_allowed = true;
+            }
+            return study_run_slug(slug, NULL, NULL);
         }
     }
 
@@ -933,10 +1085,10 @@ static char *execute_tool(const char *command) {
                 else sb_append_char(&wrapped, *c);
             }
             sb_append_str(&wrapped, "' 2>&1");
-            int bash_tmo = 120;            /* seconds; override via env, cap 600 */
+            int bash_tmo = 120;            /* seconds; override via env, cap 2400 */
             const char *tenv = getenv("BASI_BASH_TIMEOUT");
             if (tenv) { int v = atoi(tenv); if (v > 0) bash_tmo = v; }
-            if (bash_tmo > 600) bash_tmo = 600;
+            if (bash_tmo > 2400) bash_tmo = 2400;   /* 40 min: an experiment phase may build */
             int timed_out = 0;
             char *result = run_command_timeout(sb_to_str(&wrapped), 512 * 1024,
                                                bash_tmo, &timed_out);
@@ -992,7 +1144,9 @@ static char *execute_tool(const char *command) {
             arglist_free(&al);
             return strdup("Error: read requires a file path");
         }
-        char *content = read_small_file(al.args[1]);
+        long start = (al.count >= 3) ? atol(al.args[2]) : 0;
+        long count = (al.count >= 4) ? atol(al.args[3]) : 0;
+        char *content = read_file_window(al.args[1], start, count);
         arglist_free(&al);
         return content;
     }
@@ -1059,9 +1213,20 @@ static char *execute_tool(const char *command) {
             read_tracker_mark(al.args[i]);
     }
 
-    char *result = run_command(sb_to_str(&shell_cmd), 512 * 1024);
+    /* Bounded, like the bash tool: these are read-only utilities, so any run that
+       lasts minutes is a malformed command rather than slow work. Belt to the
+       stdin-from-/dev/null brace in run_command_*: that removes the common
+       infinite block, this bounds whatever else the model invents. */
+    int timed_out = 0;
+    char *result = run_command_timeout(sb_to_str(&shell_cmd), 512 * 1024, 60, &timed_out);
     sb_free(&shell_cmd);
     arglist_free(&al);
+    if (timed_out) {
+        char *msg = strdup("Error: command timed out after 60s and was killed. "
+                           "Check for a command that reads stdin or scans too much.");
+        free(result);
+        return msg;
+    }
     return result;
 }
 
@@ -1109,7 +1274,8 @@ static char *execute_tool_native(const char *name, const char *args_json) {
     bool direct = strcmp(name, "read") == 0  || strcmp(name, "head") == 0 ||
                   strcmp(name, "tail") == 0  || strcmp(name, "grep") == 0 ||
                   strcmp(name, "wc")   == 0  || strcmp(name, "web_search") == 0 ||
-                  strcmp(name, "web_fetch") == 0 || strcmp(name, "readfile") == 0;
+                  strcmp(name, "web_fetch") == 0 || strcmp(name, "readfile") == 0 ||
+                  strcmp(name, "symbols") == 0;
 
     if (!direct) {
         char *cmd = basi_build_command(name, args_json);
@@ -1135,8 +1301,19 @@ static char *execute_tool_native(const char *name, const char *args_json) {
     if (strcmp(name, "read") == 0) {
         char *file = jx_get_string(args_json, "file");
         if (!file) return strdup("Error: read requires a file path");
-        char *r = read_small_file(file);
+        long start = jx_get_int(args_json, "start");   /* 0 if absent */
+        long count = jx_get_int(args_json, "count");   /* 0 if absent */
+        char *r = read_file_window(file, start, count);
         free(file);
+        return r;
+    }
+    if (strcmp(name, "symbols") == 0) {
+        char *file = jx_get_string(args_json, "file");
+        if (!file) return strdup("Error: symbols requires a file path");
+        char *kind = jx_get_string(args_json, "kind");        /* may be NULL */
+        char *r = execute_symbols(file, kind);
+        read_tracker_mark(file);   /* enumerating a file counts as having inspected it */
+        free(file); free(kind);
         return r;
     }
     if (strcmp(name, "web_search") == 0) {
@@ -1283,6 +1460,7 @@ typedef struct {
     uint32_t    cli_seed;           /* --seed: RNG seed for sampling */
     bool        bypass;             /* --yolo/--bypass: auto-approve all tool actions */
     const char *resume_path;        /* --resume: reload this session file, skip picker */
+    const char *tool_subset;        /* --tools a,b,c: hard-scope the active tool set (factory phase) */
     bool        pick;               /* --pick: force the model picker (used by /model) */
     bool        want_exit;          /* -h/--help: caller should return exit_code */
     int         exit_code;
@@ -1294,7 +1472,7 @@ static Cli parse_args(int argc, char **argv) {
         .deepsearch_q = NULL, .prompt = NULL, .no_tools = false,
         .system_override = NULL, .cli_ctx = 0, .cli_temp = -1.0f,
         .cli_top_k = 0, .cli_top_p = 1.0f,
-        .cli_seed = LLAMA_DEFAULT_SEED, .bypass = false, .resume_path = NULL,
+        .cli_seed = BASI_DEFAULT_SEED, .bypass = false, .resume_path = NULL,
         .pick = false, .want_exit = false, .exit_code = 0,
     };
     for (int i = 1; i < argc; i++) {
@@ -1331,6 +1509,8 @@ static Cli parse_args(int argc, char **argv) {
             c.bypass = true;
         } else if (strcmp(argv[i], "--resume") == 0 && i + 1 < argc) {
             c.resume_path = argv[++i];
+        } else if (strcmp(argv[i], "--tools") == 0 && i + 1 < argc) {
+            c.tool_subset = argv[++i];   /* factory: hard-scope this phase's tools */
         } else if (strcmp(argv[i], "--pick") == 0) {
             c.pick = true;
         } else if ((strcmp(argv[i], "-s") == 0 || strcmp(argv[i], "--system") == 0)
@@ -1465,13 +1645,13 @@ static void build_system_prompt(char *buf, size_t sz, bool native_tools,
  * of the content, and mirror non-system turns into the session file. Backs the
  * ADD_MESSAGE macro in main() and is called directly by the extracted REPL
  * helpers (which hold the state by pointer). */
-static void repl_add_message(struct llama_chat_message **messages,
+static void repl_add_message(BasiMsg **messages,
                              size_t *msg_count, size_t *msg_cap,
                              FILE *session_fp,
                              const char *role, const char *content) {
     if (*msg_count >= *msg_cap) {
         *msg_cap = *msg_cap ? *msg_cap * 2 : 16;
-        *messages = realloc(*messages, *msg_cap * sizeof(struct llama_chat_message));
+        *messages = realloc(*messages, *msg_cap * sizeof(BasiMsg));
     }
     (*messages)[*msg_count].role    = role;
     (*messages)[*msg_count].content = strdup(content);
@@ -1488,9 +1668,15 @@ static void repl_add_message(struct llama_chat_message **messages,
  * This measures live context OCCUPANCY (what decides the context limit),
  * which is distinct from the cumulative session token counts /cost reports
  * (those measure throughput across the whole session). */
-static int context_used_tokens(struct llama_context *ctx) {
-    llama_pos m = llama_memory_seq_pos_max(llama_get_memory(ctx), 0);
-    return m < 0 ? 0 : (int)m + 1;
+/* The server holds the KV, not us — so we track the server's prompt token count
+   (from the /v1/chat/completions `usage`, set by generate_chat) and its context
+   size (set at spawn). The ctx meter / compaction trigger / "tokens remaining"
+   hint all read these. */
+static int basi_srv_ctx_used  = 0;
+static int basi_srv_ctx_total = 0;
+
+static int context_used_tokens(void) {
+    return basi_srv_ctx_used;
 }
 
 /* Compact human token count: "830", "12.3k", "131k". */
@@ -1500,14 +1686,13 @@ static void fmt_token_count(char *buf, size_t n, int t) {
     else                 snprintf(buf, n, "%dk", (t + 500) / 1000);
 }
 
-/* Format a colour-graded "ctx 12.3k/32k 38%" gauge into `out`. The denominator
- * is llama_n_ctx(ctx) — the context the model was ACTUALLY loaded with, which
- * may be smaller than the requested CONTEXT_SIZE if the load OOM-retry halved
- * it. Colour is the at-a-glance warning: green < 70%, amber 70-89%, red >= 90%.
- * Trailing reset returns to the caller's dim style. */
-static void format_context_meter(struct llama_context *ctx, char *out, size_t n) {
-    int used  = context_used_tokens(ctx);
-    int total = (int)llama_n_ctx(ctx);
+/* Format a colour-graded "ctx 12.3k/32k 38%" gauge into `out`. The denominator is
+ * basi_srv_ctx_total — the context the llama-server was launched with. Colour is
+ * the at-a-glance warning: green < 70%, amber 70-89%, red >= 90%. Trailing reset
+ * returns to the caller's dim style. */
+static void format_context_meter(char *out, size_t n) {
+    int used  = context_used_tokens();
+    int total = basi_srv_ctx_total;
     int pct   = total > 0 ? (int)((100.0 * used) / total) : 0;
     char u[16], t[16];
     fmt_token_count(u, sizeof u, used);
@@ -1534,7 +1719,6 @@ static struct {
     bool   suspended;          /* torn down for a shell-out, resume afterwards */
     bool   hooks_installed;    /* atexit + signal handlers registered once */
     int    rows, cols;
-    struct llama_context *ctx; /* for the live ctx meter */
     char   model_tag[32];
 } g_bar = {0};
 
@@ -1576,8 +1760,8 @@ static void statusbar_compose(char *out, size_t outsz) {
 
     /* ctx meter — always shown, colour-graded like the footer */
     {
-        int used  = context_used_tokens(g_bar.ctx);
-        int total = (int)llama_n_ctx(g_bar.ctx);
+        int used  = context_used_tokens();
+        int total = basi_srv_ctx_total;
         int pct   = total > 0 ? (int)((100.0 * used) / total) : 0;
         char u[16], t[16];
         fmt_token_count(u, sizeof u, used);
@@ -1711,9 +1895,8 @@ static void statusbar_install_hooks(void) {
     sigaction(SIGWINCH, &wa, NULL);
 }
 
-static void statusbar_enable(struct llama_context *ctx, const char *model_tag) {
+static void statusbar_enable(const char *model_tag) {
     if (!isatty(STDOUT_FILENO) || !isatty(STDIN_FILENO)) return;
-    g_bar.ctx = ctx;
     snprintf(g_bar.model_tag, sizeof g_bar.model_tag, "%s", model_tag ? model_tag : "");
     statusbar_install_hooks();
     statusbar_setup_terminal();
@@ -2080,8 +2263,7 @@ static bool ci_contains(const char *hay, const char *needle) {
 
 static void try_model_switch(const char *arg, char **argv, int argc,
                              const char *cur_model, int cur_ngl,
-                             const char *session_path,
-                             struct llama_context *ctx) {
+                             const char *session_path) {
     char *new_path = NULL;              /* set for a named / substring switch */
     int   new_ngl  = cur_ngl;
     bool  use_picker = false;
@@ -2166,24 +2348,28 @@ static void try_model_switch(const char *arg, char **argv, int argc,
     nv[k] = NULL;
     fflush(stdout);
 
+    /* Server mode: execv() replaces the image WITHOUT running atexit(kill_srv), so
+       the spawned llama-server would be orphaned and the re-exec'd process could
+       not rebind :8181 (address in use → new server fails to start). Tear it down
+       now; the child spawns a fresh server for the new model. No-op if not in
+       server mode (g_srv_pid == 0). */
+    kill_srv();
+
     execv("/proc/self/exe", nv);        /* Linux: re-run this binary */
     execv(argv[0], nv);                 /* fallback */
 
     perror("/model: exec");             /* only reached if exec failed */
     free(nv);
     free(new_path);
-    { char tag[32]; derive_model_tag(cur_model, tag, sizeof tag); statusbar_enable(ctx, tag); }
+    { char tag[32]; derive_model_tag(cur_model, tag, sizeof tag); statusbar_enable(tag); }
     fflush(stdout);
 }
 
 /* ── Context reclamation (recent-window compaction) ────────────────────
- * Resync after any mutation of the message history. The delta-prompt scheme
- * feeds only formatted_buf+prev_len each turn, trusting the KV cache to hold the
- * prefix; once we rewrite messages[] that prefix is invalid, so we drop the
- * whole KV and zero prev_len — the next render+decode rebuilds it from the
- * (now smaller) history. Shared by /clear, deepsearch-return, and reclaim. */
-static void kv_resync_full(struct llama_context *ctx, size_t *prev_len) {
-    llama_memory_clear(llama_get_memory(ctx), true);
+ * After any mutation of the message history, reset prev_len. The local KV is gone
+ * (the server prefix-caches the full prompt itself), so there's nothing to clear —
+ * this is now just prev_len bookkeeping. Shared by /clear, deepsearch-return, reclaim. */
+static void kv_resync_full(size_t *prev_len) {
     *prev_len = 0;
 }
 
@@ -2222,7 +2408,7 @@ static const char *SUMMARY_TEMPLATE =
 
 /* Serialize a message range [start,end) into a plain transcript for the summary
  * input. Tool results were already capped at add time (MAX_TOOL_RESULT_SZ). */
-static char *serialize_messages(struct llama_chat_message *m, size_t start, size_t end) {
+static char *serialize_messages(BasiMsg *m, size_t start, size_t end) {
     StringBuf sb; sb_init(&sb);
     for (size_t i = start; i < end; i++) {
         const char *role = m[i].role ? m[i].role : "";
@@ -2256,10 +2442,9 @@ static char *build_checkpoint(const char *summary) {
  * de-advertised for the render so the schemas don't bloat the prompt or tempt a
  * tool call. Leaves the KV cleared; the caller resyncs. Returns malloc'd summary
  * text, or NULL on failure (caller falls back to a plain drop). */
-static char *summarize_head(struct llama_model *model, const struct llama_vocab *vocab,
-                            struct llama_context *ctx, struct llama_sampler *smpl,
-                            bool native_tools, char *formatted_buf,
+static char *summarize_head(bool native_tools, char *formatted_buf,
                             const char *prev_checkpoint, const char *head_text) {
+    (void) formatted_buf;   /* unused: server templates from messages */
     StringBuf up; sb_init(&up);
     if (prev_checkpoint && *prev_checkpoint) {
         sb_append_str(&up, "Update the existing checkpoint using the new transcript: keep "
@@ -2275,21 +2460,17 @@ static char *summarize_head(struct llama_model *model, const struct llama_vocab 
     sb_append_str(&up, "\n</transcript>");
     char *user_content = sb_to_str(&up);
 
-    struct llama_chat_message tmp[2];
+    BasiMsg tmp[2];
     tmp[0].role = "system"; tmp[0].content = SUMMARY_SYS;
     tmp[1].role = "user";   tmp[1].content = user_content;
 
-    basi_set_tools(NULL, 0);                       /* no tool schemas in the summary prompt */
-    int len = apply_template(model, tmp, 2, true, formatted_buf, FORMATTED_BUF_SZ);
-    if (native_tools) { int n; const BasiToolDef *d = basi_tool_defs(&n); basi_set_tools(d, n); }
-    free(user_content);
-    if (len <= 0) return NULL;
-
-    llama_memory_clear(llama_get_memory(ctx), true);   /* fresh KV for the summary decode */
+    basi_set_tools(NULL, 0);                        /* no tool schemas in the summary prompt */
     sig_atomic_t prev_quiet = generate_quiet;
     generate_quiet = 1;
-    GenerateResult r = generate(ctx, vocab, smpl, formatted_buf, (size_t)len);
+    GenerateResult r = generate_chat(tmp, 2, NULL, NULL);   /* server templates from tmp */
     generate_quiet = prev_quiet;
+    if (native_tools) { int n; const BasiToolDef *d = basi_tool_defs(&n); basi_set_tools(d, n); }
+    free(user_content);                             /* was tmp[1].content — freed after the call */
     return r.text;                                  /* may be an "[error]" string; caller checks */
 }
 
@@ -2302,18 +2483,16 @@ static char *summarize_head(struct llama_model *model, const struct llama_vocab 
  * (phase-1 behaviour) so the session still survives. Returns true if it compacted.
  * Must be called BEFORE rendering the current turn. */
 static bool reclaim_context_if_needed(
-        struct llama_model *model, const struct llama_vocab *vocab,
-        struct llama_context *ctx, struct llama_sampler *smpl,
         bool native_tools, char *formatted_buf,
-        struct llama_chat_message **messages_p, size_t *msg_count_p,
+        BasiMsg **messages_p, size_t *msg_count_p,
         size_t *prev_len_p) {
-    int total = (int)llama_n_ctx(ctx);
+    int total = basi_srv_ctx_total;
     /* RESERVE: headroom left free for the incoming turn + its answer. ~4k on a
        full local ctx, scaled down so it never swallows a small ctx whole. */
     int reserve = total / 4 < 4096 ? total / 4 : 4096;
-    int used = context_used_tokens(ctx);
+    int used = context_used_tokens();
 
-    struct llama_chat_message *m = *messages_p;
+    BasiMsg *m = *messages_p;
     size_t mc = *msg_count_p;
 
     /* Account for the turn we are ABOUT to decode: the just-added user message
@@ -2387,7 +2566,7 @@ static bool reclaim_context_if_needed(
     bool ok = false;
     if (want_summary) {
         char *head_text = serialize_messages(m, pinned, keep_from);
-        summary = summarize_head(model, vocab, ctx, smpl, native_tools, formatted_buf,
+        summary = summarize_head(native_tools, formatted_buf,
                                  has_summary ? m[1].content : NULL, head_text);
         free(head_text);
         if (getenv("BASI_DEBUG_RECLAIM"))
@@ -2402,17 +2581,17 @@ static bool reclaim_context_if_needed(
         if (has_summary) free((void *)m[1].content);    /* replace the old summary in place */
         m[1].role = "user";
         m[1].content = cp;
-        memmove(&m[2], &m[keep_from], R * sizeof(struct llama_chat_message));
+        memmove(&m[2], &m[keep_from], R * sizeof(BasiMsg));
         *msg_count_p = 2 + R;
     } else {
         /* No checkpoint (retrieve/off, or summary failed): keep system [+ any
            existing summary] + recent. */
-        memmove(&m[pinned], &m[keep_from], R * sizeof(struct llama_chat_message));
+        memmove(&m[pinned], &m[keep_from], R * sizeof(BasiMsg));
         *msg_count_p = pinned + R;
     }
     free(summary);
 
-    kv_resync_full(ctx, prev_len_p);
+    kv_resync_full(prev_len_p);
     printf("\033[33m[Compacted: kept %zu recent message%s%s%s]\033[0m\n",
            R, R == 1 ? "" : "s",
            ok ? ", summary anchored" : "",
@@ -2429,9 +2608,7 @@ static bool reclaim_context_if_needed(
  * frees it. State the commands mutate is passed by pointer; the macro
  * aliases keep the moved body verbatim. */
 static void handle_slash_command(char *user_input,
-        struct llama_model *model, const struct llama_vocab *vocab,
-        struct llama_context *ctx,
-        struct llama_chat_message **messages_p, size_t *msg_count_p,
+        BasiMsg **messages_p, size_t *msg_count_p,
         size_t *msg_cap_p, FILE *session_fp, size_t *prev_len_p,
         size_t session_prompt_tokens, size_t session_gen_tokens) {
     #define messages  (*messages_p)
@@ -2456,6 +2633,10 @@ static void handle_slash_command(char *user_input,
                     "  /premortem            (drafting only) enter premortem — model rewrites the plan with a ## Pre-mortem section\n"
                     "  /deepsearch <question>\n"
                     "                        multi-round deep research (web + knowledge base), synthesized + cited\n"
+                    "  /study [N] <question> settle a question by MEASUREMENT: designs the experiments, runs\n"
+                    "                        them, reports verdicts computed from the numbers (not argued).\n"
+                    "                        Explores N DIFFERENT theories (default 3), each told what the\n"
+                    "                        others covered; findings ranked by measured effect\n"
                     "  /model [name]         switch model (no arg: picker; name: match; keeps your chat)\n"
                     "  /cookbook [sub]       download & manage models (list | search | get <repo> | rm)\n"
                     "\n"
@@ -2476,7 +2657,7 @@ static void handle_slash_command(char *user_input,
             if (strcmp(user_input, "/clear") == 0) {
                 for (size_t i = 1; i < msg_count; i++) free((void*)messages[i].content);
                 msg_count = 1;
-                kv_resync_full(ctx, prev_len_p);
+                kv_resync_full(prev_len_p);
                 mem_clear();    /* drop retrieval memory too */
                 printf("\033[90m[Cleared conversation history (system prompt kept)]\033[0m\n");
                 fflush(stdout);
@@ -2487,8 +2668,8 @@ static void handle_slash_command(char *user_input,
                 printf("\033[90m[Session: %zu prompt tokens, %zu generated tokens, %zu total]\033[0m\n",
                        session_prompt_tokens, session_gen_tokens,
                        session_prompt_tokens + session_gen_tokens);
-                int used  = context_used_tokens(ctx);
-                int total = (int)llama_n_ctx(ctx);
+                int used  = context_used_tokens();
+                int total = basi_srv_ctx_total;
                 int pct   = total > 0 ? (int)((100.0 * used) / total) : 0;
                 printf("\033[90m[Context: %d/%d tokens in window (%d%%), %d free]\033[0m\n",
                        used, total, pct, total - used);
@@ -2657,6 +2838,67 @@ static void handle_slash_command(char *user_input,
             }
             /* /model is intercepted in the REPL loop (it re-execs), so it never
                reaches here. */
+            /* /study <question> — the discovery loop, in the session. Designs its
+             * own experiments, runs them, and reports verdicts COMPUTED from the
+             * measurements. Commands it may run come from --allow equivalents in
+             * the session: the model already has bash here, so the allowlist adds
+             * no safety, but the loop still refuses to invent commands outside
+             * what the question names. */
+            if (strncmp(user_input, "/study", 6) == 0 &&
+                (user_input[6] == '\0' || user_input[6] == ' ')) {
+                const char *q = user_input + 6;
+                while (*q == ' ') q++;
+                if (!*q) {
+                    printf("\033[31m[/study: needs a question. Usage: /study <question to settle by measurement>]\033[0m\n");
+                    printf("\033[90m  e.g. /study which zstd level compresses fastest on this machine\033[0m\n");
+                    printf("\033[90m  /study <N> <question> explores N different theories (default 3)\033[0m\n");
+                    fflush(stdout);
+                    free(user_input);
+                    return;
+                }
+                /* Optional leading count: "/study 5 <question>" runs 5 independent
+                 * explorations. DEFAULT 3, matching ROBIN's num_assays — a single
+                 * chain stops at its first success, which is exactly when it is
+                 * most tempting to stop and least justified. */
+                int ntraj = 3;
+                if (*q >= '1' && *q <= '9') {
+                    const char *after = q;
+                    int v = 0;
+                    while (*after >= '0' && *after <= '9') v = v * 10 + (*after++ - '0');
+                    if (*after == ' ' && v >= 1 && v <= 20) {
+                        ntraj = v;
+                        q = after;
+                        while (*q == ' ') q++;
+                    }
+                }
+                if (!*q) {
+                    printf("\033[31m[/study: needs a question after the count]\033[0m\n");
+                    fflush(stdout); free(user_input); return;
+                }
+                char *q_copy = strdup(q);
+                StudyLoopOpts so = { .max_rounds = 3, .port = basi_srv_port,
+                                     .unsafe = true, .question = q_copy,
+                                     .allow = NULL, .trajectories = ntraj };
+                { const char *e = getenv("BASI_STUDY_ROUNDS"); if (e && *e) so.max_rounds = atoi(e); }
+
+                char slug[128];
+                snprintf(slug, sizeof(slug), "session-study-%d", (int)(time(NULL) % 100000));
+                printf("\033[90m[/study] exploring %d different theories, up to %d rounds each — "
+                       "verdicts are computed, not argued\033[0m\n", so.trajectories, so.max_rounds);
+                fflush(stdout);
+
+                char *report = study_loop(slug, &so);
+                printf("\n%s\n", report ? report : "(no result)");
+                fflush(stdout);
+                ADD_MESSAGE("user", q_copy);
+                ADD_MESSAGE("assistant", report ? report : "(no result)");
+                kv_resync_full(prev_len_p);
+                free(q_copy);
+                free(report);
+                free(user_input);
+                return;
+            }
+
             if (strncmp(user_input, "/deepsearch", 11) == 0 &&
                 (user_input[11] == '\0' || user_input[11] == ' ')) {
                 const char *q = user_input + 11;
@@ -2668,7 +2910,7 @@ static void handle_slash_command(char *user_input,
                     return;
                 }
                 char *q_copy = strdup(q);
-                char *answer = execute_deep_search(model, vocab, q_copy);
+                char *answer = execute_deep_search(q_copy);
                 printf("\n%s\n\n", answer ? answer : "(no answer)");
                 fflush(stdout);
                 /* Record the exchange so follow-up turns have context. The
@@ -2677,7 +2919,7 @@ static void handle_slash_command(char *user_input,
                  * (like /clear) so the next turn cleanly re-decodes everything. */
                 ADD_MESSAGE("user", q_copy);
                 ADD_MESSAGE("assistant", answer ? answer : "(no answer)");
-                kv_resync_full(ctx, prev_len_p);
+                kv_resync_full(prev_len_p);
                 free(q_copy);
                 free(answer);
                 free(user_input);
@@ -2827,11 +3069,72 @@ static void handle_slash_command(char *user_input,
  * call and feed the result back (up to max_tool_iterations), then a final
  * answer. State that outlives the turn is passed by pointer; user_input is
  * borrowed (the caller frees it). */
+/* ── Durable action journal + tool-result elision ──────────────────────
+ * A single agentic turn is ONE user message followed by many tool_call/
+ * tool_result pairs. reclaim_context_if_needed() only cuts at USER boundaries,
+ * so it can never reclaim INSIDE such a turn — measured: a long -p run climbed
+ * to 99% ctx with the compaction banner never once printing, then died. The tool
+ * RESULTS (sed/grep dumps) are what fill the window, and in native-tools mode
+ * they carry the role "tool_result", which reclaim's user-boundary walk skips.
+ *
+ * Fix (two coupled halves): every FULL tool result is appended to a plain-text
+ * JOURNAL on disk — lossless and grep-able — and once context is tight the OLD
+ * tool_result messages in the working set are replaced with a short stub that
+ * points at the journal. Context stays bounded; nothing is lost; the model greps
+ * the journal to recall one earlier output instead of holding all of them. */
+#define ELIDE_STUB_PREFIX "[earlier tool output elided to save context"
+#define ELIDE_KEEP_RECENT 4          /* most-recent tool results kept in full */
+
+static char *g_journal_path = NULL;  /* .basi/journal-<pid>.md, created lazily */
+static int   g_journal_seq  = 0;
+
+static const char *journal_path(void) {
+    if (!g_journal_path) {
+        mkdir(".basi", 0755);
+        char p[128];
+        snprintf(p, sizeof(p), ".basi/journal-%d.md", (int)getpid());
+        g_journal_path = strdup(p);
+    }
+    return g_journal_path;
+}
+
+/* Append one FULL tool result (called BEFORE truncation, so the journal keeps
+ * what the context does not). `tag` is the tool identity, for a grep-able header. */
+static void journal_append(const char *tag, const char *full_result) {
+    if (!full_result) return;
+    FILE *f = fopen(journal_path(), "a");
+    if (!f) return;
+    fprintf(f, "\n## [%d] %s\n\n", ++g_journal_seq, (tag && *tag) ? tag : "tool");
+    fwrite(full_result, 1, strlen(full_result), f);
+    fputc('\n', f);
+    fclose(f);
+}
+
+/* Replace the content of tool_result messages older than the most recent `keep`
+ * with a stub. Returns how many were elided. The journal holds the full text, so
+ * this loses nothing the model cannot grep back. This is the compaction reclaim
+ * cannot do inside a single agentic turn. */
+static int elide_old_tool_results(BasiMsg *messages, size_t mc, int keep) {
+    int seen = 0, elided = 0;
+    for (size_t i = mc; i-- > 0; ) {
+        const char *role = messages[i].role, *c = messages[i].content;
+        if (!role || strcmp(role, "tool_result") != 0) continue;
+        if (c && strncmp(c, ELIDE_STUB_PREFIX, strlen(ELIDE_STUB_PREFIX)) == 0) continue;
+        if (++seen <= keep) continue;
+        char stub[256];
+        snprintf(stub, sizeof(stub),
+            "%s — full output is in %s (grep it to recall this).]",
+            ELIDE_STUB_PREFIX, journal_path());
+        free((void *)messages[i].content);
+        messages[i].content = strdup(stub);
+        elided++;
+    }
+    return elided;
+}
+
 static void run_agentic_turn(char *user_input,
-        struct llama_model *model, const struct llama_vocab *vocab,
-        struct llama_context *ctx, struct llama_sampler *smpl,
         bool native_tools, char *formatted_buf,
-        struct llama_chat_message **messages_p, size_t *msg_count_p,
+        BasiMsg **messages_p, size_t *msg_count_p,
         size_t *msg_cap_p, FILE *session_fp, size_t *prev_len_p,
         size_t *session_prompt_tokens_p, size_t *session_gen_tokens_p) {
     #define messages  (*messages_p)
@@ -2871,7 +3174,7 @@ static void run_agentic_turn(char *user_input,
            Summarizes the oldest turns into an anchored checkpoint (system prompt
            pinned) and resyncs the KV, so the render below re-decodes the compacted
            history once instead of hitting the [Context limit reached] wall. */
-        reclaim_context_if_needed(model, vocab, ctx, smpl, native_tools, formatted_buf,
+        reclaim_context_if_needed(native_tools, formatted_buf,
                                   messages_p, msg_count_p, prev_len_p);
 
         /* retrieve/hybrid: pull the top-k dropped turns most relevant to THIS query
@@ -2905,45 +3208,10 @@ static void run_agentic_turn(char *user_input,
             }
         }
 
-        /* Apply chat template — renders the model's native format via the jinja
-           engine (chat_tmpl shim), with ChatML fallback. */
-        int new_len = apply_template(
-            model, messages, msg_count, true,
-            formatted_buf, FORMATTED_BUF_SZ);
-
-        if (new_len < 0) {
-            printf("Error: Failed to apply chat template\n");
-            fflush(stdout);
-            return;
-        }
-
-        /* Delta-prompt invariant guard. The KV holds the prefix up to prev_len
-           and we feed only formatted_buf+prev_len, trusting the render to grow
-           monotonically. Some templates DON'T — notably thinking models (Qwen3.x)
-           that restructure prior turns — so this render can come out SHORTER than
-           prev_len, underflowing prompt_len to a huge size_t and crashing tokenize.
-           When that happens the cached prefix is invalid anyway: drop the KV and
-           decode the whole freshly-rendered prompt. */
-        /* Resync the KV when a cross-turn delta can't be trusted:
-           (a) prev_len > new_len — a non-monotonic render underflows prompt_len
-               and crashes tokenize.
-           (b) thinking model — BASI strips <think>...</think> from the stored
-               assistant turn, but the KV decoded it. So the KV holds MORE tokens
-               than the re-rendered (stripped) history, and a delta feeds the new
-               turn at the wrong KV position: the model loses the conversation and
-               answers a stale turn. Re-decode the clean full history instead.
-               (Costs a full prefill per turn for thinking models — correct over
-               fast; a future optimization could surgically drop the think tokens
-               from the KV instead.) */
-        bool delta_unsafe = (prev_len > (size_t)new_len) || basi_thinking_tags(NULL, NULL);
-        if (delta_unsafe) {
-            if (getenv("BASI_DEBUG_RECLAIM"))
-                fprintf(stderr, "[delta] resync (prev_len=%zu new_len=%d thinking=%d)\n",
-                        prev_len, new_len, basi_thinking_tags(NULL, NULL));
-            kv_resync_full(ctx, prev_len_p);
-        }
-        char *prompt = formatted_buf + prev_len;
-        size_t prompt_len = (size_t)new_len - prev_len;
+        /* No prompt render here anymore: generation is server-backed and
+           generate_chat() serializes `messages` itself (the server templates +
+           owns the KV via cache_prompt). Compaction/retrieval above operate on the
+           message array directly. */
 
         /* Tool execution loop. The per-turn cap defaults to 40 — multi-step work
            on a large/unfamiliar repo (navigate→grep→read→edit→test→fix) needs many
@@ -2953,50 +3221,89 @@ static void run_agentic_turn(char *user_input,
         int tool_iterations = 0;
         int consec_parse_fail = 0;     /* consecutive unparseable tool-call outputs */
         int max_tool_iterations = 40;
+        /* The iteration cap used to double as a context-overflow guard; now that
+           elision bounds context, a compaction event resets the counter (it means
+           the agent did real work and earned fresh room). max_elision_resets is the
+           remaining backstop against a loop that keeps eliding without converging. */
+        int elision_resets = 0;
+        int max_elision_resets = 12;
+
+        /* Re-read dedup: hashes of substantial tool results already returned this turn.
+           A tool call that returns bytes identical to one of these fed the model nothing
+           new, so its context copy is replaced with a nudge to act instead of re-reading
+           (a phase was measured re-reading .basi/findings.md 8x without ever editing). */
+        unsigned long seen_results[256];
+        int n_seen_results = 0;
         {
             const char *mi = getenv("BASI_MAX_TOOL_ITERS");
             if (mi) { int v = atoi(mi); if (v > 0 && v <= 200) max_tool_iterations = v; }
+            const char *mr = getenv("BASI_MAX_ELISION_RESETS");
+            if (mr) { int v = atoi(mr); if (v >= 0 && v <= 100) max_elision_resets = v; }
         }
 
         while (tool_iterations < max_tool_iterations) {
             tool_iterations++;
 
             /* Reclaim INSIDE the tool loop too. A long agentic turn is one user
-               turn with many tool calls, each appending a result — with the
-               reclaim check only before the loop, that history accumulates with
-               no compaction until the KV overflows mid-session (the [Context
-               limit reached] wall, after which a small model often degenerates).
-               On compaction the KV is cleared and prev_len reset, so re-render the
-               full compacted history instead of the now-invalid delta. Skip the
-               first iteration: the pre-loop reclaim + retrieve injection already
-               set up `prompt` for it. */
-            if (tool_iterations > 1 &&
-                reclaim_context_if_needed(model, vocab, ctx, smpl, native_tools,
-                                          formatted_buf, messages_p, msg_count_p, prev_len_p)) {
-                int rl = apply_template(model, messages, msg_count, true,
-                                        formatted_buf, FORMATTED_BUF_SZ);
-                if (rl < 0) { printf("Error: Failed to apply chat template\n"); fflush(stdout); break; }
-                prompt = formatted_buf;
-                prompt_len = (size_t)rl;
+               turn with many tool calls, each appending a result — without an
+               in-loop reclaim that history accumulates until the server's context
+               overflows. Compaction rewrites the message array; generate_chat()
+               re-serializes it next iteration, so no re-render is needed here. */
+            if (tool_iterations > 1)
+                reclaim_context_if_needed(native_tools,
+                                          formatted_buf, messages_p, msg_count_p, prev_len_p);
+
+            /* reclaim above cuts only at user boundaries, of which a single
+               agentic turn has none — so once the window is tight, elide OLD
+               tool RESULTS (which are what actually fill it) down to journal
+               stubs. Keeps context bounded where reclaim structurally cannot. */
+            if (context_used_tokens() > (basi_srv_ctx_total * 3) / 4) {
+                int e = elide_old_tool_results(*messages_p, *msg_count_p, ELIDE_KEEP_RECENT);
+                if (e > 0) {
+                    printf("\033[33m[Context: elided %d old tool result(s) -> %s; grep to recall]\033[0m\n",
+                           e, journal_path());
+                    /* Compaction => the agent filled the window with real work and now
+                       has room again; refresh the iteration budget so the cap (meant to
+                       bound context) does not kill a productive long task. Bounded by
+                       max_elision_resets so a non-converging loop still terminates. */
+                    if (elision_resets < max_elision_resets) {
+                        elision_resets++;
+                        tool_iterations = 0;
+                        printf("\033[33m[Tool budget refreshed after compaction (reset %d/%d)]\033[0m\n",
+                               elision_resets, max_elision_resets);
+                    }
+                }
             }
 
-            /* Reset the lazy tool grammar so this generation starts fresh — no
-               trigger state carried over from the previous tool round. */
-            if (g_tool_grammar) llama_sampler_reset(g_tool_grammar);
+            /* Server-chat path (item 6b, opt-in via BASI_SERVER_CHAT): the server
+               templates from the message array, owns the tool grammar, and returns
+               STRUCTURED tool calls — so we skip the rendered prompt, the grammar
+               reset, and the PEG parse. The prompt/delta above is still built (its
+               cost goes away in phase c); we just don't use it here. */
+            /* Server mode drives generation through /v1/chat/completions by default
+               now (the server owns templating + grammar + tool parsing). The old
+               /completion path is still reachable during the teardown via
+               BASI_SERVER_COMPLETION=1. */
+            BasiToolCall *ncalls = NULL;
+            int n_ncalls = 0;
             generation_interrupted = 0;
             setup_sigint_handler();
-            GenerateResult result = generate(ctx, vocab, smpl, prompt, prompt_len);
+            GenerateResult result = generate_chat(messages, msg_count, &ncalls, &n_ncalls);
+            basi_srv_ctx_used = (int) result.prompt_tokens;   /* honest ctx meter from usage */
             reset_sigint_handler();
             session_prompt_tokens += result.prompt_tokens;
             session_gen_tokens    += result.gen_tokens;
 
             /* Performance metrics */
-            double prompt_tps = result.prompt_time_s > 0
-                ? result.prompt_tokens / result.prompt_time_s : 0;
+            /* The server's own prefill rate (over the tokens it actually evaluated).
+               Displays identically to the old prompt_tokens/prompt_time_s form, which
+               algebraically reduced to this same figure — the difference is that
+               prompt_time_s is now a real duration rather than a reconstruction. */
+            double prompt_tps = result.prompt_tps;
             double gen_tps = result.gen_time_s > 0
                 ? result.gen_tokens / result.gen_time_s : 0;
             char meter[80];
-            format_context_meter(ctx, meter, sizeof meter);
+            format_context_meter(meter, sizeof meter);
             printf("\033[90m[ Prompt: %.1f t/s | Generation: %.1f t/s | %s ]\033[0m\n",
                    prompt_tps, gen_tps, meter);
             fflush(stdout);
@@ -3012,35 +3319,22 @@ static void run_agentic_turn(char *user_input,
             char *call_env = NULL;         /* native: structured assistant tool-call envelope */
             char *call_name = NULL;        /* native: tool name, for the result envelope */
             bool have_call = false;
-            BasiToolCall *ncalls = NULL;
-            int n_ncalls = 0;
 
-            if (native_tools) {
-                n_ncalls = basi_parse_tool_calls(result.text, &ncalls);
-                if (n_ncalls > 0) {        /* one tool per turn for now (2a) */
-                    const char *nm = ncalls[0].name ? ncalls[0].name : "?";
-                    print_tool_activity(nm, ncalls[0].arguments);
-                    /* Structured dispatch: parsed JSON args go straight to the
-                       handlers, never round-tripped through a shell string. */
-                    tool_result = execute_tool_native(ncalls[0].name, ncalls[0].arguments);
-                    if (getenv("BASI_DEBUG_TOOLS"))
-                        fprintf(stderr, "[tool] name=%s args=%s\n  -> result=%.160s\n",
-                                nm, ncalls[0].arguments ? ncalls[0].arguments : "(null)",
-                                tool_result ? tool_result : "(null)");
-                    if (!tool_result) unknown_tool = strdup(nm);
-                    call_name = strdup(nm);
-                    call_env  = tool_call_envelope(ncalls[0].name, ncalls[0].arguments);
-                    have_call = true;
-                }
-            } else {
-                size_t tool_cmd_len;
-                const char *tc = extract_tool_call(result.text, &tool_cmd_len);
-                if (tc) {
-                    cmd_str = malloc(tool_cmd_len + 1);
-                    memcpy(cmd_str, tc, tool_cmd_len);
-                    cmd_str[tool_cmd_len] = '\0';
-                    have_call = true;
-                }
+            /* Structured tool calls come straight from the server (one per turn). */
+            if (n_ncalls > 0) {
+                const char *nm = ncalls[0].name ? ncalls[0].name : "?";
+                print_tool_activity(nm, ncalls[0].arguments);
+                /* Structured dispatch: parsed JSON args go straight to the
+                   handlers, never round-tripped through a shell string. */
+                tool_result = execute_tool_native(ncalls[0].name, ncalls[0].arguments);
+                if (getenv("BASI_DEBUG_TOOLS"))
+                    fprintf(stderr, "[tool] name=%s args=%s\n  -> result=%.160s\n",
+                            nm, ncalls[0].arguments ? ncalls[0].arguments : "(null)",
+                            tool_result ? tool_result : "(null)");
+                if (!tool_result) unknown_tool = strdup(nm);
+                call_name = strdup(nm);
+                call_env  = tool_call_envelope(ncalls[0].name, ncalls[0].arguments);
+                have_call = true;
             }
 
             if (have_call) {
@@ -3058,6 +3352,33 @@ static void run_agentic_turn(char *user_input,
                 free(unknown_tool);
                 if (ncalls) basi_free_tool_calls(ncalls, n_ncalls);
 
+                /* Journal the FULL result before truncation, so the on-disk log
+                   is lossless even when the in-context copy is trimmed or later
+                   elided. The model can grep it to recall anything. */
+                journal_append(call_name, tool_result);
+
+                /* Re-read dedup: if this substantial result is byte-identical to one the
+                   model already received this turn, re-reading it added nothing — replace
+                   its context copy with a nudge to act, so a phase cannot burn its budget
+                   re-reading one file. Journaled above first, so the log stays lossless. */
+                if (tool_result && strlen(tool_result) > 200) {
+                    unsigned long h = tool_result_hash(tool_result);
+                    bool dup = false;
+                    for (int i = 0; i < n_seen_results; i++)
+                        if (seen_results[i] == h) { dup = true; break; }
+                    if (dup) {
+                        free(tool_result);
+                        tool_result = strdup(
+                            "[IDENTICAL to a result you already have — re-reading it gives you "
+                            "nothing new. Do NOT read it again. Act on what you know: make the "
+                            "edit / run the command, or read a DIFFERENT file.]");
+                        printf("\033[33m[dedup: identical re-read — nudging toward action]\033[0m\n");
+                        fflush(stdout);
+                    } else if (n_seen_results < (int)(sizeof(seen_results)/sizeof(seen_results[0]))) {
+                        seen_results[n_seen_results++] = h;
+                    }
+                }
+
                 /* Truncate tool result if too large — line-aware, head+tail.
                    The dim "└ <summary>" sub-line reports the outcome (and any
                    trim) directly under the activity header. */
@@ -3066,9 +3387,11 @@ static void run_agentic_turn(char *user_input,
                         TOOL_RESULT_MAX_BYTES);
                 print_tool_result_line(tool_result, dropped);
 
-                llama_memory_t mem = llama_get_memory(ctx);
-                int used = llama_memory_seq_pos_max(mem, 0) + 1;
-                int remaining = (int)llama_n_ctx(ctx) - used;
+                /* context_used_tokens() reads the server's tracked prompt count in
+                   server mode, or the local KV otherwise — so the budget hint the
+                   model sees is honest in both. */
+                int used = context_used_tokens();
+                int remaining = basi_srv_ctx_total - used;
 
                 if (native_tools) {
                     /* Structured round-trip: the assistant's tool call and the
@@ -3083,7 +3406,7 @@ static void run_agentic_turn(char *user_input,
                     char budget[256];
                     snprintf(budget, sizeof(budget),
                         "\n[Context: %d/%d tokens used, %d remaining. Answer now if remaining < 8000.]",
-                        used, (int)llama_n_ctx(ctx), remaining);
+                        used, basi_srv_ctx_total, remaining);
                     sb_append_str(&tr, budget);
                     char *res_env = tool_result_envelope(call_name, sb_to_str(&tr));
                     sb_free(&tr);
@@ -3104,7 +3427,7 @@ static void run_agentic_turn(char *user_input,
                     snprintf(budget, sizeof(budget),
                         "\n</tool_result>\n[Context: %d/%d tokens used, %d remaining. "
                         "Original request: \"%.180s\". You MUST answer now if remaining < 8000.]",
-                        used, (int)llama_n_ctx(ctx), remaining, user_input);
+                        used, basi_srv_ctx_total, remaining, user_input);
                     sb_append_str(&tool_resp, budget);
                     ADD_MESSAGE("user", sb_to_str(&tool_resp));
                     sb_free(&tool_resp);
@@ -3113,27 +3436,8 @@ static void run_agentic_turn(char *user_input,
                 free(call_name);
                 free(tool_result);
 
-                /* Update template for next iteration (delta prompt) */
-                int next_len = apply_template(
-                    model, messages, msg_count, true,
-                    formatted_buf, FORMATTED_BUF_SZ);
-                if (next_len < 0) {
-                    printf("Error: Failed to apply chat template\n");
-                    fflush(stdout);
-                    break;
-                }
-                int prev = apply_template(
-                    model, messages, msg_count - 1, false, NULL, 0);
-                /* Same non-monotonic-render guard as the turn-start delta: if the
-                   all-but-last render is longer than the full one, the delta would
-                   underflow — resync the KV and feed the whole prompt instead. */
-                if (prev < 0 || prev > next_len) {
-                    kv_resync_full(ctx, prev_len_p);
-                    prev = 0;
-                }
-                prompt = formatted_buf + prev;
-                prompt_len = (size_t)next_len - (size_t)prev;
-
+                /* The tool call + result were appended to `messages`; generate_chat()
+                   re-serializes them next iteration. No re-render needed. */
                 printf("\n");
                 fflush(stdout);
             } else {
@@ -3160,16 +3464,9 @@ static void run_agentic_turn(char *user_input,
                         "the correct format with properly matched tags, or give your final answer "
                         "if the task is complete.");
                     free(result.text);
-                    int nl = apply_template(model, messages, msg_count, true,
-                                            formatted_buf, FORMATTED_BUF_SZ);
-                    if (nl < 0) { printf("Error: Failed to apply chat template\n"); break; }
-                    int pv = apply_template(model, messages, msg_count - 1, false, NULL, 0);
-                    if (pv < 0 || pv > nl) { kv_resync_full(ctx, prev_len_p); pv = 0; }
-                    prompt = formatted_buf + pv;
-                    prompt_len = (size_t)nl - (size_t)pv;
                     printf("\n");
                     fflush(stdout);
-                    continue;
+                    continue;   /* re-serialized from messages next iteration */
                 }
                 /* genuine final answer (or gave up after repeated parse failures) */
                 ADD_MESSAGE("assistant", result.text);
@@ -3178,14 +3475,35 @@ static void run_agentic_turn(char *user_input,
             }
         }
 
-        /* If we exhausted tool iterations, do one final generation for the answer */
+        /* If we exhausted tool iterations, do one final generation for the answer.
+         *
+         * Tools MUST be withdrawn for it. Passing NULL for tc_out only discards
+         * the parsed calls — it does not stop generate_chat from advertising the
+         * tool list, so the model answers the only way it has been trained to and
+         * emits another tool call. The structured call is then thrown away and
+         * whatever lead-in sentence preceded it becomes the "final answer": a
+         * capped run reported `Let me find the common directory and look at...`
+         * as its deliverable after 40 rounds of real work. Clearing g_tools is
+         * how deepsearch already suppresses tools for its own loop. */
         if (tool_iterations >= max_tool_iterations) {
-            printf("\033[90m[Generating answer...]\033[0m\n");
+            printf("\033[90m[Tool budget exhausted — asking for a final answer]\033[0m\n");
             fflush(stdout);
-            if (g_tool_grammar) llama_sampler_reset(g_tool_grammar);
+
+            ADD_MESSAGE("user",
+                "You have used your entire tool budget, so no further tool calls are "
+                "possible. Answer now, from what you have already found. Give the best "
+                "complete answer you can: state what you established, and where you were "
+                "still uncertain, say so explicitly rather than leaving it out.");
+
+            int n_saved_tools = 0;
+            const BasiToolDef *saved_tools = basi_tool_defs(&n_saved_tools);
+            basi_set_tools(NULL, 0);
+
             generation_interrupted = 0;
             setup_sigint_handler();
-            GenerateResult final_result = generate(ctx, vocab, smpl, prompt, prompt_len);
+            GenerateResult final_result = generate_chat(messages, msg_count, NULL, NULL);
+            basi_set_tools(saved_tools, n_saved_tools);
+            basi_srv_ctx_used = (int) final_result.prompt_tokens;
             reset_sigint_handler();
             session_prompt_tokens += final_result.prompt_tokens;
             session_gen_tokens    += final_result.gen_tokens;
@@ -3193,7 +3511,7 @@ static void run_agentic_turn(char *user_input,
             double gen_tps = final_result.gen_time_s > 0
                 ? final_result.gen_tokens / final_result.gen_time_s : 0;
             char meter[80];
-            format_context_meter(ctx, meter, sizeof meter);
+            format_context_meter(meter, sizeof meter);
             printf("\033[90m[ Generation: %.1f t/s | %s ]\033[0m\n", gen_tps, meter);
             fflush(stdout);
             statusbar_draw();   /* refresh the pinned ctx meter after this turn */
@@ -3204,11 +3522,6 @@ static void run_agentic_turn(char *user_input,
 
         printf("\n");
         fflush(stdout);
-
-        /* Update prev_len for next turn */
-        int len = apply_template(
-            model, messages, msg_count, false, NULL, 0);
-        if (len >= 0) prev_len = (size_t)len;
 
     #undef messages
     #undef msg_count
@@ -3228,6 +3541,15 @@ int main(int argc, char **argv) {
             "Usage:\n"
             "  basi-cli docs add <file.md> [--shelf=notes|pinned|docs]\n");
         return 2;
+    }
+
+    /* `basi-cli study ...`: the discovery loop runs without loading a model —
+     * executing an experiment and applying its decision rule is deterministic. */
+    if (argc >= 2 && strcmp(argv[1], "study") == 0) {
+        return cmd_study(argc - 2, argv + 2);
+    }
+    if (argc >= 2 && strcmp(argv[1], "factory") == 0) {
+        return cmd_factory(argc - 2, argv + 2);
     }
 
     Cli cli = parse_args(argc, argv);
@@ -3301,6 +3623,7 @@ int main(int argc, char **argv) {
     static char default_model[1024];
     int ctx_override = 0;
     float temp_override = -1;
+    int picker_spec = -1, picker_fa = -1, picker_cpumoe = -1;   /* server launch flags from the picker (-1 = not set) */
     bool loaded_from_default = false;   /* model came from the saved-default file */
     /* --pick (from /model): force the picker BEFORE any model is loaded, so its
        VRAM probe / auto-fit see the whole GPU free (the previous model was
@@ -3316,6 +3639,9 @@ int main(int argc, char **argv) {
             if (!ngl_set) n_gpu_layers = cfg.gpu_layers;
             ctx_override  = cfg.ctx_size;
             temp_override = cfg.temperature;
+            picker_spec   = cfg.spec_draft_mtp;
+            picker_fa     = cfg.flash_attn;
+            picker_cpumoe = cfg.cpu_moe;
             save_default_model(model_path, n_gpu_layers, cfg.ctx_size);
         }
     }
@@ -3348,6 +3674,9 @@ int main(int argc, char **argv) {
         if (!ngl_set) n_gpu_layers = cfg.gpu_layers;
         ctx_override = cfg.ctx_size;
         temp_override = cfg.temperature;
+        picker_spec  = cfg.spec_draft_mtp;
+        picker_fa    = cfg.flash_attn;
+        picker_cpumoe = cfg.cpu_moe;
         /* An explicit pick always (re)writes the default — including repairing a
            stale file that pointed at a since-deleted model. */
         save_default_model(model_path, n_gpu_layers, cfg.ctx_size);
@@ -3369,113 +3698,218 @@ int main(int argc, char **argv) {
      * --no-tools never touches the web, so don't spin SearXNG up for it. */
     if (!no_tools) web_ensure_searxng();
 
+    /* Server-backed generation spike (M1): BASI_SERVER_SELFTEST=1 spawns a
+       llama-server, streams a completion over its SSE /completion, and exits —
+       WITHOUT loading any model in-process (the server owns the only copy).
+       Proves the Pi-style pivot + gets MTP spec-decode for free. Default-off. */
+    if (getenv("BASI_SERVER_SELFTEST") && model_path) {
+        srvgen_selftest(model_path, n_gpu_layers, ctx_override > 0 ? ctx_override : CONTEXT_SIZE);
+        return 0;
+    }
+
+    /* Item 6 phase (a): BASI_SRV_CHAT_SELFTEST=1 spawns a server and drives the
+       /v1/chat/completions client (messages+tools → structured tool_calls +
+       separated reasoning + usage), WITHOUT loading any model in-process. Proves
+       the pure-HTTP path that will let BASI drop the libllama link. */
+    if (getenv("BASI_SRV_CHAT_SELFTEST") && model_path) {
+        srvchat_selftest(model_path, n_gpu_layers, ctx_override > 0 ? ctx_override : CONTEXT_SIZE);
+        return 0;
+    }
+
+    /* Retrieve-don't-stuff M0: BASI_EMBED_BATCH_SELFTEST=1 spawns the embedder and
+       checks the batch path against the single path (equivalence + speedup). Needs
+       no chat model — it only exercises the embedder. */
+    if (getenv("BASI_EMBED_BATCH_SELFTEST")) {
+        embed_batch_selftest();
+        return 0;
+    }
+
+
+    /* Item 6 phase (b) round-trip: serialize a mock conversation that already
+       contains a tool_call + tool_result via basi_messages_to_json (OpenAI format,
+       synthetic call ids), send it through the chat client, and check the model
+       ANSWERS from the tool result — proving the message serialization + id
+       pairing template correctly server-side. */
+    if (getenv("BASI_SRV_CHAT_MSGTEST") && model_path) {
+        const char *sbin = getenv("BASI_SERVER_BIN");
+        if (!sbin || !*sbin) sbin = "/home/alberto/llama.cpp/build_vulkan/bin/llama-server";
+        int n; const BasiToolDef *defs = basi_tool_defs(&n); basi_set_tools(defs, n);
+        pid_t pid = srvgen_spawn(sbin, model_path, n_gpu_layers, 4096,
+                                 "--jinja --reasoning-format auto", 8181, "/tmp/basi_srvgen.log", 300);
+        if (pid < 0) { fprintf(stderr, "[msgtest] server spawn FAILED\n"); return 1; }
+        BasiMsg m[4] = {
+            { "system",      "You are a helpful assistant. Answer concisely." },
+            { "user",        "What files are in the current directory? Use bash." },
+            { "tool_call",   "{\"name\":\"bash\",\"arguments\":{\"command\":\"ls\"}}" },
+            { "tool_result", "{\"name\":\"bash\",\"content\":\"README.md  main.c  secret_unicorn_9f3.txt\"}" },
+        };
+        char *mj = basi_messages_to_json(m, 4);
+        char *tj = basi_tools_to_json();
+        fprintf(stderr, "[msgtest] messages JSON:\n%s\n[msgtest] tools JSON: %.80s...\n", mj, tj);
+        SrvSampling samp = { .temperature = 0.0, .repeat_penalty = 1.1, .repeat_last_n = 256,
+                             .min_p = 0.05, .top_k = 0, .top_p = 1.0, .seed = -1 };
+        SrvChatResult *r = srvchat_complete(8181, mj, tj, &samp, 120, NULL, NULL, NULL);
+        if (r) {
+            fprintf(stderr, "[msgtest] finish=%s prompt_tokens=%d tool_calls=%d\n[msgtest] ANSWER: %s\n",
+                    r->finish_reason ? r->finish_reason : "?", r->prompt_tokens, r->n_tool_calls,
+                    r->content ? r->content : "(none)");
+            srvchat_free(r);
+        } else fprintf(stderr, "[msgtest] request FAILED\n");
+        free(mj); free(tj);
+        srvgen_kill(pid);
+        return 0;
+    }
+
     /* In --no-tools mode stdout must carry only the completion, so load chatter
      * goes to stderr. */
     fprintf(no_tools ? stderr : stdout, "BASI-CLI - Loading model...\n");
     fflush(no_tools ? stderr : stdout);
 
-    model_init();
+    /* Server-backed generation only: the weights + KV + templating + tool grammar
+       all live in the spawned llama-server. BASI loads NO model in-process — the
+       model/vocab/ctx handles stay NULL (retained only in the signatures of
+       functions that no longer touch them). */
+    const bool use_server = true;
 
-    /* Load model */
-    struct llama_model_params model_params = llama_model_default_params();
-    model_params.n_gpu_layers = n_gpu_layers;
-
-    struct llama_model *model = llama_model_load_from_file(model_path, model_params);
-    if (!model) {
-        fprintf(stderr, "Error: Failed to load model from %s\n", model_path);
-        return 1;
-    }
-
-    const struct llama_vocab *vocab = llama_model_get_vocab(model);
-    if (!vocab) {
-        fprintf(stderr, "Error: Failed to get vocabulary from model\n");
-        llama_model_free(model);
-        return 1;
-    }
-
-    /* In one-shot deep-research the main context is never used for generation
-       (we run deep_search in its own large context, then exit), so shrink it to
-       free VRAM for the research context — important on a single GPU where two
-       full-size contexts won't both fit. */
+    /* In one-shot deep-research shrink the server context to free VRAM. */
     if (oneshot_deepsearch_q) ctx_override = 4096;
 
-    /* Create context */
-    struct llama_context_params ctx_params = llama_context_default_params();
-    ctx_params.n_ctx   = ctx_override > 0 ? (uint32_t)ctx_override : CONTEXT_SIZE;
-    ctx_params.n_batch = ctx_params.n_ctx;
-    /* Use physical cores (half of hyperthreaded count) for CPU layers */
-    int n_cores = (int)sysconf(_SC_NPROCESSORS_ONLN);
-    if (n_cores > 2) {
-        int phys = n_cores / 2;  /* physical cores, no hyperthreading */
-        ctx_params.n_threads = phys;
-        ctx_params.n_threads_batch = phys;
+    /* Spawn the llama-server that holds the weights + does generation. */
+    if (use_server) {
+        const char *sbin = getenv("BASI_SERVER_BIN");
+        if (!sbin || !*sbin) sbin = "/home/alberto/llama.cpp/build_vulkan/bin/llama-server";
+        int spec_nmax = 1;
+        { const char *e = getenv("BASI_SPEC_NMAX"); if (e && *e) spec_nmax = atoi(e); }
+        int srv_ctx = ctx_override > 0 ? ctx_override : CONTEXT_SIZE;
+
+        /* Attach mode (BASI_ATTACH=1 / BASI_SERVER_PORT=N): reuse an already-running
+           llama-server rather than spawning our own — a pure HTTP client, like Pi.
+           Lets one persistent server serve many short basi invocations (e.g. a
+           benchmark harness); we neither spawn it nor tear it down. */
+        const char *attach_env  = getenv("BASI_ATTACH");
+        const char *attach_port = getenv("BASI_SERVER_PORT");
+        if ((attach_env && atoi(attach_env)) || (attach_port && *attach_port)) {
+            int aport = (attach_port && *attach_port) ? atoi(attach_port) : 8181;
+            char hc[160];
+            snprintf(hc, sizeof hc, "curl -sf -o /dev/null http://127.0.0.1:%d/health", aport);
+            if (system(hc) != 0) {
+                fprintf(stderr, "Error: BASI_ATTACH set but no healthy llama-server on 127.0.0.1:%d\n", aport);
+                return 1;
+            }
+            basi_srv_port = aport;
+
+            /* The attached server's context is a property of THAT server, not of our
+               saved defaults. Ask it. Without this we budgeted against the `ctx=` in
+               ~/.config/basi-cli/default-model, which can belong to a completely
+               different model — it held ctx=2048 from an old Qwen3-0.6B entry, so
+               attach runs against a 32k server compacted continuously and every
+               measurement taken through them was distorted. */
+            char pc[200];
+            snprintf(pc, sizeof pc,
+                     "curl -sf --max-time 5 http://127.0.0.1:%d/props", aport);
+            char *props = run_command(pc, 64 * 1024);
+            long n_ctx = props ? jx_get_int(props, "default_generation_settings.n_ctx") : -1;
+            free(props);
+
+            if (n_ctx > 0) {
+                if (cli_ctx > 0 && cli_ctx <= n_ctx) {
+                    basi_srv_ctx_total = cli_ctx;      /* explicit -c narrows it on purpose */
+                } else {
+                    if (cli_ctx > n_ctx)
+                        fprintf(stderr, "\033[33m[server mode] -c %d exceeds the server's "
+                                        "n_ctx %ld; using %ld\033[0m\n", cli_ctx, n_ctx, n_ctx);
+                    basi_srv_ctx_total = (int) n_ctx;
+                }
+            } else {
+                basi_srv_ctx_total = srv_ctx;
+                fprintf(stderr, "\033[33m[server mode] could not read n_ctx from /props; "
+                                "assuming %d — pass -c to be sure\033[0m\n", srv_ctx);
+            }
+            fprintf(stderr, "\033[90m[server mode] attached to running llama-server on :%d, "
+                            "ctx %d (no spawn / no teardown)\033[0m\n", aport, basi_srv_ctx_total);
+        } else {
+
+        /* Spec-decode selection, in precedence order: explicit BASI_SPEC env wins;
+           else the picker's choice; else auto-enable draft-mtp for an MTP model
+           (its head is exactly for this). Flash-attn follows the picker, else spec. */
+        const char *spec_env = getenv("BASI_SPEC");
+        int model_is_mtp = (strstr(model_path, "MTP") || strstr(model_path, "mtp")) ? 1 : 0;
+        const char *spec_type = NULL;
+        if (spec_env && *spec_env)      spec_type = spec_env;
+        else if (picker_spec == 1)      spec_type = "draft-mtp";
+        else if (picker_spec < 0 && model_is_mtp) spec_type = "draft-mtp";
+        int fa_on = (picker_fa >= 0) ? picker_fa : (spec_type != NULL);
+        int cpu_moe_on = (picker_cpumoe >= 0) ? picker_cpumoe : 0;
+
+        /* "How to run llama-server for this model" IS the config now, so BASI keeps
+           it as a standalone, editable script (.basi/run-llama-server.sh) and execs
+           it. Reuse the user's script when it targets THIS model (respecting edits);
+           regenerate when it's missing or for a different model (e.g. after /model). */
+        const char *script = ".basi/run-llama-server.sh";
+        /* best-of-N needs one slot per sampled candidate (the server caps `n` at
+           the slot count), so the launch script must be generated with -np N. */
+        int srv_slots = 0;
+        { const char *e = getenv("BASI_BEST_OF_N"); if (e && *e) srv_slots = atoi(e); }
+        SrvLaunch L = {
+            .server_bin = sbin, .model_path = model_path, .ngl = n_gpu_layers,
+            .ctx = srv_ctx, .host = "127.0.0.1", .port = 8181,
+            .spec_type = spec_type, .spec_nmax = spec_nmax,
+            .flash_attn = fa_on, .cpu_moe = cpu_moe_on, .jinja = 1, .reasoning_format = "auto",
+            .n_parallel = srv_slots,
+        };
+        if (srvgen_script_matches(script, model_path)) {
+            fprintf(stderr, "\033[90m[server mode] using launch script %s (edit it to change flags)\033[0m\n", script);
+            /* A hand-edited or pre-best-of-N script may not request the slots.
+               llama-server's default (-np auto) often allocates enough anyway, so
+               this is a heads-up, not a verdict: if auto lands below N the server
+               rejects every turn with an opaque 400 on `n`. */
+            if (srv_slots > 1 && !srvgen_script_has_slots(script, srv_slots))
+                fprintf(stderr, "\033[33m[best-of-%d] %s does not request `-np %d --kv-unified`; "
+                        "relying on the server's auto slot count. If turns fail with a 400 on `n`, "
+                        "add the flags or delete the script to regenerate.\033[0m\n",
+                        srv_slots, script, srv_slots);
+        } else {
+            if (srvgen_write_launch_script(&L, script) == 0)
+                fprintf(stderr, "\033[90m[server mode] wrote launch script %s\033[0m\n", script);
+        }
+        fprintf(stderr, "\033[90m[server mode] spawning llama-server (holds the weights)…\033[0m\n");
+        g_srv_pid = srvgen_spawn_script(script, 8181, "/tmp/basi_srvgen.log", 300);
+        if (g_srv_pid < 0) {
+            fprintf(stderr, "Error: llama-server failed to start (see /tmp/basi_srvgen.log and %s)\n", script);
+            return 1;
+        }
+        atexit(kill_srv);
+        basi_srv_port      = 8181;
+        basi_srv_ctx_total = srv_ctx;   /* the server's context size, for the ctx meter */
+        fprintf(stderr, "\033[90m[server mode] ready — generation delegated to llama-server\033[0m\n");
+        }
     }
 
-    /* Context allocation (KV cache + compute buffers) is where VRAM actually
-     * runs out — the picker's estimate is only a guess. The model weights are
-     * already resident, so on failure we halve n_ctx and retry WITHOUT
-     * reloading. This is the hard backstop that guarantees we never crash on a
-     * mis-estimate: it degrades context length until the KV cache fits. */
-    struct llama_context *ctx = NULL;
-    {
-        const uint32_t requested_ctx = ctx_params.n_ctx;
-        const uint32_t min_ctx = 2048;
-        while (1) {
-            ctx = llama_init_from_model(model, ctx_params);
-            if (ctx) break;
-            if (ctx_params.n_ctx <= min_ctx) break;
-            uint32_t reduced = ctx_params.n_ctx / 2;
-            if (reduced < min_ctx) reduced = min_ctx;
-            fprintf(stderr,
-                "\033[33m[VRAM: context of %u didn't fit — retrying at %u]\033[0m\n",
-                ctx_params.n_ctx, reduced);
-            ctx_params.n_ctx   = reduced;
-            ctx_params.n_batch = reduced;
-        }
-        if (ctx && ctx_params.n_ctx < requested_ctx) {
-            fprintf(stderr,
-                "\033[33m[VRAM: loaded with context %u instead of %u to fit available memory]\033[0m\n",
-                ctx_params.n_ctx, requested_ctx);
-        }
-    }
-    if (!ctx) {
-        fprintf(stderr, "Error: Failed to create context (out of VRAM even at minimum size)\n");
-        llama_model_free(model);
-        return 1;
-    }
-
-    /* Create sampler chain */
-    struct llama_sampler *smpl = llama_sampler_chain_init(llama_sampler_chain_default_params());
-    /* Repetition penalty — damps the degenerate repeat-loop collapse seen in long
-       agentic sessions (a small model emits a malformed token, then spirals into
-       "XXXX…" until it overruns the context). Added FIRST so it shapes the logits
-       before min_p/temp. Mild by default (1.1 over the last 256 tokens, no
-       freq/presence component); tune with BASI_REPEAT_PENALTY (1.0 disables). */
+    /* Sampling knobs for the server /v1/chat/completions request (generation runs
+       on llama-server, not in-process — there is no local sampler chain anymore).
+       Repetition penalty damps the degenerate repeat-loop collapse; tune with
+       BASI_REPEAT_PENALTY. */
     float repeat_pen = 1.1f;
     {
         const char *rp = getenv("BASI_REPEAT_PENALTY");
         if (rp) { float v = (float)atof(rp); if (v >= 1.0f && v <= 2.0f) repeat_pen = v; }
     }
-    llama_sampler_chain_add(smpl, llama_sampler_init_penalties(256, repeat_pen, 0.0f, 0.0f));
-    /* The rest of the chain (min_p → temp → dist) is appended by SAMPLER_TAIL
-       below, AFTER the tool-call grammar (when native tools are active) so the
-       grammar masks invalid tokens before min_p/temp narrow the set. */
-    #define SAMPLER_TAIL() do { \
-        if (top_k > 0)    llama_sampler_chain_add(smpl, llama_sampler_init_top_k(top_k)); \
-        if (top_p < 1.0f) llama_sampler_chain_add(smpl, llama_sampler_init_top_p(top_p, 1)); \
-        llama_sampler_chain_add(smpl, llama_sampler_init_min_p(0.05f, 1)); \
-        llama_sampler_chain_add(smpl, llama_sampler_init_temp(temp_override >= 0 ? temp_override : 0.4f)); \
-        llama_sampler_chain_add(smpl, llama_sampler_init_dist(cli_seed)); \
-    } while (0)
+    basi_srv_sampling.temperature    = temp_override >= 0 ? temp_override : 0.4;
+    basi_srv_sampling.repeat_penalty = repeat_pen;
+    basi_srv_sampling.repeat_last_n  = 256;
+    basi_srv_sampling.min_p          = 0.05;
+    basi_srv_sampling.top_k          = top_k;
+    basi_srv_sampling.top_p          = top_p;
+    basi_srv_sampling.seed           = (cli_seed == BASI_DEFAULT_SEED) ? -1 : (long) cli_seed;
 
     if (!no_tools && !oneshot_prompt) {
-        print_startup_banner(model_path, (int)llama_n_ctx(ctx), n_gpu_layers);
+        print_startup_banner(model_path, basi_srv_ctx_total, n_gpu_layers);
         printf("\033[38;5;245mType your message, or /help. Empty line to quit.\033[0m\n\n");
         fflush(stdout);
     }
 
     /* Chat messages (dynamic array) */
-    struct llama_chat_message *messages = NULL;
+    BasiMsg *messages = NULL;
     size_t msg_count = 0;
     size_t msg_cap   = 0;
 
@@ -3504,34 +3938,29 @@ int main(int argc, char **argv) {
         if (sys && *sys) ADD_MESSAGE("system", sys);
         ADD_MESSAGE("user", oneshot_prompt);
 
-        char *buf = malloc(FORMATTED_BUF_SZ);
-        int len = apply_template(model, messages, msg_count, true,
-                                 buf, FORMATTED_BUF_SZ);
-        if (len < 0) {
-            fprintf(stderr, "Error: Failed to apply chat template\n");
-            free(buf);
-            goto cleanup;
-        }
-
-        SAMPLER_TAIL();       /* --no-tools: no grammar, just finish the chain */
+        /* No tools are registered here, so the chat request advertises none — a
+           plain completion the server templates from these two messages. */
         generate_quiet = 1;  /* suppress streaming/decoration; we print result.text */
-        GenerateResult r = generate(ctx, vocab, smpl, buf, (size_t)len);
+        GenerateResult r = generate_chat(messages, msg_count, NULL, NULL);
         printf("%s\n", r.text ? r.text : "");
         fflush(stdout);
         free(r.text);
-        free(buf);
         goto cleanup;
     }
 
     /* Native tool-calling (phase 2a): register the tool set, then ask whether
-       THIS model's template supports tool calls. If so, the model emits its
-       own trained <tool_call> JSON and we parse it; otherwise we fall back to
-       the legacy <tool>-prose path. The system prompt is slimmed to match. */
+       the server templates them and returns STRUCTURED tool_calls. Server-only, so
+       tools are always "native" (the /v1/chat/completions path owns the format). */
     int tool_n = 0;
     const BasiToolDef *tool_defs = basi_tool_defs(&tool_n);
+    if (cli.tool_subset && *cli.tool_subset) {         /* --tools: hard-scope this phase */
+        tool_defs = filter_tool_defs(cli.tool_subset, &tool_n);
+        printf("\033[36m[Tools scoped to: %s (%d tool%s)]\033[0m\n",
+               cli.tool_subset, tool_n, tool_n == 1 ? "" : "s");
+    }
     basi_set_tools(tool_defs, tool_n);
-    int native_tools = basi_tools_active(model);
-    generate_native_tools = native_tools;   /* hide raw tool-call markup from the live stream */
+    int native_tools = 1;
+    generate_native_tools = native_tools;
     /* Render the answer stream as markdown, but only for the interactive REPL on
        a real terminal — -p/one-shot and piped output stay raw and parseable.
        Disable with BASI_MARKDOWN=0. */
@@ -3548,23 +3977,13 @@ int main(int argc, char **argv) {
     fflush(stdout);
     if (!native_tools) basi_set_tools(NULL, 0);   /* don't advertise tools the model can't format */
 
-    /* Phase 2b: constrain decoding to valid tool-call JSON when the model speaks
-       native function-calling. Stops a small model drifting off-format after a
-       few rounds (emitting malformed <tool_call> the PEG parser rejects, which
-       ends the agentic loop). The grammar is LAZY — free text and thinking are
-       unaffected; it only forces valid JSON once a tool call begins. Inserted
-       into the chain BEFORE the min_p/temp/dist tail so it masks first. */
+    /* Tool-call grammar is now derived + applied server-side (llama-server owns it
+       for /v1/chat/completions when we send `tools`), so there is no in-process
+       grammar sampler to build here. */
     if (native_tools) {
-        g_tool_grammar = basi_tool_grammar_sampler(model);
-        if (g_tool_grammar) {
-            llama_sampler_chain_add(smpl, g_tool_grammar);
-            printf("\033[90m[Tool grammar: constrained decoding active]\033[0m\n");
-        } else {
-            printf("\033[90m[Tool grammar: none for this format — unconstrained]\033[0m\n");
-        }
+        printf("\033[90m[Tool grammar: constrained decoding active (server-side)]\033[0m\n");
         fflush(stdout);
     }
-    SAMPLER_TAIL();
 
     /* The date is injected per-turn (see the REPL loop) so it stays fresh on
        long-lived / resumed sessions, not stamped once here. */
@@ -3575,7 +3994,7 @@ int main(int argc, char **argv) {
     /* Non-interactive deep research: run it, print the answer, and exit —
        skipping the session picker and the REPL entirely. */
     if (oneshot_deepsearch_q) {
-        char *ans = execute_deep_search(model, vocab, oneshot_deepsearch_q);
+        char *ans = execute_deep_search(oneshot_deepsearch_q);
         printf("\n%s\n", ans ? ans : "(no answer)");
         fflush(stdout);
         free(ans);
@@ -3590,7 +4009,7 @@ int main(int argc, char **argv) {
     if (!oneshot) {
         if (resume_path) {
             session_load_into(resume_path, &messages, &msg_count, &msg_cap,
-                              (int)ctx_params.n_ctx);
+                              basi_srv_ctx_total);
             session_fp = fopen(resume_path, "a");
             session_path = strdup(resume_path);
             printf("\033[90m[Resumed session: %s]\033[0m\n\n", resume_path);
@@ -3601,7 +4020,7 @@ int main(int argc, char **argv) {
                 char *load_path = session_picker(sess_dir);
                 if (load_path) {
                     session_load_into(load_path, &messages, &msg_count, &msg_cap,
-                                      (int)ctx_params.n_ctx);
+                                      basi_srv_ctx_total);
                     session_fp = fopen(load_path, "a");
                     session_path = strdup(load_path);
                     printf("\033[90m[Session: %s]\033[0m\n\n", load_path);
@@ -3629,7 +4048,7 @@ int main(int argc, char **argv) {
     if (!oneshot_prompt) {
         char model_tag[32];
         derive_model_tag(model_path, model_tag, sizeof model_tag);
-        statusbar_enable(ctx, model_tag);
+        statusbar_enable(model_tag);
     }
 
     /* REPL loop (or a single injected turn in -p one-shot mode) */
@@ -3660,17 +4079,17 @@ int main(int argc, char **argv) {
                 const char *marg = user_input + 6;
                 while (*marg == ' ') marg++;
                 try_model_switch(marg, argv, argc, model_path, n_gpu_layers,
-                                 session_path, ctx);
+                                 session_path);
                 free(user_input);
                 continue;
             }
-            handle_slash_command(user_input, model, vocab, ctx,
+            handle_slash_command(user_input,
                                  &messages, &msg_count, &msg_cap, session_fp,
                                  &prev_len, session_prompt_tokens, session_gen_tokens);
             continue;
         }
 
-        run_agentic_turn(user_input, model, vocab, ctx, smpl, native_tools,
+        run_agentic_turn(user_input, native_tools,
                          formatted_buf, &messages, &msg_count, &msg_cap,
                          session_fp, &prev_len,
                          &session_prompt_tokens, &session_gen_tokens);
@@ -3688,10 +4107,6 @@ cleanup:
         free((void *)messages[i].content);
     free(messages);
     history_free_all();
-
-    llama_sampler_free(smpl);
-    llama_free(ctx);
-    llama_model_free(model);
 
     /* --no-tools keeps stdout to the completion alone; no sign-off banner. */
     if (!no_tools) printf("\nGoodbye!\n");

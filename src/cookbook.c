@@ -8,7 +8,7 @@
  *     /cookbook                list cached models + starter picks
  *     /cookbook search [q]     trending HF GGUF models that fit this box's VRAM
  *     /cookbook get <repo>     download a GGUF (curl + HF resolve URL)
- *     /cookbook rm <name>      delete a cached model
+ *     /cookbook rm [name]      remove cached models (a menu, or one by name)
  *
  * Downloads are self-contained: curl straight from huggingface.co/<repo>/
  * resolve/main/<file> into ~/models (a dir BASI already scans), so no Python /
@@ -24,6 +24,7 @@
 #include <string.h>
 #include <strings.h>
 #include <sys/stat.h>
+#include <termios.h>
 #include <unistd.h>
 
 #include "util.h"     /* run_command, jx_get_string, jx_get_int, mkdir_p, url_encode */
@@ -214,7 +215,8 @@ static void cmd_list(void) {
                PRESETS[i].repo, PRESETS[i].note);
 
     printf("\n\033[90m  /cookbook search [query]   find trending models that fit your VRAM\n"
-           "  /cookbook get <org/name>   download  ·  /cookbook rm <name>  delete\033[0m\n\n");
+           "  /cookbook get <org/name>   download a GGUF\n"
+           "  /cookbook rm               remove models (interactive menu)\033[0m\n\n");
     fflush(stdout);
 }
 
@@ -243,36 +245,41 @@ static void cmd_search(const char *query) {
     }
 
     if (vram_gb > 0)
-        printf("\n\033[1mTrending GGUF models\033[0m \033[90m(● fits your %s, ~%.0f GB VRAM)\033[0m\n",
+        printf("\n\033[1mTrending GGUF models\033[0m \033[90m(\033[32m●\033[90m fits your %s ~%.0f GB · ○ = larger)\033[0m\n",
                hw.gpu_name, vram_gb);
     else
         printf("\n\033[1mTrending GGUF models\033[0m \033[90m(no GPU detected — showing size estimates)\033[0m\n");
 
+    /* Two passes so models that fit this box's VRAM surface first, then the
+     * bigger trending ones (marked ○). Nothing is hidden — a specific large
+     * model you searched for by name is still listed, just flagged as too big. */
     int shown = 0;
-    for (int i = 0; i < 100 && shown < 15; i++) {
-        char path[32];
-        snprintf(path, sizeof path, "%d.id", i);
-        char *id = jx_get_string(json, path);
-        if (!id) break;                        /* past end of array */
-        if (!id[0]) { free(id); break; }
+    for (int pass = 0; pass < 2 && shown < 15; pass++) {
+        for (int i = 0; i < 100 && shown < 15; i++) {
+            char path[32];
+            snprintf(path, sizeof path, "%d.id", i);
+            char *id = jx_get_string(json, path);
+            if (!id) break;                        /* past end of array */
+            if (!id[0]) { free(id); break; }
 
-        snprintf(path, sizeof path, "%d.downloads", i);
-        long dl = jx_get_int(json, path);
+            double pb  = parse_params_b(id);
+            double est = est_gb_q4(pb);
+            bool fits  = (vram_gb <= 0) || (est <= 0) || (est <= vram_gb * 0.92);
+            if ((pass == 0) != fits) { free(id); continue; }   /* pass 0: fits, pass 1: rest */
 
-        double pb  = parse_params_b(id);
-        double est = est_gb_q4(pb);
-        bool fits  = (vram_gb <= 0) || (est <= 0) || (est <= vram_gb * 0.92);
-        if (vram_gb > 0 && !fits) { free(id); continue; }   /* hide non-fitting */
+            snprintf(path, sizeof path, "%d.downloads", i);
+            long dl = jx_get_int(json, path);
 
-        char estbuf[16];
-        if (est > 0) snprintf(estbuf, sizeof estbuf, "~%.1fGB", est);
-        else         snprintf(estbuf, sizeof estbuf, "?");
+            char estbuf[16];
+            if (est > 0) snprintf(estbuf, sizeof estbuf, "~%.1fGB", est);
+            else         snprintf(estbuf, sizeof estbuf, "?");
 
-        const char *mark = fits ? "\033[32m●\033[0m" : "\033[90m○\033[0m";
-        printf("  %s \033[36m%-46s\033[0m \033[90m%7s  %ld dl\033[0m\n",
-               mark, id, estbuf, dl < 0 ? 0 : dl);
-        shown++;
-        free(id);
+            const char *mark = fits ? "\033[32m●\033[0m" : "\033[90m○\033[0m";
+            printf("  %s \033[36m%-46s\033[0m \033[90m%7s  %ld dl\033[0m\n",
+                   mark, id, estbuf, dl < 0 ? 0 : dl);
+            shown++;
+            free(id);
+        }
     }
     free(json);
 
@@ -377,8 +384,14 @@ static void cmd_get(const char *rest) {
     char repo[256] = "", quant[64] = "";
     /* first token = repo, optional second = quant hint */
     if (sscanf(rest, "%255s %63s", repo, quant) < 1 || !repo[0]) {
-        printf("\033[31m[/cookbook get: usage: /cookbook get <org/name> [quant]]\033[0m\n");
+        printf("\033[31m[/cookbook get: usage: /cookbook get <org/name>[:quant] [quant]]\033[0m\n");
         return;
+    }
+    /* Also accept the llama.cpp `-hf` convention `org/name:quant` — the colon is
+     * an alias for the space-separated quant hint (repo ids never contain ':'). */
+    if (!quant[0]) {
+        char *colon = strchr(repo, ':');
+        if (colon) { snprintf(quant, sizeof quant, "%s", colon + 1); *colon = 0; }
     }
     if (!valid_repo(repo)) {
         printf("\033[31m[/cookbook get: '%s' is not a valid 'org/name' repo id]\033[0m\n", repo);
@@ -480,12 +493,39 @@ static void cmd_get(const char *rest) {
 
 /* ── rm ─────────────────────────────────────────────────────────────── */
 
-static void cmd_rm(const char *arg) {
-    while (*arg == ' ') arg++;
-    if (!*arg) {
-        printf("\033[31m[/cookbook rm: usage: /cookbook rm <name-substring>]\033[0m\n");
-        return;
+/* Resolve what a cached-model path actually deletes. A file inside an HF hub
+ * cache (…/models--org--name/…) shares blobs with the rest of that repo, so the
+ * deletable unit is the whole models--… dir; a file we pulled into ~/models is
+ * just itself. Writes the target path and sets *is_dir. */
+static void resolve_delete_target(const char *path, char *target, size_t tn, bool *is_dir) {
+    const char *hub = strstr(path, "/models--");
+    if (hub) {
+        const char *slash = strchr(hub + 1, '/');   /* end of the models--… segment */
+        size_t tlen = slash ? (size_t)(slash - path) : strlen(path);
+        if (tlen < tn) {
+            memcpy(target, path, tlen); target[tlen] = 0;
+            *is_dir = true;
+            return;
+        }
     }
+    snprintf(target, tn, "%s", path);
+    *is_dir = false;
+}
+
+/* Delete a resolved target: rm -rf for a hub repo dir, unlink for a plain file.
+ * Returns 0 on success, else a non-zero errno / shell status. */
+static int do_delete(const char *target, bool is_dir) {
+    if (is_dir) {
+        char cmd[PATH_MAX + 32];
+        snprintf(cmd, sizeof cmd, "rm -rf '%s'", target);
+        int rc = system(cmd);
+        return (rc == -1) ? -1 : (rc >> 8);
+    }
+    return unlink(target);
+}
+
+/* /cookbook rm <name-substring> — resolve one model by name and confirm. */
+static void cmd_rm_named(const char *arg) {
     char **models = NULL;
     int n = basi_list_models(&models);
     int match = -1, matches = 0;
@@ -495,45 +535,20 @@ static void cmd_rm(const char *arg) {
     if (matches == 0) {
         printf("\033[31m[/cookbook rm: no cached model matches '%s']\033[0m\n", arg);
     } else if (matches > 1) {
-        printf("\033[33m[/cookbook rm: '%s' matches %d models — be more specific:]\033[0m\n",
-               arg, matches);
+        printf("\033[33m[/cookbook rm: '%s' matches %d models — be more specific, "
+               "or run /cookbook rm with no name for a menu:]\033[0m\n", arg, matches);
         for (int i = 0; i < n; i++)
             if (ci_find(base_name(models[i]), arg)) printf("    %s\n", base_name(models[i]));
     } else {
-        const char *path = models[match];
-        /* If this file lives inside an HF hub cache (…/models--org--name/…),
-         * removing just the .gguf leaves the blob behind — offer the whole
-         * repo dir instead. Otherwise it's a plain file we downloaded. */
-        char target[PATH_MAX];
-        bool is_dir = false;
-        const char *hub = strstr(path, "/models--");
-        if (hub) {
-            const char *slash = strchr(hub + 1, '/');   /* end of models--… segment */
-            size_t tlen = slash ? (size_t)(slash - path) : strlen(path);
-            if (tlen < sizeof target) {
-                memcpy(target, path, tlen); target[tlen] = 0;
-                is_dir = true;
-            } else {
-                snprintf(target, sizeof target, "%s", path);
-            }
-        } else {
-            snprintf(target, sizeof target, "%s", path);
-        }
-
-        printf("\033[33mDelete %s\033[0m\n  %s\n\033[33mThis frees the disk but is not reversible. Proceed? [y/N] \033[0m",
+        char target[PATH_MAX]; bool is_dir = false;
+        resolve_delete_target(models[match], target, sizeof target, &is_dir);
+        printf("\033[33mDelete %s\033[0m\n  %s\n\033[33mThis frees the disk but is not "
+               "reversible. Proceed? [y/N] \033[0m",
                is_dir ? "this cached repo" : "this model file", target);
         fflush(stdout);
         char resp[16] = {0};
         if (fgets(resp, sizeof resp, stdin) && (resp[0] == 'y' || resp[0] == 'Y')) {
-            int rc;
-            if (is_dir) {
-                char cmd[PATH_MAX + 32];
-                snprintf(cmd, sizeof cmd, "rm -rf '%s'", target);
-                rc = system(cmd);
-                rc = (rc == -1) ? -1 : (rc >> 8);
-            } else {
-                rc = unlink(target);
-            }
+            int rc = do_delete(target, is_dir);
             if (rc == 0) printf("\033[90m[deleted %s]\033[0m\n", target);
             else printf("\033[31m[/cookbook rm: delete failed (%s)]\033[0m\n", strerror(errno));
         } else {
@@ -545,6 +560,169 @@ static void cmd_rm(const char *arg) {
     fflush(stdout);
 }
 
+/* /cookbook rm (no arg) — a full-screen multi-select menu. Runs its own
+ * raw-mode session (the caller handed us a cooked terminal): ↑/↓ or k/j move,
+ * Space marks a row, a marks all, n clears, Enter deletes the marked rows (or
+ * the highlighted one if none are marked) after a y/N confirm, q/Ctrl-C cancels.
+ * OPOST stays on (only ICANON|ECHO are cleared) so plain "\n" still renders. */
+static void cmd_rm_menu(void) {
+    char **models = NULL;
+    int n = basi_list_models(&models);
+    if (n == 0) {
+        printf("\n\033[90m(no cached models to remove — pull one with "
+               "/cookbook get <org/name>)\033[0m\n\n");
+        free(models);
+        return;
+    }
+
+    struct termios orig;
+    if (tcgetattr(STDIN_FILENO, &orig) != 0) {   /* not a TTY — can't drive a menu */
+        printf("\033[33m[/cookbook rm: no interactive terminal — use "
+               "/cookbook rm <name> instead]\033[0m\n");
+        for (int i = 0; i < n; i++) free(models[i]);
+        free(models);
+        return;
+    }
+
+    long  *sizes   = calloc((size_t)n, sizeof *sizes);
+    bool  *is_dir  = calloc((size_t)n, sizeof *is_dir);
+    bool  *marked  = calloc((size_t)n, sizeof *marked);
+    char (*targets)[PATH_MAX] = malloc((size_t)n * sizeof *targets);
+    int   *uniq    = malloc((size_t)n * sizeof *uniq);      /* rows chosen to delete */
+    int   *uniq_rc = malloc((size_t)n * sizeof *uniq_rc);   /* their delete results  */
+    int    uniq_n  = 0;
+    for (int i = 0; i < n; i++) {
+        struct stat st;
+        sizes[i] = (stat(models[i], &st) == 0) ? (long)st.st_size : -1;
+        resolve_delete_target(models[i], targets[i], sizeof targets[i], &is_dir[i]);
+    }
+
+    struct termios t = orig;
+    t.c_lflag &= ~(ICANON | ECHO);
+    t.c_cc[VMIN] = 1; t.c_cc[VTIME] = 0;
+    tcsetattr(STDIN_FILENO, TCSAFLUSH, &t);
+
+    int  sel = 0;
+    bool committed = false;
+    while (1) {
+        printf("\033[2J\033[H");
+        printf("\033[1;36m  /cookbook rm\033[0m \033[90m— remove cached models\033[0m\n");
+        printf("\033[90m  ────────────────────────────────────────────────\033[0m\n\n");
+
+        long marked_bytes = 0; int marked_ct = 0;
+        for (int i = 0; i < n; i++) {
+            char sz[24]; human_size(sizes[i], sz, sizeof sz);
+            const char *box = marked[i] ? "\033[1;31m[✓]\033[0m" : "\033[90m[ ]\033[0m";
+            const char *tag = is_dir[i] ? " \033[90m(repo)\033[0m" : "";
+            const char *b = base_name(models[i]);
+            if (i == sel)
+                printf("  \033[1;33m▸\033[0m %s \033[1;36m%-44s\033[0m \033[90m%8s\033[0m%s\n",
+                       box, b, sz, tag);
+            else
+                printf("    %s \033[36m%-44s\033[0m \033[90m%8s\033[0m%s\n", box, b, sz, tag);
+            if (marked[i]) { marked_ct++; if (sizes[i] > 0) marked_bytes += sizes[i]; }
+        }
+
+        printf("\n");
+        if (marked_ct) {
+            char freed[24]; human_size(marked_bytes, freed, sizeof freed);
+            printf("  \033[1;31m%d marked · ~%s to free\033[0m\n", marked_ct, freed);
+        } else {
+            printf("  \033[90m(nothing marked — Enter deletes the highlighted row)\033[0m\n");
+        }
+        printf("\n\033[90m  ↑/↓ move   Space mark   a all   n none   Enter delete   q cancel\033[0m\n");
+        fflush(stdout);
+
+        unsigned char ch;
+        if (read(STDIN_FILENO, &ch, 1) != 1) break;
+
+        if (ch == 'q' || ch == 'Q' || ch == 3) break;                        /* cancel */
+        if (ch == 'k' || ch == 'K') { if (sel > 0) sel--; continue; }
+        if (ch == 'j' || ch == 'J') { if (sel < n - 1) sel++; continue; }
+        if (ch == ' ')  { marked[sel] = !marked[sel]; if (sel < n - 1) sel++; continue; }
+        if (ch == 'a' || ch == 'A') { for (int i = 0; i < n; i++) marked[i] = true;  continue; }
+        if (ch == 'n' || ch == 'N') { for (int i = 0; i < n; i++) marked[i] = false; continue; }
+
+        if (ch == 27) {                                       /* arrow escape sequence */
+            unsigned char seq[2];
+            if (read(STDIN_FILENO, seq, 2) == 2 && seq[0] == '[') {
+                if      (seq[1] == 'A' && sel > 0)     sel--;   /* up   */
+                else if (seq[1] == 'B' && sel < n - 1) sel++;   /* down */
+            }
+            continue;
+        }
+
+        if (ch == '\n' || ch == '\r') {
+            /* Selection = the marked rows, or the highlighted one if none are
+             * marked. Sum every selected row's size for the freed estimate (so
+             * it matches the menu), but dedupe targets for the delete list —
+             * shards of one hub repo collapse to a single dir. */
+            bool any = false;
+            for (int i = 0; i < n; i++) if (marked[i]) { any = true; break; }
+
+            uniq_n = 0;
+            long total = 0;
+            for (int i = 0; i < n; i++) {
+                if (any ? !marked[i] : i != sel) continue;
+                if (sizes[i] > 0) total += sizes[i];
+                bool dup = false;
+                for (int u = 0; u < uniq_n; u++)
+                    if (strcmp(targets[uniq[u]], targets[i]) == 0) { dup = true; break; }
+                if (!dup) uniq[uniq_n++] = i;
+            }
+
+            printf("\033[2J\033[H");
+            printf("\033[1;31m  Confirm deletion\033[0m\n");
+            printf("\033[90m  ────────────────────────────────────────────────\033[0m\n\n");
+            printf("  Permanently delete (frees disk, not reversible):\n\n");
+            for (int u = 0; u < uniq_n; u++) {
+                int i = uniq[u];
+                printf("    \033[31m✗\033[0m %s%s\n", base_name(models[i]),
+                       is_dir[i] ? "  \033[90m(cached repo dir)\033[0m" : "");
+            }
+            char freed[24]; human_size(total, freed, sizeof freed);
+            printf("\n  \033[1;33mDelete %d item%s (~%s)? [y/N] \033[0m",
+                   uniq_n, uniq_n == 1 ? "" : "s", freed);
+            fflush(stdout);
+            unsigned char c2;
+            if (read(STDIN_FILENO, &c2, 1) == 1 && (c2 == 'y' || c2 == 'Y')) {
+                for (int u = 0; u < uniq_n; u++)
+                    uniq_rc[u] = do_delete(targets[uniq[u]], is_dir[uniq[u]]);
+                committed = true;
+                break;
+            }
+            continue;   /* declined at the confirm — back to the menu */
+        }
+    }
+
+    tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig);
+    printf("\033[2J\033[H");
+
+    if (committed) {
+        int ok = 0, fail = 0;
+        for (int u = 0; u < uniq_n; u++) {
+            int i = uniq[u];
+            if (uniq_rc[u] == 0) { ok++;   printf("  \033[90m[deleted %s]\033[0m\n", targets[i]); }
+            else                 { fail++; printf("  \033[31m[failed:  %s]\033[0m\n", targets[i]); }
+        }
+        if (fail == 0) printf("\n\033[32m✓ removed %d model%s.\033[0m\n\n", ok, ok == 1 ? "" : "s");
+        else           printf("\n\033[31m[%d removed, %d failed]\033[0m\n\n", ok, fail);
+    } else {
+        printf("\033[90m[cancelled — nothing deleted]\033[0m\n\n");
+    }
+
+    for (int i = 0; i < n; i++) free(models[i]);
+    free(models); free(sizes); free(is_dir); free(marked);
+    free(targets); free(uniq); free(uniq_rc);
+    fflush(stdout);
+}
+
+static void cmd_rm(const char *arg) {
+    while (*arg == ' ') arg++;
+    if (!*arg) cmd_rm_menu();       /* no name → interactive multi-select menu */
+    else       cmd_rm_named(arg);
+}
+
 /* ── help ───────────────────────────────────────────────────────────── */
 
 static void cmd_help(void) {
@@ -552,8 +730,8 @@ static void cmd_help(void) {
         "\n\033[1m/cookbook\033[0m — download and manage local GGUF models\n"
         "  \033[36m/cookbook\033[0m                    list cached models + starter picks\n"
         "  \033[36m/cookbook search\033[0m [query]     trending GGUF models that fit your VRAM\n"
-        "  \033[36m/cookbook get\033[0m <org/name> [q] download a GGUF (q = quant hint, e.g. Q5_K_M)\n"
-        "  \033[36m/cookbook rm\033[0m <name>          delete a cached model\n"
+        "  \033[36m/cookbook get\033[0m <org/name>[:q] download a GGUF (q = quant hint, e.g. Q6_K_XL)\n"
+        "  \033[36m/cookbook rm\033[0m [name]          remove models — a pick-menu, or one by name\n"
         "\n\033[90m  After a get, switch to it with /model <name>. Files land in ~/models.\033[0m\n\n");
     fflush(stdout);
 }

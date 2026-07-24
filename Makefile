@@ -1,26 +1,23 @@
 CC = gcc
 CXX = g++
 CFLAGS = -Wall -Wextra -O2
-# -Wno-unused-function: llama.cpp's jinja headers define a couple of unused
-# static helpers; that's upstream, not our code.
+# -Wno-unused-function: nlohmann/json.hpp defines some unused static helpers.
 CXXFLAGS = -std=c++17 -Wall -Wextra -O2 -Wno-unused-function
 
-# Point these at your llama.cpp checkout + build dir. Defaults assume a clone at
-# $HOME/llama.cpp built with the Vulkan backend (build_vulkan) — Vulkan runs on
-# any NVIDIA/AMD/Intel GPU. Override for a different location or backend, e.g.:
-#   make LLAMA_DIR=/path/to/llama.cpp LLAMA_BUILD=/path/to/llama.cpp/build_cuda
-LLAMA_DIR ?= $(HOME)/llama.cpp
-LLAMA_BUILD ?= $(LLAMA_DIR)/build_vulkan
+# BASI is now fully self-contained: it links NO libllama and needs NO llama.cpp
+# checkout to build. Generation, templating, tool grammar/parsing and embeddings
+# all run in spawned llama-server processes over HTTP; the only third-party header,
+# nlohmann/json, is vendored under src/vendor. BASI just needs the `llama-server`
+# BINARY present at runtime (default path in srvgen.c; override BASI_SERVER_BIN).
+# Dropping the libllama link killed the old ABI gotcha (a llama.cpp rebuild used to
+# crash basi-cli with free(): invalid pointer).
+INCLUDES = -Isrc -Isrc/vendor
+CXXINCLUDES = $(INCLUDES)
 
-INCLUDES = -I$(LLAMA_DIR)/include -I$(LLAMA_DIR)/ggml/include -Isrc
-# The C++ shim (chat_tmpl.cpp) calls llama.cpp's chat-template engine, so it
-# also needs the common headers and the vendored nlohmann/json headers.
-CXXINCLUDES = $(INCLUDES) -I$(LLAMA_DIR)/common -I$(LLAMA_DIR)/vendor
-
-LDFLAGS = -L$(LLAMA_BUILD)/bin -Wl,-rpath,$(LLAMA_BUILD)/bin
-# -lllama-common: the SHARED common lib (jinja chat-template engine), the same
-# one llama-cli links — consistent with libllama.so.
-LIBS = -lllama-common -lllama -lggml -lggml-base -lm -lvulkan
+LDFLAGS =
+# -lvulkan: hwinfo.c probes GPU VRAM directly via Vulkan (a stable system lib) for
+# the picker's fit estimate.
+LIBS = -lm -lvulkan
 
 TARGET = basi-cli
 SRCS = $(wildcard src/*.c)

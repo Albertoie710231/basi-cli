@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <string.h>
 #include <stdbool.h>
 #include <unistd.h>
@@ -11,8 +12,7 @@
 #include <time.h>
 #include <errno.h>
 
-#include "llama.h"
-#include "ggml-backend.h"
+#include "basi_types.h"
 
 #include "util.h"
 #include "globals.h"
@@ -20,12 +20,10 @@
 #include "hwinfo.h"
 #include "chat_tmpl.h"
 #include "md.h"
+#include "srvgen.h"
+#include "srvchat.h"
+#include "bestof.h"
 
-void model_init(void) {
-    extern void log_callback(enum ggml_log_level level, const char *text, void *user_data);
-    llama_log_set(log_callback, NULL);
-    ggml_backend_load_all();
-}
 
 /* ── Spinner frames ────────────────────────────────────────────────── */
 
@@ -72,572 +70,249 @@ static void clear_thinking_box(void) {
     fflush(stdout);
 }
 
-/* ── UTF-8 helpers ─────────────────────────────────────────────────── */
-
-static size_t utf8_seq_len(unsigned char b) {
-    if ((b & 0x80) == 0)    return 1;
-    if ((b & 0xE0) == 0xC0) return 2;
-    if ((b & 0xF0) == 0xE0) return 3;
-    if ((b & 0xF8) == 0xF0) return 4;
-    return 1;
-}
-
-/* ── Thinking state machine ────────────────────────────────────────── */
-
-typedef enum {
-    STATE_NORMAL,
-    STATE_MAYBE_OPEN,
-    STATE_THINKING,
-    STATE_MAYBE_CLOSE,
-    STATE_SUPPRESS,     /* inside a native tool call: kept in text, hidden from display */
-} ThinkingState;
 
 /* ── Generate response ─────────────────────────────────────────────── */
 
 
-GenerateResult generate(
-    struct llama_context *ctx,
-    const struct llama_vocab *vocab,
-    struct llama_sampler *smpl,
-    const char *prompt,
-    size_t prompt_len)
-{
-    GenerateResult res = { NULL, 0, 0, 0.0, 0.0 };
-    StringBuf response;
-    sb_init(&response);
+/* ── Server-backed generation (Pi-style) ─────────────────────────────────────
+ * When basi_srv_port>0, generate() delegates token generation to a spawned
+ * llama-server over its /completion SSE stream instead of decoding in-process.
+ * Set by main.c after srvgen_spawn(). basi_srv_model is a vocab_only handle used
+ * to derive the tool grammar. */
+int basi_srv_port = 0;
+/* Defaults mirror BASI's native sampler chain (main.c overwrites in server mode):
+   temp 0.4, repeat_penalty 1.1 over 256 tokens, min_p 0.05, top_k/top_p/seed off. */
+SrvSampling basi_srv_sampling = { .temperature = 0.4, .repeat_penalty = 1.1, .repeat_last_n = 256,
+                                  .min_p = 0.05, .top_k = 0, .top_p = 1.0, .seed = -1 };
+/* When set, generate_server() omits the tool-call grammar. deepsearch drives its
+   own ReAct loop with a private sampler chain that (in native mode) carries no
+   grammar; this flag reproduces that on the server path so the main tool grammar
+   can't leak into deepsearch's rounds or its final synthesis. */
+int basi_srv_suppress_grammar = 0;
+/* When set, build_request() adds chat_template_kwargs.enable_thinking=false to
+   every chat-completions request — the per-request equivalent of BASI_NO_THINK,
+   scoped by a caller that sets it around a sub-loop. study_ground sets it around
+   its ReAct grounding turns: a Gemma-4 / Qwen3.x model then investigates the
+   codebase WITHOUT a multi-thousand-token <think> per tool call, while the
+   hypothesis step (which does NOT set it) keeps full reasoning. Not process-wide:
+   it is a scoped toggle, restored by the caller — never a global setenv. */
+int basi_srv_no_think = 0;
 
-    /* Live markdown rendering of the answer stream (interactive TTY only). When
-       on, visible answer text is routed through md_feed() instead of raw
-       printf; md_end() closes it at the end / before tool markup. */
-    const bool md = generate_markdown && !generate_quiet;
-    if (md) md_begin();
 
-    /* Check if first generation */
-    llama_memory_t memory = llama_get_memory(ctx);
-    bool is_first = (llama_memory_seq_pos_max(memory, 0) == -1);
+/* ── Chat-completions path (item 6b): server templates from messages, owns the
+ * tool grammar, and returns STRUCTURED tool_calls + separated reasoning. The
+ * display is simpler than the /completion state machine — reasoning arrives on a
+ * distinct stream, so no <think> tag parsing: reasoning → thinking box (or dim
+ * text under Ctrl+T), content → the markdown answer. ─────────────────────────── */
+typedef struct {
+    int    md;
+    bool   thinking_box_shown;
+    bool   md_started;
+    size_t spinner_frame;
+    double last_spinner;
+} ChatDisplay;
 
-    /* Defensive backstop: an underflowed delta (prev_len > render) yields a huge
-       prompt_len whose (int) cast crashes llama_tokenize with std::length_error.
-       Callers guard the delta, but never let a bogus length abort the process. */
-    if (prompt_len == 0 || prompt_len > (size_t)(64 * 1024 * 1024)) {
-        res.text = strdup("[Invalid prompt length]");
+static void chat_on_reasoning(const char *chunk, void *ud) {
+    ChatDisplay *d = (ChatDisplay *) ud;
+    if (generate_quiet) return;
+    if (show_thinking) {
+        printf("\033[90m%s\033[0m", chunk); fflush(stdout);
+        d->thinking_box_shown = true;   /* so a newline is emitted when it closes */
+    } else {
+        double now = time_now();
+        if (!d->thinking_box_shown || now - d->last_spinner > 0.08) {
+            d->spinner_frame++; draw_thinking_box(d->spinner_frame); d->last_spinner = now;
+            d->thinking_box_shown = true;
+        }
+    }
+}
+
+static void chat_on_content(const char *chunk, void *ud) {
+    ChatDisplay *d = (ChatDisplay *) ud;
+    if (generate_quiet) return;
+    if (d->thinking_box_shown) {   /* reasoning finished — tear the box down first */
+        if (show_thinking) printf("\033[0m\n"); else clear_thinking_box();
+        d->thinking_box_shown = false;
+    }
+    if (d->md) {
+        if (!d->md_started) { md_begin(); d->md_started = true; }   /* open the answer stream once */
+        md_feed(chunk, strlen(chunk));
+    } else { printf("\033[0m"); fputs(chunk, stdout); fflush(stdout); }
+}
+
+/* Server-chat generation. Serializes `messages` (+ registered tools) to OpenAI
+ * JSON, streams /v1/chat/completions, and returns the answer text plus STRUCTURED
+ * tool calls in tc_out/n_tc_out (caller frees via basi_free_tool_calls).
+ * res.prompt_tokens carries the server's exact prompt count for ctx accounting. */
+GenerateResult generate_chat(const BasiMsg *messages, size_t msg_count,
+                             BasiToolCall **tc_out, int *n_tc_out) {
+    GenerateResult res = { NULL, 0, 0, 0, 0.0, 0.0, 0.0 };
+    if (tc_out) *tc_out = NULL;
+    if (n_tc_out) *n_tc_out = 0;
+
+    char *mj = basi_messages_to_json(messages, (int) msg_count);
+    if (!mj) { res.text = strdup("[chat serialization failed]"); return res; }
+    /* deepsearch clears g_tools for its own ReAct loop → basi_tools_to_json()
+       returns NULL there, which is exactly what we want (no tools advertised). */
+    char *tj = basi_tools_to_json();
+
+    long cap = 0; { const char *e = getenv("BASI_MAX_TOKENS"); if (e && *e) cap = atol(e); }
+    int n_predict = cap > 0 ? (int) cap : -1;
+
+    ChatDisplay disp = { (generate_markdown && !generate_quiet) ? 1 : 0, false, false, 0, 0.0 };
+    double t0 = time_now();
+
+    /* BASI_BEST_OF_N>1: sample N turns from ONE prefill and keep the consensus
+       pick. Costs ~1.95x a single turn for N=4 (not Nx) because the server
+       prefills once — but it REQUIRES the launch script to carry `-np N
+       --kv-unified`, or the server caps n at the slot count and 400s the request.
+       Streaming is suppressed here: N interleaved token streams are unreadable,
+       so the turn renders after the winner is chosen. */
+    int best_of = 0;
+    { const char *e = getenv("BASI_BEST_OF_N"); if (e && *e) best_of = atoi(e); }
+
+    /* Whether the answer was already shown live by the streaming callbacks. The
+       best-of-N path streams nothing (N interleaved streams are unreadable), so
+       its winner has to be rendered explicitly once chosen. */
+    bool streamed = true;
+
+    SrvChatResult *r = NULL;
+    if (best_of > 1) {
+        SrvChatResult **cands = calloc((size_t) best_of, sizeof *cands);
+        int got = cands ? srvchat_complete_n(basi_srv_port, mj, tj, &basi_srv_sampling,
+                                             n_predict, best_of, NULL, NULL, NULL,
+                                             cands, best_of)
+                        : -1;
+        if (got > 0) {
+            BestOfPick pick = bestof_select(cands, got);
+            /* winner<0 means NOTHING was usable — every candidate empty, which is
+               exactly what a server-rejected request looks like (an error response
+               carries no deltas, so each result parses to empty rather than NULL).
+               Taking cands[0] here would hand back a blank turn and suppress the
+               fallback; bestof.h's contract is to fall through to a single sample. */
+            if (pick.winner < 0) {
+                if (!generate_quiet)
+                    fprintf(stderr, "\033[33m[best-of-%d] no usable candidate "
+                            "(server rejected the request?) — retrying single-sample\033[0m\n", best_of);
+                for (int i = 0; i < got; i++) srvchat_free(cands[i]);
+                bestof_free(&pick);
+                free(cands);
+                cands = NULL;
+                goto single_sample;
+            }
+            int w = pick.winner;
+            if (!generate_quiet)
+                fprintf(stderr, "\033[90m[best-of-%d] %s\033[0m\n", got,
+                        pick.reason ? pick.reason : "no consensus, kept first");
+            /* BASI_BEST_OF_DEBUG=1 shows the REJECTED candidates too. A ranker you
+               can't see the losers of is a ranker you can't evaluate — especially
+               in medoid mode, where "most central" is only a proxy for "best". */
+            if (getenv("BASI_BEST_OF_DEBUG")) {
+                for (int i = 0; i < got; i++) {
+                    if (!cands[i]) continue;
+                    const char *c = cands[i]->content ? cands[i]->content : "";
+                    if (cands[i]->n_tool_calls > 0)
+                        fprintf(stderr, "\033[90m  %s [%d] %s(%.90s)\033[0m\n",
+                                i == w ? "->" : "  ", i,
+                                cands[i]->tool_calls[0].name ? cands[i]->tool_calls[0].name : "?",
+                                cands[i]->tool_calls[0].arguments ? cands[i]->tool_calls[0].arguments : "");
+                    else
+                        fprintf(stderr, "\033[90m  %s [%d] %zub: %.140s…\033[0m\n",
+                                i == w ? "->" : "  ", i, strlen(c), c);
+                }
+            }
+            r = cands[w];
+            streamed = false;
+            for (int i = 0; i < got; i++) if (i != w) srvchat_free(cands[i]);
+            bestof_free(&pick);
+        }
+        free(cands);
+        /* Fall through to the single-sample path if the N-way request failed. */
+    }
+single_sample:
+    if (!r)
+        r = srvchat_complete(basi_srv_port, mj, tj, &basi_srv_sampling, n_predict,
+                             chat_on_content, chat_on_reasoning, &disp);
+    free(mj); free(tj);
+
+    if (!r) {
+        if (disp.thinking_box_shown && !generate_quiet) { if (show_thinking) printf("\033[0m\n"); else clear_thinking_box(); }
+        if (disp.md && disp.md_started) md_end();
+        res.text = strdup("[server chat failed]");
         return res;
     }
 
-    /* Tokenize */
-    int n_prompt_tokens = -llama_tokenize(vocab, prompt, (int)prompt_len,
-                                           NULL, 0, is_first, true);
-    if (n_prompt_tokens <= 0) {
-        res.text = strdup("[Tokenization failed]");
-        return res;
+    if (getenv("BASI_DEBUG_CHAT"))
+        fprintf(stderr, "\n[chat] finish=%s content=%zub reasoning=%zub tool_calls=%d\n  reasoning=[%.400s]\n  content=[%.200s]\n",
+                r->finish_reason ? r->finish_reason : "?",
+                r->content ? strlen(r->content) : 0,
+                r->reasoning ? strlen(r->reasoning) : 0, r->n_tool_calls,
+                r->reasoning ? r->reasoning : "", r->content ? r->content : "");
+
+    /* Qwen3.x sometimes keeps a brief final answer INSIDE the reasoning stream
+       (thinks the answer, closes, stops) → content comes back empty. When there's
+       no answer content and no tool call, promote the reasoning to the answer so
+       the turn isn't blank; it was shown live as a hidden box, so reveal it now. */
+    bool answer_in_reasoning = (!r->content || !r->content[0]) && r->n_tool_calls == 0
+                               && r->reasoning && r->reasoning[0];
+    const char *answer = answer_in_reasoning ? r->reasoning : (r->content ? r->content : "");
+
+    if (disp.thinking_box_shown && !generate_quiet) {   /* tear the reasoning box down */
+        if (show_thinking) printf("\033[0m\n"); else clear_thinking_box();
+        disp.thinking_box_shown = false;
+    }
+    /* Render when the answer was never shown live: either the reasoning box hid
+       it, or best-of-N suppressed streaming entirely. */
+    if ((answer_in_reasoning || !streamed) && !generate_quiet) {
+        if (disp.md) { md_begin(); md_feed(answer, strlen(answer)); md_end(); }
+        else { printf("\033[0m"); fputs(answer, stdout); }
+    } else if (disp.md && disp.md_started) {
+        md_end();                                        /* close the answer stream */
+    }
+    if (!generate_quiet) { printf("\033[0m\n"); fflush(stdout); }
+
+    res.text          = strdup(answer);
+    res.prompt_tokens = (size_t) r->prompt_tokens;
+    res.gen_tokens    = (size_t) r->completion_tokens;
+    res.gen_time_s    = (r->tps > 0) ? r->completion_tokens / r->tps : (time_now() - t0);
+    /* Prefill time comes straight from the server's own clock. The old form,
+       prompt_tokens/prompt_tps, divided the whole prompt by a rate measured over
+       only the evaluated tokens; on a cache-hit turn (prompt_tokens=15442,
+       prompt_n=19) that reported ~400s of prefill for 0.49s of work. */
+    res.prompt_n      = (size_t) r->prompt_n;
+    res.prompt_time_s = r->prompt_ms / 1000.0;
+    res.prompt_tps    = r->prompt_tps;
+
+    /* BASI_TIMING_TRACE=1: one TSV row per model round, so the prefill/decode split
+       of a real agentic run can be summed from the server's clock instead of
+       estimated. Columns: prompt_tokens (occupancy) prompt_n (work) prefill_s
+       gen_tokens gen_s. */
+    if (getenv("BASI_TIMING_TRACE")) {
+        fprintf(stderr, "[timing]\t%zu\t%zu\t%.3f\t%zu\t%.3f\n",
+                res.prompt_tokens, res.prompt_n, res.prompt_time_s,
+                res.gen_tokens, res.gen_time_s);
+        fflush(stderr);
     }
 
-    llama_token *tokens = malloc(n_prompt_tokens * sizeof(llama_token));
-    llama_tokenize(vocab, prompt, (int)prompt_len,
-                   tokens, n_prompt_tokens, is_first, true);
-
-    res.prompt_tokens = n_prompt_tokens;
-
-    /* Create batch */
-    struct llama_batch batch = llama_batch_get_one(tokens, n_prompt_tokens);
-    bool is_prompt_phase = true;
-    double timer_start = time_now();
-
-    /* Thinking state */
-    ThinkingState state = STATE_NORMAL;
-    char tag_buf[64];
-    size_t tag_len = 0;
-
-    /* Reasoning delimiters: use the ones common_chat derives from THIS model's
-       template, so Gemma's "<|channel>thought"/"<channel|>", Qwen's
-       "<think>"/"</think>", etc. are all hidden automatically — falling back to
-       <think>/</think> when the model declares none. Copied locally so the
-       pointers stay valid for the whole generation, and length-bounded so they
-       can never overflow tag_buf. */
-    const char *think_open = "<think>", *think_close = "</think>";
-    char think_open_buf[48], think_close_buf[48];
-    {
-        const char *o = NULL, *c = NULL;
-        if (basi_thinking_tags(&o, &c) && o && c &&
-            strlen(o) > 0 && strlen(o) < sizeof(think_open_buf) &&
-            strlen(c) > 0 && strlen(c) < sizeof(think_close_buf)) {
-            strcpy(think_open_buf, o);
-            strcpy(think_close_buf, c);
-            think_open  = think_open_buf;
-            think_close = think_close_buf;
+    if (r->n_tool_calls > 0 && tc_out) {
+        BasiToolCall *arr = calloc((size_t) r->n_tool_calls, sizeof(BasiToolCall));
+        if (arr) {
+            for (int i = 0; i < r->n_tool_calls; i++) {
+                arr[i].name      = strdup(r->tool_calls[i].name      ? r->tool_calls[i].name      : "");
+                arr[i].arguments = strdup(r->tool_calls[i].arguments ? r->tool_calls[i].arguments : "{}");
+            }
+            *tc_out = arr;
+            if (n_tc_out) *n_tc_out = r->n_tool_calls;
         }
     }
-    const size_t think_open_len  = strlen(think_open);
-    const size_t think_close_len = strlen(think_close);
-
-    /* Openers the STATE_MAYBE_OPEN matcher recognizes: the reasoning tag (→ hide
-       as a thinking box) plus, in native tool mode, the tool-call markers (→
-       hide the raw JSON; the [Executing:] line is the clean indicator). The
-       tool-call markers are a display-only heuristic covering the families in
-       use — a miss just means the markup shows, never a parse/behaviour change. */
-    enum { OPEN_THINK = 1, OPEN_TOOLCALL = 2 };
-    struct { const char *s; size_t len; int act; } openers[3];
-    int n_openers = 0;
-    openers[n_openers].s = think_open; openers[n_openers].len = think_open_len; openers[n_openers].act = OPEN_THINK; n_openers++;
-    if (generate_native_tools) {
-        openers[n_openers].s = "<tool_call>";  openers[n_openers].len = 11; openers[n_openers].act = OPEN_TOOLCALL; n_openers++;
-        openers[n_openers].s = "<|tool_call>"; openers[n_openers].len = 12; openers[n_openers].act = OPEN_TOOLCALL; n_openers++;
-    }
-    size_t spinner_frame = 0;
-    double last_spinner = 0;
-    bool thinking_box_shown = false;
-
-    /* UTF-8 buffer */
-    unsigned char utf8_buf[4];
-    size_t utf8_len = 0;
-
-    /* Only poll stdin for Ctrl+T when it's an interactive terminal. On piped /
-       scripted stdin there is always input pending, so the poll-and-read below
-       would steal bytes from the next prompt — corrupting multi-turn scripted
-       sessions. You also can't press Ctrl+T through a pipe, so there's nothing
-       to detect there. */
-    const bool stdin_is_tty = isatty(STDIN_FILENO);
-
-    /* Forced-open thinking: some templates (Qwen3.x) inject the opening think tag
-       into the generation PROMPT, so the model emits only the thinking CONTENT
-       and then the closing tag — the open tag never appears in the output. Left
-       alone the state machine stays NORMAL and the reasoning LEAKS as visible
-       text (and isn't stripped from the stored turn). If the rendered prompt ends
-       with the think-open tag (modulo trailing whitespace), start INSIDE the
-       thinking block, exactly as if we'd just matched the open tag. */
-    bool forced_open_think = false;
-    if (think_open_len > 0) {
-        size_t pl = prompt_len;
-        while (pl > 0 && (prompt[pl-1] == '\n' || prompt[pl-1] == '\r' ||
-                          prompt[pl-1] == ' '  || prompt[pl-1] == '\t')) pl--;
-        if (pl >= think_open_len &&
-            memcmp(prompt + pl - think_open_len, think_open, think_open_len) == 0) {
-            state = STATE_THINKING;
-            if (generate_keep_think) sb_append_str(&response, think_open);
-            /* Reveal the box AFTER prefill (in the is_prompt_phase block below),
-               not here — drawing it before the loop would freeze the spinner on
-               frame 0 for the entire prompt decode (which blocks the loop). */
-            forced_open_think = true;
-        }
-    }
-
-    /* Optional hard cap on generated tokens (env BASI_MAX_TOKENS; 0/unset =
-       unlimited, preserving default behavior). Without it, a model that never
-       emits end-of-turn generates until the context fills — this bounds
-       non-interactive and benchmark runs. */
-    long gen_cap = 0;
-    { const char *e = getenv("BASI_MAX_TOKENS"); if (e && *e) gen_cap = atol(e); }
-    long n_generated = 0;
-
-    /* Generation loop */
-    while (1) {
-        /* Check context space */
-        uint32_t n_ctx = llama_n_ctx(ctx);
-        uint32_t n_ctx_used = (uint32_t)(llama_memory_seq_pos_max(memory, 0) + 1);
-        if (n_ctx_used + (uint32_t)batch.n_tokens > n_ctx) {
-            if (thinking_box_shown) { if (!generate_quiet) { if (show_thinking) { printf("\033[0m\n"); } else { clear_thinking_box(); } } thinking_box_shown = false; }
-            if (md) md_end();
-            if (!generate_quiet) printf("\n[Context limit reached]\n");
-            fflush(stdout);
-            break;
-        }
-
-        if (llama_decode(ctx, batch) != 0) {
-            if (thinking_box_shown) { if (!generate_quiet) { if (show_thinking) { printf("\033[0m\n"); } else { clear_thinking_box(); } } thinking_box_shown = false; }
-            if (md) md_end();
-            if (!generate_quiet) printf("\n[Decode error]\n");
-            fflush(stdout);
-            break;
-        }
-
-        if (is_prompt_phase) {
-            res.prompt_time_s = time_now() - timer_start;
-            timer_start = time_now();
-            is_prompt_phase = false;
-            /* Prefill is done — now reveal a forced-open thinking box (deferred
-               from before the loop) so its spinner animates from the first
-               generated token instead of sitting frozen through the prompt
-               decode. The first token is already suppressed because state was
-               set to STATE_THINKING up front. */
-            if (forced_open_think && !thinking_box_shown && !generate_quiet) {
-                if (show_thinking) { printf("\033[90m[thinking] "); fflush(stdout); }
-                else { draw_thinking_box(spinner_frame); last_spinner = time_now(); }
-                thinking_box_shown = true;
-            }
-        }
-
-        /* Tick the pinned status bar so its ctx meter climbs live as the KV
-           fills (throttled internally; no-op when the bar is inactive/quiet). */
-        if (!generate_quiet) statusbar_tick();
-
-        llama_token new_token = llama_sampler_sample(smpl, ctx, -1);
-
-        if (llama_vocab_is_eog(vocab, new_token)) {
-            res.gen_time_s = time_now() - timer_start;
-            if (thinking_box_shown) { if (!generate_quiet) { if (show_thinking) { printf("\033[0m\n"); } else { clear_thinking_box(); } } thinking_box_shown = false; }
-            break;
-        }
-
-        if (gen_cap > 0 && ++n_generated >= gen_cap) {
-            res.gen_time_s = time_now() - timer_start;
-            if (thinking_box_shown) { if (!generate_quiet) { if (show_thinking) { printf("\033[0m\n"); } else { clear_thinking_box(); } } thinking_box_shown = false; }
-            if (md) md_end();
-            if (!generate_quiet) { printf("\n[max tokens reached]\n"); fflush(stdout); }
-            break;
-        }
-
-        if (generation_interrupted) {
-            res.gen_time_s = time_now() - timer_start;
-            if (thinking_box_shown) { if (!generate_quiet) { if (show_thinking) { printf("\033[0m\n"); } else { clear_thinking_box(); } } thinking_box_shown = false; }
-            if (md) md_end();
-            if (!generate_quiet) printf("\n\033[90m[interrupted]\033[0m");
-            fflush(stdout);
-            break;
-        }
-
-        /* Check for Ctrl+T (toggle thinking display) via non-blocking read.
-           Skipped when quiet (deepsearch internal rounds) or when stdin is not a
-           TTY (piped/scripted — reading would eat the next prompt). */
-        if (!generate_quiet && stdin_is_tty) {
-            struct pollfd pfd = { .fd = STDIN_FILENO, .events = POLLIN };
-            if (poll(&pfd, 1, 0) > 0 && (pfd.revents & POLLIN)) {
-                unsigned char key;
-                if (read(STDIN_FILENO, &key, 1) == 1 && key == 0x14) { /* Ctrl+T */
-                    show_thinking = !show_thinking;
-                    if (state == STATE_THINKING || state == STATE_MAYBE_CLOSE) {
-                        if (show_thinking) {
-                            /* Switching from box to text */
-                            if (thinking_box_shown) { if (!generate_quiet) { if (show_thinking) { printf("\033[0m\n"); } else { clear_thinking_box(); } } thinking_box_shown = false; }
-                            printf("\033[90m[thinking] ");
-                            fflush(stdout);
-                        } else {
-                            /* Switching from text to box */
-                            printf("\033[0m\n");
-                            draw_thinking_box(spinner_frame);
-                            thinking_box_shown = true;
-                            last_spinner = time_now();
-                        }
-                    }
-                }
-            }
-        }
-
-        res.gen_tokens++;
-
-        /* Token to text */
-        char buf[256];
-        int n = llama_token_to_piece(vocab, new_token, buf, sizeof(buf), 0, true);
-        if (n < 0) continue;
-
-        /* Process through thinking state machine */
-        size_t piece_start = 0;
-        for (int idx = 0; idx < n; idx++) {
-            char ch = buf[idx];
-            switch (state) {
-            case STATE_NORMAL:
-                if (ch == '<') {
-                    /* Flush text before '<' */
-                    if ((size_t)idx > piece_start) {
-                        if (md) md_feed(buf + piece_start, idx - piece_start);
-                        else if (!generate_quiet) {
-                            printf("\033[0m");
-                            fwrite(buf + piece_start, 1, idx - piece_start, stdout);
-                            fflush(stdout);
-                        }
-                        sb_append(&response, buf + piece_start, idx - piece_start);
-                    }
-                    state = STATE_MAYBE_OPEN;
-                    tag_len = 0;
-                    tag_buf[tag_len++] = ch;
-                    piece_start = idx + 1;
-                }
-                break;
-
-            case STATE_MAYBE_OPEN: {
-                tag_buf[tag_len++] = ch;
-                /* Match the accumulating tag against every opener; an opener is
-                   "alive" while tag_buf is a prefix of it. */
-                int matched = 0;       /* action of a fully-matched opener */
-                bool alive = false;
-                for (int oi = 0; oi < n_openers; oi++) {
-                    if (tag_len <= openers[oi].len &&
-                        memcmp(tag_buf, openers[oi].s, tag_len) == 0) {
-                        alive = true;
-                        if (tag_len == openers[oi].len) { matched = openers[oi].act; break; }
-                    }
-                }
-                if (matched == OPEN_THINK) {
-                    state = STATE_THINKING;
-                    tag_len = 0;
-                    piece_start = idx + 1;
-                    if (generate_keep_think) sb_append_str(&response, think_open);
-                    if (show_thinking) {
-                        if (!generate_quiet) { printf("\033[90m[thinking] "); fflush(stdout); }
-                    } else {
-                        draw_thinking_box(spinner_frame);
-                        last_spinner = time_now();
-                    }
-                    thinking_box_shown = true;
-                } else if (matched == OPEN_TOOLCALL) {
-                    /* Keep the markup in the returned text (the parser needs it)
-                       but stop displaying it — the [Executing:] line is shown
-                       after the call is parsed. */
-                    sb_append(&response, tag_buf, tag_len);
-                    if (md) md_end();   /* close the answer before the hidden tool markup */
-                    state = STATE_SUPPRESS;
-                    tag_len = 0;
-                    piece_start = idx + 1;
-                } else if (!alive) {
-                    /* Matched no opener — flush the buffer as normal text. */
-                    if (md) md_feed(tag_buf, tag_len);
-                    else if (!generate_quiet) {
-                        printf("\033[0m");
-                        fwrite(tag_buf, 1, tag_len, stdout);
-                        fflush(stdout);
-                    }
-                    sb_append(&response, tag_buf, tag_len);
-                    state = STATE_NORMAL;
-                    tag_len = 0;
-                    piece_start = idx + 1;
-                }
-                /* else: still a viable prefix of some opener — keep buffering */
-                break;
-            }
-
-            case STATE_SUPPRESS:
-                /* Native tool-call markup: retained in `response` for parsing,
-                   never displayed. Remains until the generation ends. */
-                sb_append_char(&response, ch);
-                piece_start = idx + 1;
-                break;
-
-            case STATE_THINKING: {
-                if (ch == '<') {
-                    state = STATE_MAYBE_CLOSE;
-                    tag_len = 0;
-                    tag_buf[tag_len++] = ch;
-                } else {
-                    if (generate_keep_think) sb_append_char(&response, ch);
-                    if (show_thinking) {
-                        if (!generate_quiet) { printf("\033[90m%c", ch); fflush(stdout); }
-                    } else {
-                        /* Spinner animation */
-                        double now = time_now();
-                        if (now - last_spinner > 0.08) {
-                            spinner_frame++;
-                            draw_thinking_box(spinner_frame);
-                            last_spinner = now;
-                        }
-                    }
-                }
-                piece_start = idx + 1;
-                break;
-            }
-
-            case STATE_MAYBE_CLOSE: {
-                tag_buf[tag_len++] = ch;
-                const char *target = think_close;
-                if (tag_len <= think_close_len && tag_buf[tag_len - 1] == target[tag_len - 1]) {
-                    if (tag_len == think_close_len) {
-                        state = STATE_NORMAL;
-                        tag_len = 0;
-                        piece_start = idx + 1;
-                        if (generate_keep_think) sb_append_str(&response, think_close);
-                        if (show_thinking) {
-                            if (!generate_quiet) printf("\033[0m\n");
-                        } else {
-                            clear_thinking_box();
-                        }
-                        fflush(stdout);
-                        thinking_box_shown = false;
-                    }
-                } else {
-                    if (generate_keep_think) sb_append(&response, tag_buf, tag_len);
-                    if (show_thinking && !generate_quiet) {
-                        printf("\033[90m");
-                        fwrite(tag_buf, 1, tag_len, stdout);
-                        fflush(stdout);
-                    }
-                    state = STATE_THINKING;
-                    tag_len = 0;
-                    piece_start = idx + 1;
-                }
-                break;
-            }
-            }
-        }
-
-        /* Output remaining content in normal state with UTF-8 buffering */
-        if (state == STATE_NORMAL && piece_start < (size_t)n) {
-            const char *slice = buf + piece_start;
-            size_t slice_len = n - piece_start;
-
-            unsigned char combined[260];
-            size_t combined_len = 0;
-
-            /* Prepend buffered UTF-8 bytes */
-            memcpy(combined, utf8_buf, utf8_len);
-            combined_len = utf8_len;
-            utf8_len = 0;
-
-            memcpy(combined + combined_len, slice, slice_len);
-            combined_len += slice_len;
-
-            /* Find complete UTF-8 boundary */
-            size_t output_end = 0;
-            size_t pos = 0;
-            while (pos < combined_len) {
-                size_t slen = utf8_seq_len(combined[pos]);
-                if (pos + slen <= combined_len) {
-                    output_end = pos + slen;
-                    pos += slen;
-                } else {
-                    break;
-                }
-            }
-
-            if (output_end > 0) {
-                if (md) md_feed((const char *)combined, output_end);
-                else if (!generate_quiet) {
-                    printf("\033[0m");
-                    fwrite(combined, 1, output_end, stdout);
-                    fflush(stdout);
-                }
-                sb_append(&response, (const char *)combined, output_end);
-            }
-
-            /* Buffer incomplete trailing bytes */
-            if (output_end < combined_len) {
-                memcpy(utf8_buf, combined + output_end, combined_len - output_end);
-                utf8_len = combined_len - output_end;
-            }
-        }
-
-        /* Stop as soon as a complete <tool>...</tool> has been emitted, so the
-           model can't chain dozens of speculative tool calls in one response.
-           Gated to STATE_NORMAL so a "</tool>" inside a kept <think> block
-           (generate_keep_think) can't trip it. */
-        if (state == STATE_NORMAL && response.len >= 7 &&
-            memcmp(response.data + response.len - 7, "</tool>", 7) == 0) {
-            res.gen_time_s = time_now() - timer_start;
-            if (thinking_box_shown) {
-                if (!generate_quiet) { if (show_thinking) { printf("\033[0m\n"); } else { clear_thinking_box(); } }
-                thinking_box_shown = false;
-            }
-            break;
-        }
-
-        /* Next token */
-        llama_token single = new_token;
-        batch = llama_batch_get_one(&single, 1);
-    }
-
-    /* Flush remaining UTF-8 */
-    if (utf8_len > 0) {
-        if (md) md_feed((const char *)utf8_buf, utf8_len);
-        else if (!generate_quiet) {
-            printf("\033[0m");
-            fwrite(utf8_buf, 1, utf8_len, stdout);
-        }
-        sb_append(&response, (const char *)utf8_buf, utf8_len);
-    }
-
-    if (md) md_end();   /* render any trailing partial line + close open spans */
-    if (!generate_quiet) printf("\033[0m\n");
-    fflush(stdout);
-
-    free(tokens);
-    res.text = sb_to_str(&response);
+    srvchat_free(r);
     return res;
 }
 
-/* ── Log callback (suppress non-errors) ────────────────────────────── */
 
-void log_callback(enum ggml_log_level level, const char *text, void *user_data) {
-    (void)user_data;
-    if (level >= GGML_LOG_LEVEL_ERROR) {
-        fprintf(stderr, "%s", text);
-    }
-}
-
-/* ── Custom ChatML template ────────────────────────────────────────── */
-
-/*
- * Format messages as ChatML. Same format for all models:
- *   <|im_start|>role\ncontent<|im_end|>\n
- *
- * If add_generation_prompt is true, appends <|im_start|>assistant\n
- * If buf is NULL, returns the required length without writing.
- */
-static int apply_chatml(
-    const struct llama_chat_message *msgs, size_t n_msgs,
-    bool add_gen_prompt,
-    char *buf, size_t buf_size)
-{
-    size_t total = 0;
-
-    #define CHATML_WRITE(s, len) do { \
-        if (buf && total + (len) < buf_size) \
-            memcpy(buf + total, (s), (len)); \
-        total += (len); \
-    } while(0)
-    #define CHATML_STR(s) CHATML_WRITE(s, strlen(s))
-
-    for (size_t i = 0; i < n_msgs; i++) {
-        CHATML_STR("<|im_start|>");
-        CHATML_STR(msgs[i].role);
-        CHATML_WRITE("\n", 1);
-        if (msgs[i].content)
-            CHATML_STR(msgs[i].content);
-        CHATML_STR("<|im_end|>\n");
-    }
-
-    if (add_gen_prompt) {
-        CHATML_STR("<|im_start|>assistant\n");
-    }
-
-    #undef CHATML_WRITE
-    #undef CHATML_STR
-
-    if (buf && total < buf_size) buf[total] = '\0';
-    return (int)total;
-}
-
-/*
- * Apply chat template with fallback. The C-API llama_chat_apply_template only
- * matches a hardcoded list of templates (no Jinja parser). Modern HF GGUFs ship
- * custom Jinja templates that it rejects with -1. When that happens, fall back
- * to plain ChatML, which is the de-facto format for Qwen/Phi/etc.
- */
-int apply_template(
-    const struct llama_model *model,
-    const struct llama_chat_message *msgs, size_t n_msgs,
-    bool add_gen_prompt,
-    char *buf, size_t buf_size)
-{
-    bool dbg = getenv("BASI_DEBUG_TEMPLATE") != NULL;
-
-    /* 1) Native: render the model's actual chat template via the jinja engine.
-          This drives every model in its real format (Gemma/DeepSeek/custom). */
-    char *rendered = basi_render_chat(model, msgs, n_msgs, add_gen_prompt);
-    if (rendered) {
-        size_t len = strlen(rendered);
-        if (dbg) fprintf(stderr, "[tmpl] native jinja render: %zu bytes\n", len);
-        if (!buf) { free(rendered); return (int)len; }       /* length-only query */
-        if (len < buf_size) { memcpy(buf, rendered, len + 1); free(rendered); return (int)len; }
-        free(rendered);   /* doesn't fit this buffer — fall through to legacy */
-        if (dbg) fprintf(stderr, "[tmpl] rendered prompt too big for buffer; falling back\n");
-    }
-
-    /* 2) Legacy fallback: llama.cpp's C-API detection, then ChatML. */
-    const char *tmpl = model ? llama_model_chat_template(model, NULL) : NULL;
-    if (tmpl) {
-        int r = llama_chat_apply_template(tmpl, msgs, n_msgs, add_gen_prompt, buf, buf_size);
-        if (dbg) fprintf(stderr, "[tmpl] fallback llama_chat_apply_template -> %d\n", r);
-        if (r >= 0) return r;
-    }
-    return apply_chatml(msgs, n_msgs, add_gen_prompt, buf, buf_size);
-}
+/* Chat templating is done server-side now (llama-server templates from the
+   messages we POST to /v1/chat/completions), so there is no in-process
+   apply_template / basi_render_chat anymore. */
 
 /* ── Model picker ──────────────────────────────────────────────────── */
 
@@ -689,6 +364,15 @@ typedef struct {
      * tensor walk failed; estimator falls back to file_size/n_layers. */
     double *layer_weight_mb;     /* size n_layers */
     double  fixed_weight_mb;     /* token_embd, output, output_norm, etc. */
+
+    /* Mixture-of-experts. The experts are the bulk of an MoE's weights but only
+     * a few are active per token, so pinning them to system RAM (--cpu-moe) and
+     * putting every ATTENTION layer on the GPU beats offloading whole layers.
+     * Measured on Qwen3.6-35B-A3B: --cpu-moe -ngl 99 gives 33.97 tok/s in
+     * ~4.0 GB VRAM, versus 24.60 tok/s in ~5.5 GB for the -ngl 7 that
+     * whole-layer fitting picks (p=0.0079). Faster AND smaller. */
+    int     n_experts;           /* <arch>.expert_count; 0 = dense */
+    double *layer_expert_mb;     /* size n_layers; expert bytes only, subset of layer_weight_mb */
 } GGUFArch;
 
 /* True when `key` ends with `suffix` — avoids the substring trap where
@@ -804,6 +488,7 @@ static GGUFArch read_gguf_arch(const char *path) {
             else if (key_suffix_is(key, ".attention.key_length"))       r.key_length   = (int)val;
             else if (key_suffix_is(key, ".attention.value_length"))     r.value_length = (int)val;
             else if (key_suffix_is(key, ".attention.sliding_window"))   r.sliding_window = (int)val;
+            else if (key_suffix_is(key, ".expert_count"))               r.n_experts   = (int)val;
         } else if (vtype == 6) { fseek(f, 4, SEEK_CUR); }
         else if (vtype == 0 || vtype == 1 || vtype == 7) { fseek(f, 1, SEEK_CUR); }
         else if (vtype == 2 || vtype == 3) { fseek(f, 2, SEEK_CUR); }
@@ -885,7 +570,8 @@ static GGUFArch read_gguf_arch(const char *path) {
      * weight bytes matter for MoE models where layers are wildly uneven. */
     if (metadata_clean && r.n_layers > 0 && tensor_count > 0 && tensor_count < 1000000) {
         r.layer_weight_mb = calloc((size_t)r.n_layers, sizeof(double));
-        if (r.layer_weight_mb) {
+        r.layer_expert_mb = calloc((size_t)r.n_layers, sizeof(double));
+        if (r.layer_weight_mb && r.layer_expert_mb) {
             bool tensor_clean = true;
             for (uint64_t t = 0; t < tensor_count; t++) {
                 uint64_t name_len;
@@ -917,6 +603,10 @@ static GGUFArch read_gguf_arch(const char *path) {
                 int layer = tensor_layer_index(name);
                 if (layer >= 0 && layer < r.n_layers) {
                     r.layer_weight_mb[layer] += mb;
+                    /* ffn_{gate,down,up}_exps are the expert stacks — the part
+                     * --cpu-moe keeps in system RAM. Tracked separately so the
+                     * VRAM estimate can exclude them. */
+                    if (strstr(name, "_exps")) r.layer_expert_mb[layer] += mb;
                 } else {
                     r.fixed_weight_mb += mb;
                 }
@@ -924,6 +614,8 @@ static GGUFArch read_gguf_arch(const char *path) {
             if (!tensor_clean) {
                 free(r.layer_weight_mb);
                 r.layer_weight_mb = NULL;
+                free(r.layer_expert_mb);
+                r.layer_expert_mb = NULL;
                 r.fixed_weight_mb = 0.0;
             }
         }
@@ -1025,7 +717,7 @@ typedef struct { double vram_mb; double ram_mb; } MemorySplit;
  * Uses exact per-layer tensor bytes when the GGUF tensor walk succeeded;
  * otherwise falls back to file_size / n_layers. */
 static MemorySplit estimate_memory(double file_size_mb, GGUFArch arch,
-                                   int gpu_layers, int ctx) {
+                                   int gpu_layers, int ctx, bool cpu_moe) {
     MemorySplit s = {0, 0};
     int total_layers = arch.n_layers > 0 ? arch.n_layers : 32;
     if (gpu_layers > total_layers) gpu_layers = total_layers;
@@ -1033,7 +725,18 @@ static MemorySplit estimate_memory(double file_size_mb, GGUFArch arch,
 
     /* Weights — exact per-layer if the tensor walker succeeded, else even split. */
     if (arch.layer_weight_mb) {
-        for (int i = 0; i < gpu_layers; i++)        s.vram_mb += arch.layer_weight_mb[i];
+        for (int i = 0; i < gpu_layers; i++) {
+            double w = arch.layer_weight_mb[i];
+            /* --cpu-moe pins the expert stacks to system RAM even for layers that
+             * are otherwise offloaded, so only the attention/norm remainder of an
+             * offloaded layer lands in VRAM. */
+            if (cpu_moe && arch.layer_expert_mb) {
+                s.ram_mb  += arch.layer_expert_mb[i];
+                w         -= arch.layer_expert_mb[i];
+                if (w < 0) w = 0;
+            }
+            s.vram_mb += w;
+        }
         for (int i = gpu_layers; i < total_layers; i++) s.ram_mb += arch.layer_weight_mb[i];
         /* Fixed tensors (token_embd, output, output_norm) live on CPU when not
          * fully offloaded. llama.cpp puts them on GPU only when n_gpu_layers
@@ -1097,13 +800,22 @@ static MemorySplit estimate_memory(double file_size_mb, GGUFArch arch,
 /* Largest gpu_layers (in [0, n_layers]) whose VRAM footprint fits `vram_budget_mb`.
  * Returns 0 if even the smallest non-zero offload spills. */
 static int auto_fit_layers(double file_size_mb, GGUFArch arch,
-                           int ctx, double vram_budget_mb) {
+                           int ctx, double vram_budget_mb, bool cpu_moe) {
     int total = arch.n_layers > 0 ? arch.n_layers : 32;
     for (int g = total; g >= 0; g--) {
-        MemorySplit s = estimate_memory(file_size_mb, arch, g, ctx);
+        MemorySplit s = estimate_memory(file_size_mb, arch, g, ctx, cpu_moe);
         if (s.vram_mb <= vram_budget_mb) return g;
     }
     return 0;
+}
+
+/* An MoE is worth running with --cpu-moe whenever the experts actually dominate.
+ * Measured on Qwen3.6-35B-A3B: whole-layer fitting picks -ngl 7 (24.60 tok/s,
+ * ~5.5GB) while --cpu-moe -ngl 99 gives 33.97 tok/s in ~4.0GB — faster AND
+ * smaller, because only a couple of experts are active per token but every
+ * offloaded layer must carry ALL of them. */
+static bool arch_prefers_cpu_moe(GGUFArch arch) {
+    return arch.n_experts > 0 && arch.layer_expert_mb != NULL;
 }
 
 /* VRAM freed by a just-exited model (e.g. after a /model re-exec) can lag in the
@@ -1130,7 +842,7 @@ static HwInfo hw_probe_settled(void) {
  * Returns filled LaunchConfig, or model_path=NULL on cancel.
  */
 LaunchConfig pick_model(void) {
-    LaunchConfig cfg = { NULL, 99, CONTEXT_SIZE, 0.4f };
+    LaunchConfig cfg = { NULL, 99, CONTEXT_SIZE, 0.4f, 0, 0, 0 };
 
     /* Build search dirs */
     init_model_search_dirs();
@@ -1174,12 +886,19 @@ LaunchConfig pick_model(void) {
     HwInfo hw = hw_probe_settled();
 
     /* Menu state */
-    enum { SECTION_MODEL, SECTION_GPU, SECTION_CTX, SECTION_TEMP, SECTION_LAUNCH, SECTION_COUNT };
+    enum { SECTION_MODEL, SECTION_GPU, SECTION_CTX, SECTION_TEMP,
+           SECTION_SPEC, SECTION_FA, SECTION_LAUNCH, SECTION_COUNT };
     int section = SECTION_MODEL;
     int model_sel = 0;
     int gpu_setting = GPU_LAYER_AUTO;  /* -1 = auto, else absolute layer count */
     int ctx_val = CTX_DEFAULT;     /* free slider value */
     int temp_idx = 4;              /* default: 0.4 */
+    /* llama-server launch flags (baked into .basi/run-llama-server.sh). Until the
+       user toggles them, they auto-follow the selected model's MTP-ness (an MTP
+       head gives lossless spec-decode); spec is forced off for a non-MTP model
+       where draft-mtp has nothing to draft. */
+    int spec_on = 0, fa_on = 0;
+    int spec_touched = 0, fa_touched = 0;
 
     while (1) {
         printf("\033[2J\033[H");
@@ -1228,12 +947,17 @@ LaunchConfig pick_model(void) {
             if (vram_usable_mb < 0) vram_usable_mb = 0;
         }
 
+        /* MoE models run faster in less VRAM with --cpu-moe: the experts are the
+         * bulk of the weights but only a couple fire per token, so pinning them to
+         * RAM and offloading every attention layer beats fitting whole layers. */
+        bool cpu_moe = arch_prefers_cpu_moe(model_arch[model_sel]);
+
         /* Resolve effective GPU layer count (auto-fit when sentinel is selected) */
         int gpu_effective;
         if (gpu_setting == GPU_LAYER_AUTO) {
             gpu_effective = auto_fit_layers(model_size_mb[model_sel],
                                             model_arch[model_sel],
-                                            ctx_val, vram_usable_mb);
+                                            ctx_val, vram_usable_mb, cpu_moe);
         } else {
             gpu_effective = gpu_setting;
         }
@@ -1248,6 +972,7 @@ LaunchConfig pick_model(void) {
             printf("\033[1m%d\033[0m \033[90m/ %d\033[0m",
                    gpu_setting, model_max_layers);
         }
+        if (cpu_moe) printf("  \033[36m--cpu-moe\033[0m");
         if (section == SECTION_GPU) printf("  \033[90m← →\033[0m");
         printf("\033[0m\n");
 
@@ -1274,7 +999,7 @@ LaunchConfig pick_model(void) {
         {
             MemorySplit ms = estimate_memory(model_size_mb[model_sel],
                                              model_arch[model_sel],
-                                             gpu_effective, ctx_val);
+                                             gpu_effective, ctx_val, cpu_moe);
             bool fits_gpu = hw.has_gpu && ms.vram_mb <= vram_usable_mb;
             bool spilling = ms.ram_mb > 0.5;  /* anything not on GPU */
 
@@ -1312,6 +1037,24 @@ LaunchConfig pick_model(void) {
         if (section == SECTION_TEMP) printf("  \033[90m← →\033[0m");
         printf("\033[0m\n");
 
+        /* llama-server launch flags — these become the .basi/run-llama-server.sh
+           command. Spec-decode needs an MTP head, so it's n/a for non-MTP models. */
+        int cur_mtp = (strstr(models[model_sel], "MTP") || strstr(models[model_sel], "mtp")) ? 1 : 0;
+        if (!spec_touched) spec_on = cur_mtp;   /* auto-follow model until toggled */
+        if (!fa_touched)   fa_on   = cur_mtp;
+        if (!cur_mtp) spec_on = 0;              /* draft-mtp needs an MTP head */
+        printf("%s SPEC-DECODE   \033[1m%s\033[0m",
+               section == SECTION_SPEC ? "\033[1;33m▸" : "  \033[90m",
+               !cur_mtp ? "n/a (no MTP head)" : (spec_on ? "draft-mtp (n-max 1)" : "off"));
+        if (section == SECTION_SPEC && cur_mtp) printf("  \033[90m← →\033[0m");
+        printf("\033[0m\n");
+
+        printf("%s FLASH-ATTN    \033[1m%s\033[0m",
+               section == SECTION_FA ? "\033[1;33m▸" : "  \033[90m",
+               fa_on ? "on" : "off");
+        if (section == SECTION_FA) printf("  \033[90m← →\033[0m");
+        printf("\033[0m\n");
+
         printf("\n");
 
         /* Launch button */
@@ -1347,6 +1090,8 @@ LaunchConfig pick_model(void) {
                 cfg.gpu_layers = gpu_effective;
                 cfg.ctx_size = ctx_val;
                 cfg.temperature = temp_opts[temp_idx];
+                cfg.spec_draft_mtp = spec_on;
+                cfg.flash_attn = fa_on;
                 break;
             } else {
                 /* Enter on setting goes to next section */
@@ -1380,6 +1125,8 @@ LaunchConfig pick_model(void) {
                         if (ctx_val > mc) ctx_val = mc;
                     }
                     if (section == SECTION_TEMP && temp_idx < N_TEMP_OPTS - 1) temp_idx++;
+                    if (section == SECTION_SPEC && cur_mtp) { spec_on = 1; spec_touched = 1; }
+                    if (section == SECTION_FA) { fa_on = 1; fa_touched = 1; }
                     break;
                 case 'D': /* Left */
                     if (section == SECTION_GPU && gpu_setting > GPU_LAYER_AUTO) gpu_setting--;
@@ -1388,6 +1135,8 @@ LaunchConfig pick_model(void) {
                         if (ctx_val < CTX_MIN) ctx_val = CTX_MIN;
                     }
                     if (section == SECTION_TEMP && temp_idx > 0) temp_idx--;
+                    if (section == SECTION_SPEC) { spec_on = 0; spec_touched = 1; }
+                    if (section == SECTION_FA) { fa_on = 0; fa_touched = 1; }
                     break;
                 }
             }

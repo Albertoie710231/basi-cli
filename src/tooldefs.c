@@ -17,8 +17,11 @@
 #define INT(name, desc) "\"" name "\":{\"type\":\"integer\",\"description\":\"" desc "\"}"
 
 static const BasiToolDef TOOLS[] = {
-    { "read", "Read an entire small file (<~2000 tokens). For larger files use head/grep.",
-      OBJ(STR("file", "Path to the file"), "[\"file\"]") },
+    { "read", "Read a file. A small file is returned whole; a large file returns a window of "
+              "`count` lines from line `start`, with a footer telling you how to read the next window.",
+      OBJ(STR("file", "Path to the file") ","
+          INT("start", "1-based line to start at (optional; default 1)") ","
+          INT("count", "number of lines to read (optional; default 400)"), "[\"file\"]") },
     { "head", "Read the first N lines of a file.",
       OBJ(STR("file", "Path to the file") "," INT("lines", "Number of lines (default 10)"), "[\"file\"]") },
     { "tail", "Read the last N lines of a file.",
@@ -28,14 +31,16 @@ static const BasiToolDef TOOLS[] = {
           INT("context", "Lines of surrounding context to include (optional)"), "[\"pattern\",\"file\"]") },
     { "wc", "Count lines, words and characters in a file.",
       OBJ(STR("file", "Path to the file"), "[\"file\"]") },
-    { "bash", "Run a shell command via 'bash -c'. Requires user approval. Use for builds, tests, git, or anything the other tools do not cover.",
+    { "bash", "Run a shell command via 'bash -c'. Requires user approval. Use for builds, tests, git, or anything the other tools do not cover. To list or COUNT the functions in a C/C++ file, use 'ctags -x --c-kinds=f <file>' (append '| wc -l' to count) — it is exact. Do NOT try to match function definitions with grep/awk regexes; multi-line signatures, macros and return types on their own line make that unreliable.",
       OBJ(STR("command", "The shell command to run"), "[\"command\"]") },
     { "edit", "Create or modify a file. Read it first. To change part of a file, give the exact current text in 'search' and the new text in 'replace'. To create a NEW file, or to overwrite an existing file wholesale (e.g. fill in a stub), leave 'search' empty and put the full file content in 'replace'.",
       OBJ(STR("file", "Relative path to the file") "," STR("search", "Exact current text to replace (verbatim); empty to create a new file") ","
           STR("replace", "The replacement text"), "[\"file\",\"replace\"]") },
     { "scaffold", "Materialize a code template into a destination directory. Requires user approval. Use 'scaffold list' (name=list) to see templates.",
       OBJ(STR("name", "Template name, or 'list' to list templates") "," STR("dest", "Destination directory (default .)"), "[\"name\"]") },
-    { "code_context", "Return clangd's structural info (signature, type, doc) for a top-level C symbol.",
+    { "symbols", "List what a source file DEFINES, with exact counts by kind (functions, structs, macros...). Use this for any 'what is in this file' / 'how many functions' / 'where is X defined' question, and to find a symbol name before calling code_context. Exact — never count or locate definitions with grep/awk regexes, which multi-line signatures and macros defeat. Works for any language ctags parses (C/C++/Python/Go/JS/Rust/...).",
+      OBJ(STR("file", "Path to the source file") "," STR("kind", "Optional filter: function, struct, macro, variable, ..."), "[\"file\"]") },
+    { "code_context", "Return clangd's structural info (signature, type, doc) for a top-level C symbol. Authoritative for C — prefer it over grep when you need a symbol's signature, type or definition site. Requires the symbol NAME; use 'symbols' first to discover names.",
       OBJ(STR("file", "Path to the C file") "," STR("symbol", "Top-level identifier name"), "[\"file\",\"symbol\"]") },
     { "web_search", "Search the web. Use for any current/latest/version/price/news question. Returns ranked results plus the full text of the top pages.",
       OBJ(STR("query", "The search query") "," STR("recency", "Optional recency filter: day|week|month|year"), "[\"query\"]") },
@@ -57,6 +62,10 @@ static const BasiToolDef TOOLS[] = {
       OBJ(STR("items", "Newline-separated '- <item>' list"), "[\"items\"]") },
     { "spike_write", "Persist a spike artifact (spike phase): Question / Findings / Decision.",
       OBJ(STR("body", "The full spike document"), "[\"body\"]") },
+    { "study_write", "Save a study: a hypothesis paired with a COMMAND that measures it. Use when a question can be settled by running something rather than by reasoning about it. Body is YAML frontmatter (metric, extract regex, runs, decision_rule) plus ## Question/Hypothesis/Experiment/Results/Verdict, with one ```arm <name> fenced block per arm. Then run `basi study run <slug>`: the verdict is computed from the measured numbers, not from your reading of them.",
+      OBJ(STR("body", "The full study document"), "[\"body\"]") },
+    { "study_run", "Execute a study written with study_write and return the measured results plus the computed verdict (SUPPORTED / REFUTED / INCONCLUSIVE). Run this after study_write, and after any change you want to measure. The verdict is computed from the numbers by the pre-registered decision rule — you cannot argue with it, so use it: keep the change if SUPPORTED, revert it if REFUTED, and if INCONCLUSIVE the effect was not distinguishable from noise, so do NOT report it as an improvement.",
+      OBJ(STR("slug", "Slug of the study to run"), "[\"slug\"]") },
     { "plan_verify", "Run the verify clause of every Implementation Plan row (active phase), or one row by id.",
       OBJ(STR("id", "Optional row id, e.g. 1.2"), "[]") },
 };
@@ -88,6 +97,13 @@ char *basi_build_command(const char *name, const char *args) {
     if (strcmp(name, "read") == 0) {
         sb_append_str(&sb, "read");
         append_arg(&sb, args, "file", false);
+        long start = jx_get_int(args, "start");
+        long count = jx_get_int(args, "count");
+        if (start > 0 || count > 0) {                 /* paging a large file */
+            if (start < 1) start = 1;
+            char b[48]; snprintf(b, sizeof(b), " %ld", start); sb_append_str(&sb, b);
+            if (count > 0) { snprintf(b, sizeof(b), " %ld", count); sb_append_str(&sb, b); }
+        }
     } else if (strcmp(name, "head") == 0 || strcmp(name, "tail") == 0) {
         sb_append_str(&sb, name);
         long lines = jx_get_int(args, "lines");
@@ -164,6 +180,14 @@ char *basi_build_command(const char *name, const char *args) {
         sb_append_str(&sb, "spike_write\n");
         sb_append_str(&sb, body ? body : "");
         free(body);
+    } else if (strcmp(name, "study_write") == 0) {
+        char *body = jx_get_string(args, "body");
+        sb_append_str(&sb, "study_write\n");
+        sb_append_str(&sb, body ? body : "");
+        free(body);
+    } else if (strcmp(name, "study_run") == 0) {
+        sb_append_str(&sb, "study_run");
+        append_arg(&sb, args, "slug", false);
     } else if (strcmp(name, "plan_verify") == 0) {
         sb_append_str(&sb, "plan_verify");
         append_arg(&sb, args, "id", false);

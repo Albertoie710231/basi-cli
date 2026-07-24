@@ -21,6 +21,7 @@ static const SlashCmd TABLE[] = {
     { "/plan",        "planning workflow (draft/accept/off)",   true  },
     { "/premortem",   "rewrite the plan with a pre-mortem",     false },
     { "/deepsearch",  "multi-round deep research",              true  },
+    { "/study",       "run experiments until a question is settled", true  },
 };
 #define TABLE_N ((int)(sizeof(TABLE) / sizeof(TABLE[0])))
 
