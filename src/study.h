@@ -192,4 +192,8 @@ char *study_loop(const char *seed_slug, const StudyLoopOpts *opts);
 /* CLI: basi-cli study <run|list|show> ... */
 int cmd_study(int argc, char **argv);
 
+/* CLI: basi-cli factory --question <q> --measure <cmd> — propose N candidate code
+ * changes, apply+measure each, rank by the metric vs a no-edit baseline. */
+int cmd_factory(int argc, char **argv);
+
 #endif /* BASI_STUDY_H */

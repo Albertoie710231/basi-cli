@@ -3548,6 +3548,9 @@ int main(int argc, char **argv) {
     if (argc >= 2 && strcmp(argv[1], "study") == 0) {
         return cmd_study(argc - 2, argv + 2);
     }
+    if (argc >= 2 && strcmp(argv[1], "factory") == 0) {
+        return cmd_factory(argc - 2, argv + 2);
+    }
 
     Cli cli = parse_args(argc, argv);
     if (cli.want_exit) return cli.exit_code;

@@ -1854,7 +1854,9 @@ static char *ground_dispatch(const ArgList *al, const char **phase) {
  * grounding (investigate the system) and review (verify a pooled brief's citations). */
 typedef struct { const char *role; char *content; } GTurn;
 static char *study_react_brief(int port, const char *sys, const char *user_intro,
-                               const char *context, const char *label, StringBuf *log) {
+                               const char *context, const char *label, int max_rounds,
+                               int pre_grounded, StringBuf *log) {
+    int rounds = max_rounds > 0 ? max_rounds : GROUND_MAX_ROUNDS;
     /* Keep the native tool grammar out of the <tool> ReAct format, same reason
      * deepsearch does: a native-tools model otherwise emits its trained tool-call
      * syntax and extract_tool_call (legacy <tool>) can't parse it. Restored below. */
@@ -1888,13 +1890,17 @@ static char *study_react_brief(int port, const char *sys, const char *user_intro
     unsigned long *seen = NULL; int nseen = 0, capseen = 0;
 
     char *evidence = NULL;
+    /* Refuse the brief until the model has read something — UNLESS the caller already
+     * injected the exact file bytes into `context` (pre_grounded), in which case the
+     * model is reading from the prompt and needs no tool call to be grounded. */
+    int tools_used = pre_grounded ? 1 : 0;
     printf("\033[36m[study/%s] read-only investigation (up to %d tool calls)\033[0m\n",
-           label, GROUND_MAX_ROUNDS);
+           label, rounds);
     fflush(stdout);
 
-    for (int round = 1; round <= GROUND_MAX_ROUNDS && !evidence; round++) {
+    for (int round = 1; round <= rounds && !evidence; round++) {
         /* On the final round, force the brief instead of another tool. */
-        if (round == GROUND_MAX_ROUNDS && nt > 0 && strcmp(turns[nt-1].role, "user") == 0) {
+        if (round == rounds && nt > 0 && strcmp(turns[nt-1].role, "user") == 0) {
             const char *force = "\n\n[Investigation budget reached — emit the "
                 "<evidence>...</evidence> brief now from what you found; do not call another tool.]";
             size_t ol = strlen(turns[nt-1].content);
@@ -1915,7 +1921,24 @@ static char *study_react_brief(int port, const char *sys, const char *user_intro
         GPUSH("assistant", strdup(reply));
 
         evidence = ground_extract_evidence(reply);
-        if (evidence) { free(reply); break; }
+        if (evidence) {
+            if (tools_used == 0) {
+                /* Refuse a conclusion drawn from memory: a brief/theory proposed before
+                 * reading any file is a guess — its citations and SEARCH text will not
+                 * match the real code (measured: a theory phase emitted pow/sqrt/Makefile
+                 * changes for a file that had none of them, with 0 tool calls). Force a read. */
+                free(evidence); evidence = NULL;
+                GPUSH("user", strdup("You concluded WITHOUT investigating — you have read no "
+                    "file yet, so this is guessed from memory and any citation or SEARCH text "
+                    "will NOT match the real code. Use read/grep to READ the actual file(s) "
+                    "FIRST, then emit the brief."));
+                printf("\033[33m[study/%s] concluded before reading — forcing investigation\033[0m\n", label);
+                fflush(stdout);
+                free(reply);
+                continue;
+            }
+            free(reply); break;
+        }
 
         size_t tlen = 0;
         const char *tbody = extract_tool_call(reply, &tlen);
@@ -1937,8 +1960,9 @@ static char *study_react_brief(int port, const char *sys, const char *user_intro
         }
         const char *phase = "?";
         char *raw = ground_dispatch(&al, &phase);
+        tools_used++;   /* the model has now investigated at least once */
         printf("\033[90m[study/%s %d/%d] %s: %.70s\033[0m\n",
-               label, round, GROUND_MAX_ROUNDS, phase, al.count >= 2 ? al.args[1] : "");
+               label, round, rounds, phase, al.count >= 2 ? al.args[1] : "");
         fflush(stdout);
         arglist_free(&al);
         if (!raw) raw = strdup("(no result)");
@@ -1951,7 +1975,7 @@ static char *study_react_brief(int port, const char *sys, const char *user_intro
         for (int i = 0; i < nseen; i++) if (seen[i] == h) { dup = true; break; }
         if (dup) {
             printf("\033[33m[study/%s %d/%d] duplicate result — nudging\033[0m\n",
-                   label, round, GROUND_MAX_ROUNDS);
+                   label, round, rounds);
             fflush(stdout);
             GPUSH("user", strdup(
                 "That returned content IDENTICAL to a result you already have — no new "
@@ -2008,14 +2032,14 @@ static char *study_react_brief(int port, const char *sys, const char *user_intro
 /* Investigate the system under test for the given question/verdict context. */
 static char *study_ground(int port, const char *context, StringBuf *log) {
     return study_react_brief(port, GROUND_SYSTEM_PROMPT,
-        "Question the hypothesis will address:\n\n", context, "ground", log);
+        "Question the hypothesis will address:\n\n", context, "ground", 0 /*default rounds*/, 0, log);
 }
 
 /* Verify a pool of investigator briefs against the actual code (the review gate). */
 static char *study_review(int port, const char *pooled_briefs, StringBuf *log) {
     return study_react_brief(port, GROUND_REVIEW_PROMPT,
         "Evidence briefs from the investigators — verify each against the actual "
-        "code before any hypothesis is built on them:\n\n", pooled_briefs, "review", log);
+        "code before any hypothesis is built on them:\n\n", pooled_briefs, "review", 0, 0, log);
 }
 
 /* When non-NULL, propose_artifact uses THIS evidence (borrowed, never freed) instead
@@ -3170,6 +3194,225 @@ static int study_cmd_list(void) {
     }
     closedir(d);
     if (!n) printf("No studies yet.\n");
+    return 0;
+}
+
+/* ── factory: propose N candidate code changes, measure each, rank ──────────
+ * `basi-cli factory --question <q> --measure <cmd> [--extract <re>] [--theories N]
+ *  [--minimize] [--port N] [--timeout S]`. The LLM investigates the code READ-ONLY and
+ * emits N EDIT-SPEC theories; then, DETERMINISTICALLY, each theory's edit is applied to
+ * its file, the measure command runs (it builds/tests and prints a number), the file is
+ * restored, and theories are ranked by the metric vs a no-edit baseline. Creative step =
+ * LLM, trying-each + ranking = mechanical (deterministic-first). Reuses study_react_brief
+ * for the theory phase and extract_metric for the number. */
+#define FACTORY_THEORY_PROMPT \
+"You are the THEORY step of an optimization factory. Investigate the code with the\n" \
+"read-only tools (list/read/grep/symbols), then propose EVERY promising, low-risk change\n" \
+"that could improve the metric for the question below. Find MULTIPLE candidates (2-6);\n" \
+"do NOT stop at one, and do NOT edit anything.\n" \
+"\n" \
+"When done investigating, emit ALL your theories inside ONE <evidence>...</evidence>\n" \
+"block. Inside it, each theory is one block in EXACTLY this format (it is parsed\n" \
+"programmatically — do not alter the markers):\n" \
+"\n" \
+"@@THEORY@@\n" \
+"desc: <one short line: what changes and why it could improve the metric>\n" \
+"file: <relative path to the file to edit>\n" \
+"@@SEARCH@@\n" \
+"<the EXACT current lines from the file, copied VERBATIM including indentation>\n" \
+"@@REPLACE@@\n" \
+"<the exact replacement lines>\n" \
+"@@END@@\n" \
+"\n" \
+"READ the file to copy each SEARCH block verbatim (it must match character-for-character).\n" \
+"Keep each SEARCH small — the changed lines plus 1-2 for context. Output as many real,\n" \
+"independent theories as you found. The <evidence> block is your entire output.\n"
+
+typedef struct { char *desc, *file, *search, *replace; } FactoryTheory;
+
+static char *fac_between(const char *s, const char *open, const char *close, const char **after) {
+    const char *o = strstr(s, open); if (!o) return NULL;
+    o += strlen(open);
+    const char *c = strstr(o, close);
+    size_t n = c ? (size_t)(c - o) : strlen(o);
+    if (after) *after = c ? c + strlen(close) : o + n;
+    char *r = malloc(n + 1); memcpy(r, o, n); r[n] = '\0'; return r;
+}
+static char *fac_field(const char *block, const char *key) {
+    const char *p = strstr(block, key); if (!p) return NULL;
+    p += strlen(key);
+    while (*p == ' ' || *p == '\t') p++;
+    const char *e = strchr(p, '\n'); size_t n = e ? (size_t)(e - p) : strlen(p);
+    while (n && (p[n-1] == ' ' || p[n-1] == '\r' || p[n-1] == '\t')) n--;
+    char *r = malloc(n + 1); memcpy(r, p, n); r[n] = '\0'; return r;
+}
+static char *fac_strip_nl(const char *s) {   /* strip surrounding \n/\r only; keep indentation */
+    while (*s == '\n' || *s == '\r') s++;
+    size_t n = strlen(s);
+    while (n && (s[n-1] == '\n' || s[n-1] == '\r')) n--;
+    char *r = malloc(n + 1); memcpy(r, s, n); r[n] = '\0'; return r;
+}
+static void fac_free(FactoryTheory *t) { free(t->desc); free(t->file); free(t->search); free(t->replace); }
+
+static int factory_parse(const char *text, FactoryTheory *out, int max) {
+    int n = 0; const char *cur = text;
+    while (n < max) {
+        const char *after = NULL;
+        char *block = fac_between(cur, "@@THEORY@@", "@@END@@", &after);
+        if (!block) break;
+        cur = after;
+        FactoryTheory t = {0};
+        t.desc = fac_field(block, "desc:");
+        t.file = fac_field(block, "file:");
+        char *raws = fac_between(block, "@@SEARCH@@", "@@REPLACE@@", NULL);
+        const char *rp = strstr(block, "@@REPLACE@@");
+        if (raws) { t.search = fac_strip_nl(raws); free(raws); }
+        if (rp)   { t.replace = fac_strip_nl(rp + strlen("@@REPLACE@@")); }
+        free(block);
+        if (t.file && *t.file && t.search && *t.search && t.replace) out[n++] = t;
+        else fac_free(&t);
+    }
+    return n;
+}
+
+/* Measure with theory `t` applied (or baseline if NULL): back up file, apply exact
+ * SEARCH->REPLACE, run measure, restore. 1=ok, 0=measure/extract failed, -1=SEARCH not found. */
+static int factory_trial(const FactoryTheory *t, const char *measure, const regex_t *re,
+                         int timeout_s, double *out) {
+    char *orig = NULL; size_t ol = 0;
+    if (t) {
+        orig = kb_read_file(t->file, &ol);
+        if (!orig) return -1;
+        char *pos = strstr(orig, t->search);
+        if (!pos) { free(orig); return -1; }
+        FILE *f = fopen(t->file, "w");
+        if (!f) { free(orig); return 0; }
+        fwrite(orig, 1, (size_t)(pos - orig), f);
+        fwrite(t->replace, 1, strlen(t->replace), f);
+        fputs(pos + strlen(t->search), f);
+        fclose(f);
+    }
+    int to = 0;
+    char *outp = run_command_timeout(measure, 512 * 1024, timeout_s, &to);
+    int rc = (outp && !to && extract_metric(re, outp, out, NULL, NULL, NULL)) ? 1 : 0;
+    free(outp);
+    if (t && orig) { FILE *f = fopen(t->file, "w"); if (f) { fwrite(orig, 1, ol, f); fclose(f); } free(orig); }
+    return rc;
+}
+
+typedef struct { int idx, ok; double val; } FacRank;
+static int fac_cmp_hi(const void *a, const void *b) { double x=((const FacRank*)a)->val,y=((const FacRank*)b)->val; return (x<y)-(x>y); }
+static int fac_cmp_lo(const void *a, const void *b) { double x=((const FacRank*)a)->val,y=((const FacRank*)b)->val; return (x>y)-(x<y); }
+
+#define FACTORY_MAX_THEORIES 12
+#define FACTORY_MAX_FILES     8
+#define FACTORY_INJECT_CAP (48*1024)   /* per-file byte cap when injecting source into the theory prompt */
+int cmd_factory(int argc, char **argv) {
+    const char *question = NULL, *measure = NULL, *extract = "([0-9]+\\.[0-9]+)";
+    int port = 8181, timeout_s = 1800, maxth = 6; bool minimize = false;
+    const char *files[FACTORY_MAX_FILES]; int nfiles = 0;
+    { const char *pe = getenv("BASI_SERVER_PORT"); if (pe && *pe) port = atoi(pe); }
+    for (int i = 0; i < argc; i++) {   /* argv[0] is already the first flag (dispatch passed argv+2) */
+        if      (!strcmp(argv[i], "--question") && i+1 < argc) question = argv[++i];
+        else if (!strcmp(argv[i], "--measure")  && i+1 < argc) measure  = argv[++i];
+        else if (!strcmp(argv[i], "--extract")  && i+1 < argc) extract  = argv[++i];
+        else if (!strcmp(argv[i], "--theories") && i+1 < argc) maxth    = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--timeout")  && i+1 < argc) timeout_s= atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--port")     && i+1 < argc) port     = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--file")     && i+1 < argc) {
+            if (nfiles < FACTORY_MAX_FILES) files[nfiles++] = argv[++i];
+            else { fprintf(stderr, "factory: too many --file (max %d)\n", FACTORY_MAX_FILES); return 2; }
+        }
+        else if (!strcmp(argv[i], "--minimize")) minimize = true;
+        else { fprintf(stderr, "factory: unknown option '%s'\n", argv[i]); return 2; }
+    }
+    if (!question || !measure) {
+        fprintf(stderr,
+          "usage: basi-cli factory --question \"<what to optimize>\" --measure \"<cmd>\"\n"
+          "  The LLM proposes N candidate code changes; each is applied, the measure command\n"
+          "  runs (it builds/tests and PRINTS A NUMBER), the file is restored, and the\n"
+          "  theories are ranked by the metric vs a no-edit baseline.\n"
+          "  --file <path>  inject this source VERBATIM into the theory prompt (repeatable);\n"
+          "                 grounds the proposals in the real code so SEARCH text actually matches\n"
+          "  --extract <regex>  capture group 1 = the metric (default: the last N.N in output)\n"
+          "  --theories N   cap candidates (default 6)    --minimize   lower metric is better\n"
+          "  --timeout S    per-measure seconds (default 1800; builds are slow)\n");
+        return 2;
+    }
+    if (maxth < 1) maxth = 1;
+    if (maxth > FACTORY_MAX_THEORIES) maxth = FACTORY_MAX_THEORIES;
+
+    char hc[192]; snprintf(hc, sizeof(hc), "curl -sf -o /dev/null http://127.0.0.1:%d/health", port);
+    if (system(hc) != 0) { fprintf(stderr, "factory: no healthy llama-server on :%d (the theory step needs one).\n", port); return 1; }
+    regex_t re;
+    if (regcomp(&re, extract, REG_EXTENDED | REG_NEWLINE) != 0) { fprintf(stderr, "factory: --extract regex does not compile\n"); return 2; }
+
+    /* Build the theory-phase context. When --file is given we inject the EXACT bytes of
+     * each named source into the prompt, so the model proposes against the real code
+     * instead of hallucinating from memory (measured: with no file, the 35B emitted
+     * pow/sqrt/Makefile edits for a file that had none of them, 0 tool calls). The
+     * injected bytes also give it verbatim text to copy into its @@SEARCH@@ blocks, so
+     * the exact-match apply lands. Files present => pre_grounded (skip the read gate). */
+    StringBuf ctx; sb_init(&ctx);
+    sb_append_str(&ctx, question);
+    for (int i = 0; i < nfiles; i++) {
+        size_t fl = 0; char *fc = kb_read_file(files[i], &fl);
+        if (!fc) { fprintf(stderr, "factory: --file '%s' not readable\n", files[i]); sb_free(&ctx); regfree(&re); return 1; }
+        int truncd = 0;
+        if (fl > FACTORY_INJECT_CAP) { fl = FACTORY_INJECT_CAP; truncd = 1; }
+        sb_append_str(&ctx, "\n\n===== FILE: ");
+        sb_append_str(&ctx, files[i]);
+        sb_append_str(&ctx, " (your @@SEARCH@@ text must match these bytes VERBATIM) =====\n");
+        sb_append(&ctx, fc, fl);
+        if (truncd) sb_append_str(&ctx, "\n...[truncated]...");
+        free(fc);
+    }
+    char *ctx_s = sb_to_str(&ctx);
+
+    fprintf(stderr, "factory: generating theories...%s\n", nfiles ? " (source injected)" : "");
+    StringBuf log; sb_init(&log);
+    char *th_txt = study_react_brief(port, FACTORY_THEORY_PROMPT,
+        "Optimization question — find code changes that improve the metric:\n\n",
+        ctx_s, "theory", 20 /*deeper investigation than a grounding brief*/,
+        nfiles > 0 /*pre_grounded when source is injected*/, &log);
+    free(ctx_s);
+    if (!th_txt) { fprintf(stderr, "factory: theory step produced nothing.\n"); regfree(&re); sb_free(&log); return 1; }
+    FactoryTheory th[FACTORY_MAX_THEORIES];
+    int nth = factory_parse(th_txt, th, maxth);
+    if (nth == 0) { fprintf(stderr, "factory: no parseable @@THEORY@@ blocks:\n%s\n", th_txt); free(th_txt); regfree(&re); sb_free(&log); return 1; }
+    printf("factory: %d theories\n", nth);
+    for (int i = 0; i < nth; i++) printf("  T%d: %s\n", i+1, th[i].desc ? th[i].desc : "(no desc)");
+
+    printf("-- measuring baseline --\n"); fflush(stdout);
+    double base = 0;
+    if (factory_trial(NULL, measure, &re, timeout_s, &base) != 1) {
+        fprintf(stderr, "factory: baseline measure produced no number matching the extract regex.\n");
+        for (int i=0;i<nth;i++) { fac_free(&th[i]); }
+        free(th_txt); regfree(&re); sb_free(&log); return 1;
+    }
+    printf("  baseline = %g\n", base);
+
+    FacRank rank[FACTORY_MAX_THEORIES];
+    for (int i = 0; i < nth; i++) {
+        printf("-- T%d/%d --\n", i+1, nth); fflush(stdout);
+        double v = 0; int rc = factory_trial(&th[i], measure, &re, timeout_s, &v);
+        rank[i].idx = i; rank[i].ok = (rc == 1); rank[i].val = v;
+        if (rc == 1) printf("  T%d  metric=%g  (%+.2f%% vs %g)  ::  %s\n", i+1, v, base!=0?(v-base)/base*100:0, base, th[i].desc?th[i].desc:"");
+        else if (rc == -1) printf("  T%d  SEARCH not found -- could not apply  ::  %s\n", i+1, th[i].desc?th[i].desc:"");
+        else printf("  T%d  measure failed  ::  %s\n", i+1, th[i].desc?th[i].desc:"");
+    }
+
+    qsort(rank, (size_t)nth, sizeof(rank[0]), minimize ? fac_cmp_lo : fac_cmp_hi);
+    printf("\n==== CONCLUSION (baseline %g; %s is better) ====\n", base, minimize ? "lower" : "higher");
+    for (int i = 0; i < nth; i++) {
+        int k = rank[i].idx;
+        if (rank[i].ok) printf("  %+.2f%%  metric=%g  ::  %s\n", base!=0?(rank[i].val-base)/base*100:0, rank[i].val, th[k].desc?th[k].desc:"");
+        else            printf("  (n/a)  ::  %s\n", th[k].desc?th[k].desc:"");
+    }
+    printf("Note: a delta within your measurement noise is not a real win.\n");
+
+    for (int i = 0; i < nth; i++) fac_free(&th[i]);
+    free(th_txt); regfree(&re); sb_free(&log);
     return 0;
 }
 
