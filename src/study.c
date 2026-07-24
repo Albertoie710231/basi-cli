@@ -3545,7 +3545,7 @@ static char *factory_retrieve_big(const char *path, const char *question, size_t
 int cmd_factory(int argc, char **argv) {
     const char *question = NULL, *measure = NULL, *extract = "([0-9]+\\.[0-9]+)", *verify = NULL;
     const char *expect = NULL;
-    int port = 8181, timeout_s = 1800, maxth = 6, repeat = 3; bool minimize = false;
+    int port = 8181, timeout_s = 1800, maxth = 6, repeat = 1; bool minimize = false;
     const char *files[FACTORY_MAX_FILES]; int nfiles = 0;
     { const char *pe = getenv("BASI_SERVER_PORT"); if (pe && *pe) port = atoi(pe); }
     for (int i = 0; i < argc; i++) {   /* argv[0] is already the first flag (dispatch passed argv+2) */
@@ -3583,11 +3583,14 @@ int cmd_factory(int argc, char **argv) {
           "  --verify <cmd> correctness gate (LEGACY): separate cmd must exit 0 (a second full\n"
           "                 build+run per theory). Prefer --expect for heavy pipelines.\n"
           "  --theories N   cap candidates (default 6)    --minimize   lower metric is better\n"
-          "  --repeat N     scored measure runs per candidate (default 3). The baseline also\n"
-          "                 gets one DISCARDED warm-up run first (a cold first run measured ~28%%\n"
-          "                 high here), and the spread of the baseline's scored runs becomes the\n"
-          "                 noise band: a delta inside it is reported as no win. --repeat 1\n"
-          "                 restores the old single-shot behaviour and measures no band.\n"
+          "  --repeat N     scored measure runs per candidate (default 1 = cheapest). The\n"
+          "                 baseline ALWAYS does one extra DISCARDED warm-up run first — a cold\n"
+          "                 first run measured ~28%% high here, which made every theory look\n"
+          "                 faster than it was; that costs 1 run per invocation, so it is never\n"
+          "                 skipped. With N>1 the spread of the baseline's scored runs becomes a\n"
+          "                 noise band and a delta inside it is reported as NO WIN — use N=5\n"
+          "                 when a result has to be trustworthy (e.g. before landing a kernel\n"
+          "                 change); N=1 gives you a number but no way to know if it is real.\n"
           "  --timeout S    per-measure seconds (default 1800; builds are slow)\n");
         return 2;
     }
@@ -3661,7 +3664,7 @@ int cmd_factory(int argc, char **argv) {
     printf("factory: %d theories\n", nth);
     for (int i = 0; i < nth; i++) printf("  T%d: %s\n", i+1, th[i].desc ? th[i].desc : "(no desc)");
 
-    printf("-- measuring baseline (%d warm-up + %d scored runs) --\n", repeat > 1 ? 1 : 0, repeat);
+    printf("-- measuring baseline (1 warm-up + %d scored run%s) --\n", repeat, repeat == 1 ? "" : "s");
     fflush(stdout);
     double base = 0, band = 0;
     /* Baseline measure ALSO runs the --expect gate (same runs). A failure here means the
@@ -3669,8 +3672,11 @@ int cmd_factory(int argc, char **argv) {
      * The first run is discarded: it is cold, and every theory after it would otherwise be
      * compared against an inflated baseline. The spread of the scored runs IS the noise
      * band that a theory must beat to count as a win. */
+    /* Warm-up is ALWAYS discarded, even at --repeat 1: it costs ONE extra run for the whole
+     * invocation (not one per theory) and it is what removes the cold-first-run bias. Only
+     * the noise band is given up at --repeat 1. */
     int brc = factory_trial(NULL, measure, &re, timeout_s, NULL, expect_re,
-                            repeat > 1 ? 1 : 0, repeat, &base, &band);
+                            1 /*warmup*/, repeat, &base, &band);
     if (brc == -2) {
         fprintf(stderr, "factory: --expect regex did not match the UNEDITED baseline measure output.\n"
                         "  The measure cmd must emit the correctness token even before any edit.\n");
@@ -3694,7 +3700,9 @@ int cmd_factory(int argc, char **argv) {
         printf("  (band = range of %d samples; it is an ESTIMATE that grows with --repeat."
                " A delta that only just clears it is not a result.)\n", repeat);
     } else {
-        printf("  WARNING: --repeat 1 measures no noise band, so any delta will look like a win.\n");
+        printf("  no noise band at --repeat 1 -- the cold-run bias is gone (warm-up discarded),\n"
+               "  but nothing here tells you whether a small delta is real. Re-run the winner\n"
+               "  with --repeat 5 before believing it.\n");
     }
     if (expect_re)
         printf("  --expect matched on baseline; theories whose measure drops the token will be rejected\n");
