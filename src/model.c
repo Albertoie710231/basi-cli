@@ -1215,6 +1215,7 @@ LaunchConfig pick_model(void) {
     for (int i = 0; i < count; i++) {
         free(models[i]);
         free(model_arch[i].layer_weight_mb);
+        free(model_arch[i].layer_expert_mb);   /* allocated beside layer_weight_mb */
         free(model_arch[i].head_kv_per_layer);
         free(model_arch[i].is_swa_per_layer);
     }
