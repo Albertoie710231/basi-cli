@@ -19,6 +19,7 @@
 #include "embed.h"
 #include "srvgen.h"    /* spawn/kill the embedder llama-server */
 #include "srvchat.h"   /* srvchat_embed — the /embedding HTTP client */
+#include "backend.h"   /* which llama-server binary to spawn */
 
 /* ── Static state ──────────────────────────────────────────────────── *
  * The retrieval embedder runs as its OWN spawned llama-server (--embedding) on a
@@ -203,8 +204,11 @@ int embed_init(void) {
     char *path = resolve_embed_model_path();
     if (!path) return -1;          /* set_err done by resolver */
 
-    const char *sbin = getenv("BASI_SERVER_BIN");
-    if (!sbin || !*sbin) sbin = "/home/alberto/llama.cpp/build_vulkan/bin/llama-server";
+    /* Follows the selected backend (honors $BASI_SERVER_BIN first). Embedding is a
+     * prefill-only workload, which is exactly where the backends differ most; and
+     * since this spawns via execvp with no shell, it works only because BASI
+     * inherits the runtime env rather than sourcing one per launch. */
+    const char *sbin = backend_active()->server_bin;
 
     char extra[128];
     snprintf(extra, sizeof extra, "--embedding --pooling %s", pooling_from_env());

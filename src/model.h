@@ -15,9 +15,19 @@ typedef struct {
     int   spec_draft_mtp;  /* 1 = launch llama-server with --spec-type draft-mtp (MTP models) */
     int   flash_attn;      /* 1 = -fa on */
     int   cpu_moe;         /* 1 = --cpu-moe (MoE: experts to RAM, attention to GPU) */
+    /* Name of the selected llama-server binary, or NULL when the BACKEND row was
+     * hidden (fewer than two declared) or untouched. Borrowed from the backend
+     * module's static list — not malloc'd, and outlives the caller. */
+    const char *backend;
 } LaunchConfig;
 
 LaunchConfig pick_model(void);
+
+/* Predicted VRAM in MB for `model_path` at ngl/ctx — the same figure the picker's
+ * MEMORY row shows (GGUF tensor walk + per-layer KV + overhead term). Returns <0 if
+ * the GGUF can't be read. Exposed so the launch path can hold the estimate up
+ * against what the GPU actually reports afterwards. ngl<0 means "all layers". */
+double basi_predict_vram_mb(const char *model_path, int ngl, int ctx);
 
 /* Scan the model search dirs for .gguf files. Fills *out with a malloc'd array
  * of malloc'd path strings (caller frees each, then the array) and returns the

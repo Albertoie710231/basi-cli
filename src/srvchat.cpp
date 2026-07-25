@@ -12,6 +12,8 @@
 
 #include "nlohmann/json.hpp"
 
+#include "backend.h"   /* which llama-server binary to spawn */
+
 using json = nlohmann::json;
 
 /* Defined in model.c. When nonzero, a caller (study_ground) has scoped a no-think
@@ -395,9 +397,7 @@ static void st_content(const char *c, void *) { fputs(c, stdout); fflush(stdout)
 static void st_reason(const char *c, void *)  { fprintf(stderr, "\033[90m%s\033[0m", c); fflush(stderr); }
 
 extern "C" void srvchat_selftest(const char *model_path, int ngl, int ctx) {
-    const char *server_bin = getenv("BASI_SERVER_BIN");
-    if (!server_bin || !*server_bin)
-        server_bin = "/home/alberto/llama.cpp/build_vulkan/bin/llama-server";
+    const char *server_bin = backend_active()->server_bin;   /* honors $BASI_SERVER_BIN */
     const int port = 8181;
 
     char extra[160] = "--jinja --reasoning-format auto";

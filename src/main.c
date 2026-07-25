@@ -20,6 +20,7 @@
 #include <fcntl.h>
 #include <stdarg.h>
 #include <limits.h>
+#include <math.h>
 #include <sys/utsname.h>
 #include <sys/ioctl.h>
 
@@ -47,6 +48,10 @@
 #include "slashmenu.h"
 #include "srvgen.h"
 #include "srvchat.h"
+#include "backend.h"
+#include "helpparse.h"
+#include "hwinfo.h"    /* hw_probe — live VRAM, to check the estimate against reality */
+#include "vramobs.h"
 
 /* MAX_TOKENS, CONTEXT_SIZE → globals.h */
 #define MAX_FILE_TOKENS     2000
@@ -1408,12 +1413,24 @@ static void save_default_model(const char *path, int ngl, int ctx) {
     fprintf(f, "%s\n", path);
     if (ngl >= 0) fprintf(f, "ngl=%d\n", ngl);
     if (ctx >  0) fprintf(f, "ctx=%d\n", ctx);
+    /* The selected llama-server binary. This line is the whole reason backend
+       selection is a feature rather than a script edit: a hand-edited launch script
+       is honored, but /model regenerates it and the edit is lost. Only an EXPLICIT
+       choice is written, so an implicit default or a one-off $BASI_SERVER_BIN never
+       becomes sticky. */
+    const char *bsel = backend_selected_name();
+    if (bsel && *bsel) fprintf(f, "backend=%s\n", bsel);
     fclose(f);
 }
 
 /* Load the saved default into path_out (+ optional ngl/ctx). Returns true only
  * if a model was recorded AND still exists on disk (a deleted model falls
- * through to the next resolution step rather than failing the launch). */
+ * through to the next resolution step rather than failing the launch).
+ * Side effect: applies a saved `backend=` via backend_select() regardless of the
+ * return value — the backend choice is independent of whether that particular
+ * model still exists, so a deleted model must not silently reset it to Vulkan.
+ * An unknown name is ignored by backend_select, so a stale line can't break a
+ * launch. */
 static bool load_default_model(char *path_out, size_t n, int *ngl, int *ctx) {
     char dir[512]; default_model_dir(dir, sizeof dir);
     char file[600]; snprintf(file, sizeof file, "%s/default-model", dir);
@@ -1427,6 +1444,7 @@ static bool load_default_model(char *path_out, size_t n, int *ngl, int *ctx) {
         if (!line[0]) continue;
         if (strncmp(line, "ngl=", 4) == 0)      { if (ngl) *ngl = atoi(line + 4); }
         else if (strncmp(line, "ctx=", 4) == 0) { if (ctx) *ctx = atoi(line + 4); }
+        else if (strncmp(line, "backend=", 8) == 0) backend_select(line + 8);
         else if (!path_out[0])                   snprintf(path_out, n, "%s", line);
     }
     fclose(f);
@@ -3642,6 +3660,8 @@ int main(int argc, char **argv) {
             picker_spec   = cfg.spec_draft_mtp;
             picker_fa     = cfg.flash_attn;
             picker_cpumoe = cfg.cpu_moe;
+            /* Before the save: save_default_model persists whatever is selected. */
+            if (cfg.backend) backend_select(cfg.backend);
             save_default_model(model_path, n_gpu_layers, cfg.ctx_size);
         }
     }
@@ -3677,6 +3697,7 @@ int main(int argc, char **argv) {
         picker_spec  = cfg.spec_draft_mtp;
         picker_fa    = cfg.flash_attn;
         picker_cpumoe = cfg.cpu_moe;
+        if (cfg.backend) backend_select(cfg.backend);
         /* An explicit pick always (re)writes the default — including repairing a
            stale file that pointed at a since-deleted model. */
         save_default_model(model_path, n_gpu_layers, cfg.ctx_size);
@@ -3731,8 +3752,7 @@ int main(int argc, char **argv) {
        ANSWERS from the tool result — proving the message serialization + id
        pairing template correctly server-side. */
     if (getenv("BASI_SRV_CHAT_MSGTEST") && model_path) {
-        const char *sbin = getenv("BASI_SERVER_BIN");
-        if (!sbin || !*sbin) sbin = "/home/alberto/llama.cpp/build_vulkan/bin/llama-server";
+        const char *sbin = backend_active()->server_bin;   /* honors $BASI_SERVER_BIN */
         int n; const BasiToolDef *defs = basi_tool_defs(&n); basi_set_tools(defs, n);
         pid_t pid = srvgen_spawn(sbin, model_path, n_gpu_layers, 4096,
                                  "--jinja --reasoning-format auto", 8181, "/tmp/basi_srvgen.log", 300);
@@ -3776,8 +3796,11 @@ int main(int argc, char **argv) {
 
     /* Spawn the llama-server that holds the weights + does generation. */
     if (use_server) {
-        const char *sbin = getenv("BASI_SERVER_BIN");
-        if (!sbin || !*sbin) sbin = "/home/alberto/llama.cpp/build_vulkan/bin/llama-server";
+        /* The selected llama-server binary (+ its per-binary default flags).
+           Resolution order lives in backend_active(): $BASI_SERVER_BIN, then
+           $BASI_BACKEND, then the picker/saved choice, then Vulkan. */
+        const Backend *bk   = backend_active();
+        const char    *sbin = bk->server_bin;
         int spec_nmax = 1;
         { const char *e = getenv("BASI_SPEC_NMAX"); if (e && *e) spec_nmax = atoi(e); }
         int srv_ctx = ctx_override > 0 ? ctx_override : CONTEXT_SIZE;
@@ -3843,8 +3866,9 @@ int main(int argc, char **argv) {
 
         /* "How to run llama-server for this model" IS the config now, so BASI keeps
            it as a standalone, editable script (.basi/run-llama-server.sh) and execs
-           it. Reuse the user's script when it targets THIS model (respecting edits);
-           regenerate when it's missing or for a different model (e.g. after /model). */
+           it. Reuse the user's script when it targets THIS model AND THIS backend
+           (respecting edits); regenerate when it's missing, for a different model
+           (e.g. after /model), or for a different binary (after a backend switch). */
         const char *script = ".basi/run-llama-server.sh";
         /* best-of-N needs one slot per sampled candidate (the server caps `n` at
            the slot count), so the launch script must be generated with -np N. */
@@ -3856,9 +3880,18 @@ int main(int argc, char **argv) {
             .spec_type = spec_type, .spec_nmax = spec_nmax,
             .flash_attn = fa_on, .cpu_moe = cpu_moe_on, .jinja = 1, .reasoning_format = "auto",
             .n_parallel = srv_slots,
+            .backend_name = bk->name, .extra_flags = bk->extra_flags,
         };
-        if (srvgen_script_matches(script, model_path)) {
+        if (srvgen_script_matches(script, model_path) &&
+            srvgen_script_backend_matches(script, bk->name)) {
             fprintf(stderr, "\033[90m[server mode] using launch script %s (edit it to change flags)\033[0m\n", script);
+            /* An unmarked script (hand-written, or from before backend selection) is
+               honored rather than overwritten — but say so when it runs a different
+               binary than the one selected, instead of letting the menu look broken. */
+            if (!srvgen_script_uses_bin(script, sbin))
+                fprintf(stderr, "\033[33m[backend] %s does not run the selected '%s' (%s); "
+                        "the script wins. Delete it to regenerate.\033[0m\n",
+                        script, bk->name, sbin);
             /* A hand-edited or pre-best-of-N script may not request the slots.
                llama-server's default (-np auto) often allocates enough anyway, so
                this is a heads-up, not a verdict: if auto lands below N the server
@@ -3872,11 +3905,132 @@ int main(int argc, char **argv) {
             if (srvgen_write_launch_script(&L, script) == 0)
                 fprintf(stderr, "\033[90m[server mode] wrote launch script %s\033[0m\n", script);
         }
+        /* Preflight the binary before spawning it. The launch script is a plain exec
+           with no env prelude — BASI inherits the environment rather than sourcing a
+           toolchain — so a SYCL build launched from a shell without oneAPI dies in the
+           dynamic loader. `--version` reproduces that failure in ~50ms and hands back
+           the loader's own message, instead of the user getting "failed to start" and
+           a log file to go read. Skipped when the script runs some other binary (a
+           hand-edited script is honored, and was already reported above). */
+        if (srvgen_script_uses_bin(script, sbin)) {
+            char berr[400];
+            if (backend_probe(bk, berr, sizeof berr) != 0) {
+                fprintf(stderr, "\033[1;31mError: backend '%s' cannot run in this environment.\033[0m\n",
+                        bk->name);
+                fprintf(stderr, "  %s\n", berr);
+                const char *hint = backend_probe_hint(bk, berr);
+                if (*hint) fprintf(stderr, "  Fix:  %s\n", hint);
+                int nb; const Backend *bl = backend_list(&nb);
+                if (nb > 1) {
+                    fprintf(stderr, "  Or:   choose another backend in /model  (declared:");
+                    for (int i = 0; i < nb; i++) fprintf(stderr, " %s", bl[i].name);
+                    fprintf(stderr, ")\n");
+                }
+                return 1;
+            }
+
+            /* Does this build actually accept the flags we composed? Different
+               binaries can be different llama.cpp vintages, and an unknown flag
+               makes llama-server exit during startup — naming it here beats
+               "failed to start, see the log". A WARNING, never a refusal: this
+               reads help TEXT, and a parser miss must not block a valid launch
+               (if the flag really is unsupported, the spawn below fails anyway
+               and this line explains it). */
+            char *unknown[6] = {0};
+            int nu = helpspec_check_script(script, sbin, unknown, 6);
+            if (nu > 0) {
+                fprintf(stderr, "\033[33m[backend] '%s' does not list", bk->name);
+                for (int i = 0; i < nu && i < 6; i++)
+                    fprintf(stderr, " %s", unknown[i] ? unknown[i] : "?");
+                if (nu > 6) fprintf(stderr, " (+%d more)", nu - 6);
+                fprintf(stderr, " in its --help. If the server exits at startup, "
+                                "that is why — edit %s.\033[0m\n", script);
+            }
+            for (int i = 0; i < nu && i < 6; i++) free(unknown[i]);
+        }
+        /* ── VRAM: estimate vs reality ──────────────────────────────────────
+           The picker's estimate errs high (its overhead term charges ~1.2 GB more
+           than the real compute buffer on a dense 7B), so BASI records what each
+           model ACTUALLY used and, once it has a measurement, says up front when
+           the truth is more than 1 GB away from the estimate — while reconfiguring
+           is still cheap, i.e. before the weights load. */
+        /* Use the -ngl/-c the SCRIPT will run with, not the ones we were invoked
+           with: reuse is keyed on model+backend, so a reused or hand-edited script
+           keeps its own values and silently wins. Predicting from the requested
+           numbers would describe a server that isn't running — and would record the
+           observation under the wrong key. */
+        int eff_ngl = n_gpu_layers, eff_ctx = srv_ctx;
+        srvgen_script_params(script, &eff_ngl, &eff_ctx);
+        if (eff_ngl != n_gpu_layers || eff_ctx != srv_ctx)
+            fprintf(stderr, "\033[33m[server mode] %s runs -ngl %d -c %d, overriding the "
+                            "requested -ngl %d -c %d (the script wins; delete it to "
+                            "regenerate)\033[0m\n",
+                    script, eff_ngl, eff_ctx, n_gpu_layers, srv_ctx);
+
+        double vram_pred = basi_predict_vram_mb(model_path, eff_ngl, eff_ctx);
+        HwInfo vram_before = hw_probe();
+        if (vram_pred > 0) {
+            int measured = 0;
+            double corrected = vramobs_correct(model_path, eff_ngl, eff_ctx,
+                                               vram_pred, &measured);
+            double diff = corrected - vram_pred;
+            if (fabs(diff) > 1024.0) {
+                fprintf(stderr,
+                        "\033[33m[vram] this model last used \033[1m%.1f GB\033[0m\033[33m here, "
+                        "but the estimate says %.1f GB — %.1f GB %s than expected.\033[0m\n",
+                        corrected / 1024.0, vram_pred / 1024.0, fabs(diff) / 1024.0,
+                        diff < 0 ? "LESS" : "MORE");
+                if (vram_before.has_gpu && vram_before.vram_budget_known)
+                    fprintf(stderr, "\033[33m       %.1f GB is free right now.%s\033[0m\n",
+                            vram_before.vram_avail_mb / 1024.0,
+                            diff < 0 ? "  You could raise -ngl or -c."
+                                     : "  Consider lowering -ngl or -c.");
+                /* Only ASK when there is someone to answer: a one-shot run, a pipe
+                   or the factory harness must never block on a prompt. */
+                if (isatty(STDIN_FILENO) && !oneshot && !no_tools) {
+                    fprintf(stderr, "\033[33m       Continue with this configuration? [Y/n] \033[0m");
+                    fflush(stderr);
+                    char resp[16] = {0};
+                    if (fgets(resp, sizeof resp, stdin) && (resp[0] == 'n' || resp[0] == 'N')) {
+                        fprintf(stderr, "\033[90m[vram] stopped. Run `basi --pick` or /model "
+                                        "to change the configuration.\033[0m\n");
+                        return 0;
+                    }
+                }
+            }
+        }
+
         fprintf(stderr, "\033[90m[server mode] spawning llama-server (holds the weights)…\033[0m\n");
         g_srv_pid = srvgen_spawn_script(script, 8181, "/tmp/basi_srvgen.log", 300);
         if (g_srv_pid < 0) {
             fprintf(stderr, "Error: llama-server failed to start (see /tmp/basi_srvgen.log and %s)\n", script);
+            /* The likeliest cause of a load-time death is not fitting, so report the
+               two numbers that show it. The server is gone by now, so its VRAM is
+               already released — there is no delta left to measure, only this. */
+            if (vram_pred > 0 && vram_before.has_gpu && vram_before.vram_budget_known)
+                fprintf(stderr, "       Estimated need %.1f GB; %.1f GB was free at launch. "
+                                "If it ran out, lower -ngl or -c (currently -ngl %d -c %d).\n",
+                        vram_pred / 1024.0, vram_before.vram_avail_mb / 1024.0,
+                        eff_ngl, eff_ctx);
             return 1;
+        }
+
+        /* The server is up and its buffers are reserved, so this is the real number.
+           Recorded even when it matches, because an observation is what lets the next
+           launch (and the picker) stop guessing. */
+        if (vram_pred > 0 && vram_before.has_gpu && vram_before.vram_budget_known) {
+            HwInfo vram_after = hw_probe();
+            if (vram_after.has_gpu && vram_after.vram_budget_known &&
+                vram_after.vram_avail_mb < vram_before.vram_avail_mb) {
+                double used = (double) (vram_before.vram_avail_mb - vram_after.vram_avail_mb);
+                double err  = used - vram_pred;
+                vramobs_record(model_path, eff_ngl, eff_ctx, vram_pred, used);
+                if (fabs(err) > 1024.0)
+                    fprintf(stderr, "\033[90m[vram] measured %.1f GB (estimate %.1f GB, "
+                                    "%.1f GB %s) — recorded for next time\033[0m\n",
+                            used / 1024.0, vram_pred / 1024.0, fabs(err) / 1024.0,
+                            err < 0 ? "less" : "more");
+            }
         }
         atexit(kill_srv);
         basi_srv_port      = 8181;

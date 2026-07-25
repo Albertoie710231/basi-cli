@@ -43,6 +43,13 @@ typedef struct {
      * 2048 per slot and silently rejects any longer prompt. */
     int         n_parallel;       /* 0/1 = omit (single slot, no best-of-N) */
     const char *reasoning_format; /* --reasoning-format (e.g. "auto"); NULL = omit */
+    /* The selected llama-server binary's name and its per-binary default flags
+     * (e.g. "-b 2048 -ub 2048" for SYCL, where ubatch is the prefill lever).
+     * backend_name is recorded in the script as a "# BASI-BACKEND:" marker so a
+     * backend switch invalidates script reuse — without it, switching binaries on
+     * an unchanged model would silently re-run the old script. NULL = omit. */
+    const char *backend_name;
+    const char *extra_flags;
 } SrvLaunch;
 
 /* Write a standalone, runnable llama-server launch script to `path` (creating the
@@ -54,6 +61,26 @@ int srvgen_write_launch_script(const SrvLaunch *cfg, const char *path);
 /* If `path` exists and its "# BASI-MODEL:" marker equals model_path, return 1
  * (reuse the user's script as-is); else 0 (missing / stale / different model). */
 int srvgen_script_matches(const char *path, const char *model_path);
+
+/* Same, for the "# BASI-BACKEND:" marker. Reuse must be gated on model AND
+ * backend: the model marker alone would let a backend switch reuse a script that
+ * still names the old binary, so the switch would appear to do nothing.
+ * A script with no backend marker (hand-written, or predating this) counts as a
+ * match for the default backend, so existing scripts keep being honored. */
+int srvgen_script_backend_matches(const char *path, const char *backend_name);
+
+/* 1 if `path`'s exec line references `server_bin`. Lets a reused script that was
+ * hand-edited to a different binary be reported rather than silently obeyed. */
+int srvgen_script_uses_bin(const char *path, const char *server_bin);
+
+/* Read the -ngl / -c the script will ACTUALLY run with (each left untouched if
+ * absent). Returns 1 if the script was readable.
+ *
+ * Needed because script reuse is keyed on model+backend, so a reused or hand-edited
+ * script keeps its own -ngl/-c and silently overrides the ones BASI was invoked
+ * with. Anything reasoning about memory must use these, not the requested values,
+ * or it describes a server that isn't running. */
+int srvgen_script_params(const char *path, int *ngl, int *ctx);
 
 /* 1 if `path` launches with at least `need` slots AND --kv-unified — i.e. it can
  * serve best-of-`need`. Used to warn instead of letting every turn 400 when a

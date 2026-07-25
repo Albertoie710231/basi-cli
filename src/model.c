@@ -23,6 +23,8 @@
 #include "srvgen.h"
 #include "srvchat.h"
 #include "bestof.h"
+#include "backend.h"   /* the BACKEND row's candidates */
+#include "vramobs.h"   /* measured VRAM, when this model has launched before */
 
 
 /* ── Spinner frames ────────────────────────────────────────────────── */
@@ -818,6 +820,24 @@ static bool arch_prefers_cpu_moe(GGUFArch arch) {
     return arch.n_experts > 0 && arch.layer_expert_mb != NULL;
 }
 
+double basi_predict_vram_mb(const char *model_path, int ngl, int ctx) {
+    if (!model_path || !*model_path) return -1.0;
+    GGUFArch a = read_gguf_arch(model_path);
+    double result = -1.0;
+    if (a.n_layers > 0) {
+        /* ngl<0 (or the conventional 99) means every layer; estimate_memory clamps. */
+        int eff = ngl < 0 ? a.n_layers : ngl;
+        MemorySplit ms = estimate_memory(file_size_mb(model_path), a, eff, ctx,
+                                         arch_prefers_cpu_moe(a));
+        result = ms.vram_mb;
+    }
+    free(a.layer_weight_mb);
+    free(a.layer_expert_mb);
+    free(a.head_kv_per_layer);
+    free(a.is_swa_per_layer);
+    return result;
+}
+
 /* VRAM freed by a just-exited model (e.g. after a /model re-exec) can lag in the
  * driver's live budget for a few hundred ms. Sample the probe until the free
  * figure stops climbing (or a short timeout), so the picker's VRAM math reflects
@@ -842,7 +862,7 @@ static HwInfo hw_probe_settled(void) {
  * Returns filled LaunchConfig, or model_path=NULL on cancel.
  */
 LaunchConfig pick_model(void) {
-    LaunchConfig cfg = { NULL, 99, CONTEXT_SIZE, 0.4f, 0, 0, 0 };
+    LaunchConfig cfg = { NULL, 99, CONTEXT_SIZE, 0.4f, 0, 0, 0, NULL };
 
     /* Build search dirs */
     init_model_search_dirs();
@@ -887,8 +907,19 @@ LaunchConfig pick_model(void) {
 
     /* Menu state */
     enum { SECTION_MODEL, SECTION_GPU, SECTION_CTX, SECTION_TEMP,
-           SECTION_SPEC, SECTION_FA, SECTION_LAUNCH, SECTION_COUNT };
+           SECTION_SPEC, SECTION_FA, SECTION_BACKEND, SECTION_LAUNCH, SECTION_COUNT };
     int section = SECTION_MODEL;
+
+    /* Which llama-server binary to run — the one field of the composed command line
+     * this menu never used to offer. Candidates are declared by the user; with fewer
+     * than two there is nothing to choose, so the row is hidden entirely. Start on
+     * whatever is currently in effect (saved choice, else the Vulkan default). */
+    int n_backends = 0;
+    const Backend *backends = backend_list(&n_backends);
+    int backend_sel = 0;
+    for (int i = 0; i < n_backends; i++)
+        if (strcmp(backends[i].name, backend_active()->name) == 0) { backend_sel = i; break; }
+    const bool show_backend = (n_backends > 1);
     int model_sel = 0;
     int gpu_setting = GPU_LAYER_AUTO;  /* -1 = auto, else absolute layer count */
     int ctx_val = CTX_DEFAULT;     /* free slider value */
@@ -1000,6 +1031,15 @@ LaunchConfig pick_model(void) {
             MemorySplit ms = estimate_memory(model_size_mb[model_sel],
                                              model_arch[model_sel],
                                              gpu_effective, ctx_val, cpu_moe);
+            /* Prefer what this model ACTUALLY used last time it launched at this
+               config. Display only — auto_fit_layers deliberately keeps budgeting
+               against the raw estimate, because the estimate errs high and that
+               slack absorbs allocations it doesn't model (a bigger ubatch costs
+               hundreds of MiB of compute buffer). Fitting to a measured-tight
+               number could start OOMing. */
+            int vram_measured = 0;
+            ms.vram_mb = vramobs_correct(models[model_sel], gpu_effective, ctx_val,
+                                         ms.vram_mb, &vram_measured);
             bool fits_gpu = hw.has_gpu && ms.vram_mb <= vram_usable_mb;
             bool spilling = ms.ram_mb > 0.5;  /* anything not on GPU */
 
@@ -1011,9 +1051,10 @@ LaunchConfig pick_model(void) {
 
             printf("    \033[90mMEMORY        \033[0m");
             if (hw.has_gpu) {
-                printf("%s[%s %.1f / %.1f GB]\033[0m  ",
+                printf("%s[%s %.1f / %.1f GB]\033[0m%s  ",
                        gpu_color, hw_vendor_label(hw.vendor_id),
-                       ms.vram_mb / 1024.0, vram_usable_mb / 1024.0);
+                       ms.vram_mb / 1024.0, vram_usable_mb / 1024.0,
+                       vram_measured ? " \033[32mmeasured\033[0m" : "");
             } else {
                 printf("\033[90m[no GPU detected]\033[0m  ");
             }
@@ -1055,6 +1096,19 @@ LaunchConfig pick_model(void) {
         if (section == SECTION_FA) printf("  \033[90m← →\033[0m");
         printf("\033[0m\n");
 
+        /* BACKEND: which llama-server binary the generated script execs. The extra
+           flags come from the backend config, so show them — they are part of the
+           command this menu is composing. */
+        if (show_backend) {
+            printf("%s BACKEND       \033[1m%s\033[0m",
+                   section == SECTION_BACKEND ? "\033[1;33m▸" : "  \033[90m",
+                   backends[backend_sel].name);
+            if (backends[backend_sel].extra_flags[0])
+                printf("  \033[36m%s\033[0m", backends[backend_sel].extra_flags);
+            if (section == SECTION_BACKEND) printf("  \033[90m← →\033[0m");
+            printf("\033[0m\n");
+        }
+
         printf("\n");
 
         /* Launch button */
@@ -1092,10 +1146,12 @@ LaunchConfig pick_model(void) {
                 cfg.temperature = temp_opts[temp_idx];
                 cfg.spec_draft_mtp = spec_on;
                 cfg.flash_attn = fa_on;
+                cfg.backend = show_backend ? backends[backend_sel].name : NULL;
                 break;
             } else {
                 /* Enter on setting goes to next section */
                 section++;
+                if (section == SECTION_BACKEND && !show_backend) section = SECTION_LAUNCH;
             }
             continue;
         }
@@ -1106,11 +1162,18 @@ LaunchConfig pick_model(void) {
                 switch (seq[1]) {
                 case 'A': /* Up */
                     if (section == SECTION_MODEL && model_sel > 0) model_sel--;
-                    else if (section > SECTION_MODEL) section--;
+                    else if (section > SECTION_MODEL) {
+                        section--;
+                        /* Never land on the hidden BACKEND row. */
+                        if (section == SECTION_BACKEND && !show_backend) section--;
+                    }
                     break;
                 case 'B': /* Down */
                     if (section == SECTION_MODEL && model_sel < count - 1) model_sel++;
-                    else if (section < SECTION_LAUNCH) section++;
+                    else if (section < SECTION_LAUNCH) {
+                        section++;
+                        if (section == SECTION_BACKEND && !show_backend) section++;
+                    }
                     break;
                 case 'C': /* Right */
                     if (section == SECTION_GPU) {
@@ -1127,6 +1190,7 @@ LaunchConfig pick_model(void) {
                     if (section == SECTION_TEMP && temp_idx < N_TEMP_OPTS - 1) temp_idx++;
                     if (section == SECTION_SPEC && cur_mtp) { spec_on = 1; spec_touched = 1; }
                     if (section == SECTION_FA) { fa_on = 1; fa_touched = 1; }
+                    if (section == SECTION_BACKEND && backend_sel < n_backends - 1) backend_sel++;
                     break;
                 case 'D': /* Left */
                     if (section == SECTION_GPU && gpu_setting > GPU_LAYER_AUTO) gpu_setting--;
@@ -1137,6 +1201,7 @@ LaunchConfig pick_model(void) {
                     if (section == SECTION_TEMP && temp_idx > 0) temp_idx--;
                     if (section == SECTION_SPEC) { spec_on = 0; spec_touched = 1; }
                     if (section == SECTION_FA) { fa_on = 0; fa_touched = 1; }
+                    if (section == SECTION_BACKEND && backend_sel > 0) backend_sel--;
                     break;
                 }
             }
