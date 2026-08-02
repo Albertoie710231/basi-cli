@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 #include <strings.h>
 #include <math.h>
 #include <regex.h>
@@ -1492,6 +1493,32 @@ char *execute_study_write(const char *body) {
  * command's PREFIX, which means nothing if the command can chain a second one. */
 static const char *arm_forbidden_chars = ";&|`$><\n";
 
+/* `env VAR=1 /path/to/tool …` is the canonical way to make two arms differ, and
+ * the divergence guard explicitly recommends "a flag, an env var, or separate
+ * build outputs". Authorising on the literal `env` prefix would be wrong twice
+ * over: it rejects that advice when `env` is absent from allow_commands, and it
+ * authorises *any* program when `env` is present. So step over `env` and its
+ * VAR=VALUE assignments and authorise the real program instead. */
+static const char *arm_skip_env_prefix(const char *cmd) {
+    const char *p = cmd;
+    while (*p == ' ' || *p == '\t') p++;
+    /* An optional `env` keyword, then any number of NAME=VALUE assignments.
+     * Both `env VAR=1 prog` and the bare shell form `VAR=1 prog` occur in
+     * practice — the loop has emitted each — so accept either. */
+    if (strncmp(p, "env", 3) == 0 && (p[3] == ' ' || p[3] == '\t')) p += 3;
+    for (;;) {
+        while (*p == ' ' || *p == '\t') p++;
+        const char *t = p;
+        if (!(isalpha((unsigned char)*t) || *t == '_')) break;   /* not a NAME */
+        while (isalnum((unsigned char)*t) || *t == '_') t++;
+        if (*t != '=') break;                                    /* not an assignment */
+        p = t;
+        while (*p && *p != ' ' && *p != '\t') p++;               /* skip =VALUE */
+    }
+    while (*p == ' ' || *p == '\t') p++;
+    return *p ? p : cmd;
+}
+
 static bool arm_command_allowed(const char *cmd, const char *allow_csv, char *why, size_t whysz) {
     for (const char *c = cmd; *c; c++) {
         if (strchr(arm_forbidden_chars, *c)) {
@@ -1507,6 +1534,7 @@ static bool arm_command_allowed(const char *cmd, const char *allow_csv, char *wh
             "command can be authorised");
         return false;
     }
+    const char *prog = arm_skip_env_prefix(cmd);
     const char *p = allow_csv;
     while (*p) {
         while (*p == ' ' || *p == ',') p++;
@@ -1516,12 +1544,60 @@ static bool arm_command_allowed(const char *cmd, const char *allow_csv, char *wh
         while (n && (p[n-1] == ' ' || p[n-1] == '\t')) n--;
         /* The prefix must end on a word boundary, or `./bench.sh` would also
          * authorise `./bench.sh.evil` — a different program entirely. */
-        if (n && strncmp(cmd, p, n) == 0 &&
-            (cmd[n] == '\0' || cmd[n] == ' ' || cmd[n] == '\t')) return true;
+        if (n && strncmp(prog, p, n) == 0 &&
+            (prog[n] == '\0' || prog[n] == ' ' || prog[n] == '\t')) return true;
         p = e;
     }
     snprintf(why, whysz, "does not start with any prefix in allow_commands: %s", allow_csv);
     return false;
+}
+
+/* A well-formed study that names a file which is not on this machine is not a
+ * study: every run fails, the decision rule cannot fire, and the round is spent.
+ * Catch it at design time — where the loop can still retry with a legible
+ * reason — instead of at run time as five identical rc=1 failures.
+ *
+ * Deliberately narrow to keep false positives at zero: the program itself, and
+ * the operand of -m/--model. Output paths and yet-to-be-built artifacts are not
+ * checked, because those legitimately do not exist yet. */
+static bool arm_paths_exist(const char *cmd, char *why, size_t whysz) {
+    const char *prog = arm_skip_env_prefix(cmd);
+    char tok[1024];
+    const char *e = prog;
+    while (*e && *e != ' ' && *e != '\t') e++;
+    size_t n = (size_t)(e - prog);
+    if (n && n < sizeof(tok)) {
+        memcpy(tok, prog, n); tok[n] = '\0';
+        if (strchr(tok, '/') && access(tok, X_OK) != 0) {
+            snprintf(why, whysz, "the program '%.150s' does not exist on this machine", tok);
+            return false;
+        }
+    }
+    for (const char *p = e; *p; ) {
+        while (*p == ' ' || *p == '\t') p++;
+        if (!*p) break;
+        const char *t = p;
+        while (*t && *t != ' ' && *t != '\t') t++;
+        size_t tn = (size_t)(t - p);
+        bool is_m = (tn == 2 && strncmp(p, "-m", 2) == 0) ||
+                    (tn == 7 && strncmp(p, "--model", 7) == 0);
+        p = t;
+        if (!is_m) continue;
+        while (*p == ' ' || *p == '\t') p++;
+        const char *v = p;
+        while (*p && *p != ' ' && *p != '\t') p++;
+        size_t vn = (size_t)(p - v);
+        if (vn && vn < sizeof(tok)) {
+            memcpy(tok, v, vn); tok[vn] = '\0';
+            if (access(tok, R_OK) != 0) {
+                snprintf(why, whysz,
+                    "the model file '%.150s' does not exist on this machine; "
+                    "name a path that is actually present", tok);
+                return false;
+            }
+        }
+    }
+    return true;
 }
 
 /* Pull the artifact out of the model's reply.
@@ -2208,6 +2284,12 @@ static char *propose_artifact(const StudyLoopOpts *opts, const char *user_msg,
                             arms[i].name, why, arms[i].command);
                         sb_append_str(&gb, line);
                         fputs(line, stderr);
+                    } else if (!arm_paths_exist(arms[i].command, why, sizeof(why))) {
+                        snprintf(line, sizeof(line),
+                            "- arm '%s' cannot run: %s\n  command: %s\n",
+                            arms[i].name, why, arms[i].command);
+                        sb_append_str(&gb, line);
+                        fputs(line, stderr);
                     }
                     free(arms[i].name); free(arms[i].command);
                 }
@@ -2291,6 +2373,15 @@ static bool summarize_study(const char *slug, TrajFinding *out) {
             if (out->other != 0.0)
                 out->effect_pct = (out->best - out->other) / out->other * 100.0;
         }
+    }
+
+    /* A parsable "substituted:" line is NOT evidence that anything ran: a study
+     * whose every run failed still prints "mean(B) = 0 < mean(A) = 0", which was
+     * being ranked as "no gain (0 vs 0)" — a confident negative from zero data.
+     * When the runner says it could not apply the rule, there is no measurement. */
+    if (strstr(c, "The rule was not applied")) {
+        out->measured   = false;
+        out->effect_pct = 0.0;
     }
 
     snprintf(out->verdict, sizeof(out->verdict), "%s",
@@ -2655,8 +2746,18 @@ static void study_rank_synthesis(StringBuf *log, TrajFinding *finds, int nfind) 
                  finds[i].p, finds[i].what, finds[i].slug);
         sb_append_str(log, rl);
     }
-    if (!shown)
-        sb_append_str(log, "Nothing beat the baseline. The measured negatives:\n\n");
+    if (!shown) {
+        /* "Nothing beat the baseline" claims an experiment happened. If not one
+         * arm produced a number, nothing was tested and saying otherwise turns a
+         * broken run into a fabricated negative result. */
+        int any_measured = 0;
+        for (int i = 0; i < nfind; i++) if (finds[i].measured) any_measured = 1;
+        sb_append_str(log, any_measured
+            ? "Nothing beat the baseline. The measured negatives:\n\n"
+            : "NOTHING WAS MEASURED — every study failed to produce a usable number,\n"
+              "so this is not a negative result, it is a broken run. Fix the commands\n"
+              "below and re-run before concluding anything:\n\n");
+    }
 
     /* Negative results are results. A knob that provably does nothing is worth
      * as much as one that works — it stops the next person retrying it — so
