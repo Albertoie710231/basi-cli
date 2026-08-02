@@ -148,7 +148,7 @@ static void chat_on_content(const char *chunk, void *ud) {
  * res.prompt_tokens carries the server's exact prompt count for ctx accounting. */
 GenerateResult generate_chat(const BasiMsg *messages, size_t msg_count,
                              BasiToolCall **tc_out, int *n_tc_out) {
-    GenerateResult res = { NULL, 0, 0, 0, 0.0, 0.0, 0.0 };
+    GenerateResult res = { NULL, 0, 0, 0, 0.0, 0.0, 0.0, 0, 0 };
     if (tc_out) *tc_out = NULL;
     if (n_tc_out) *n_tc_out = 0;
 
@@ -274,8 +274,10 @@ single_sample:
     if (!generate_quiet) { printf("\033[0m\n"); fflush(stdout); }
 
     res.text          = strdup(answer);
-    res.prompt_tokens = (size_t) r->prompt_tokens;
-    res.gen_tokens    = (size_t) r->completion_tokens;
+    res.prompt_tokens    = (size_t) r->prompt_tokens;
+    res.gen_tokens       = (size_t) r->completion_tokens;
+    res.cached_tokens    = (size_t) r->cached_tokens;
+    res.reasoning_tokens = (size_t) r->reasoning_tokens;
     res.gen_time_s    = (r->tps > 0) ? r->completion_tokens / r->tps : (time_now() - t0);
     /* Prefill time comes straight from the server's own clock. The old form,
        prompt_tokens/prompt_tps, divided the whole prompt by a rate measured over

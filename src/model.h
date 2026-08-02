@@ -48,6 +48,9 @@ typedef struct {
                              on a cache hit. Pair it with prompt_n, never prompt_tokens. */
     double prompt_tps;    /* server's prefill rate, over prompt_n */
     double gen_time_s;
+    size_t cached_tokens; /* subset of prompt_tokens served from the provider's prompt
+                             cache (hosted APIs bill these at a discount). 0 locally. */
+    size_t reasoning_tokens; /* thinking tokens, already inside gen_tokens. 0 locally. */
 } GenerateResult;
 
 /* Server-backed generation: when basi_srv_port>0, generate() delegates to a

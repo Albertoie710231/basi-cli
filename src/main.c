@@ -1461,6 +1461,98 @@ static bool default_model_file_exists(void) {
     return access(file, F_OK) == 0;
 }
 
+/* ── Hosted (remote) OpenAI-compatible endpoints ─────────────────────────────
+ * BASI already talks to llama-server over /v1/chat/completions, so pointing it at
+ * a hosted provider is a URL + a bearer token + an explicit model id. This table
+ * is a convenience only: `--api https://host/v1` works for anything not listed.
+ * No model defaults — a wrong model id fails as an opaque provider 404, so the id
+ * is always the caller's to state. */
+typedef struct {
+    const char *name;
+    const char *base_url;
+    const char *key_env;      /* provider's conventional key variable */
+    const char *model_hint;   /* shown when no model id was given */
+} ApiProvider;
+
+static const ApiProvider API_PROVIDERS[] = {
+    { "fireworks",  "https://api.fireworks.ai/inference/v1", "FIREWORKS_API_KEY",
+      "accounts/fireworks/models/kimi-k3" },
+    { "openai",     "https://api.openai.com/v1",             "OPENAI_API_KEY",     "gpt-4.1" },
+    { "openrouter", "https://openrouter.ai/api/v1",          "OPENROUTER_API_KEY", "openai/gpt-4.1" },
+    { "together",   "https://api.together.xyz/v1",           "TOGETHER_API_KEY",
+      "moonshotai/Kimi-K2-Instruct" },
+    { "groq",       "https://api.groq.com/openai/v1",        "GROQ_API_KEY",       "llama-3.3-70b-versatile" },
+    { "deepseek",   "https://api.deepseek.com/v1",           "DEEPSEEK_API_KEY",   "deepseek-chat" },
+    { "mistral",    "https://api.mistral.ai/v1",             "MISTRAL_API_KEY",    "mistral-large-latest" },
+    { "cerebras",   "https://api.cerebras.ai/v1",            "CEREBRAS_API_KEY",   "llama-3.3-70b" },
+};
+static const int N_API_PROVIDERS = (int) (sizeof API_PROVIDERS / sizeof API_PROVIDERS[0]);
+
+static const ApiProvider *api_provider_by_name(const char *n) {
+    if (!n) return NULL;
+    for (int i = 0; i < N_API_PROVIDERS; i++)
+        if (strcasecmp(n, API_PROVIDERS[i].name) == 0) return &API_PROVIDERS[i];
+    return NULL;
+}
+
+static void api_list_providers(FILE *f) {
+    fprintf(f, "  known providers:");
+    for (int i = 0; i < N_API_PROVIDERS; i++) fprintf(f, " %s", API_PROVIDERS[i].name);
+    fprintf(f, "\n  (or pass a full base URL, e.g. --api https://my-host/v1)\n");
+}
+
+/* Configure srvchat's remote endpoint from --api/--api-model plus the environment.
+ * Precedence, highest first: CLI flag, BASI_API_* , the provider's own key var.
+ *
+ * Returns 1 when a remote is now active, 0 when none was requested, -1 on a
+ * request that could not be satisfied (already reported to stderr). */
+static int api_setup_remote(const char *cli_api, const char *cli_api_model) {
+    const char *sel = cli_api;
+    if (!sel || !*sel) sel = getenv("BASI_API");
+    const char *base_env = getenv("BASI_API_BASE");
+    if ((!sel || !*sel) && base_env && *base_env) sel = base_env;
+    if (!sel || !*sel) return 0;                       /* no remote requested */
+
+    const ApiProvider *pv = api_provider_by_name(sel);
+    const char *base = NULL;
+    if (pv)                                       base = pv->base_url;
+    else if (strncmp(sel, "http://", 7) == 0 ||
+             strncmp(sel, "https://", 8) == 0)    base = sel;
+    else {
+        fprintf(stderr, "\033[1;31mError: unknown API provider '%s'.\033[0m\n", sel);
+        api_list_providers(stderr);
+        return -1;
+    }
+    if (base_env && *base_env) base = base_env;        /* explicit base always wins */
+
+    const char *model = cli_api_model;
+    if (!model || !*model) model = getenv("BASI_API_MODEL");
+    if (!model || !*model) {
+        fprintf(stderr, "\033[1;31mError: --api %s needs a model id.\033[0m\n", sel);
+        fprintf(stderr, "  Pass --api-model <id> or set BASI_API_MODEL.\n");
+        if (pv && pv->model_hint)
+            fprintf(stderr, "  For %s that looks like: --api-model %s\n", pv->name, pv->model_hint);
+        return -1;
+    }
+
+    /* BASI_API_KEY is the generic override; otherwise use the provider's own
+       conventional variable, which is what its docs tell you to export. */
+    const char *key = getenv("BASI_API_KEY");
+    if ((!key || !*key) && pv) key = getenv(pv->key_env);
+    if (!key || !*key) {
+        fprintf(stderr, "\033[1;31mError: no API key in the environment.\033[0m\n");
+        if (pv) fprintf(stderr, "  export %s=...   (or BASI_API_KEY=...)\n", pv->key_env);
+        else    fprintf(stderr, "  export BASI_API_KEY=...\n");
+        return -1;
+    }
+
+    if (srvchat_set_remote(base, key, model) != 0) {
+        fprintf(stderr, "\033[1;31mError: could not configure the API endpoint (base='%s').\033[0m\n", base);
+        return -1;
+    }
+    return 1;
+}
+
 /* ── CLI argument parsing ──────────────────────────────────────────── */
 
 typedef struct {
@@ -1480,6 +1572,8 @@ typedef struct {
     const char *resume_path;        /* --resume: reload this session file, skip picker */
     const char *tool_subset;        /* --tools a,b,c: hard-scope the active tool set (factory phase) */
     bool        pick;               /* --pick: force the model picker (used by /model) */
+    const char *api;                /* --api <provider|base-url>: hosted endpoint, no local server */
+    const char *api_model;          /* --api-model <id>: the model id to send to that endpoint */
     bool        want_exit;          /* -h/--help: caller should return exit_code */
     int         exit_code;
 } Cli;
@@ -1491,7 +1585,8 @@ static Cli parse_args(int argc, char **argv) {
         .system_override = NULL, .cli_ctx = 0, .cli_temp = -1.0f,
         .cli_top_k = 0, .cli_top_p = 1.0f,
         .cli_seed = BASI_DEFAULT_SEED, .bypass = false, .resume_path = NULL,
-        .pick = false, .want_exit = false, .exit_code = 0,
+        .pick = false, .api = NULL, .api_model = NULL,
+        .want_exit = false, .exit_code = 0,
     };
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-m") == 0 && i + 1 < argc) {
@@ -1531,6 +1626,10 @@ static Cli parse_args(int argc, char **argv) {
             c.tool_subset = argv[++i];   /* factory: hard-scope this phase's tools */
         } else if (strcmp(argv[i], "--pick") == 0) {
             c.pick = true;
+        } else if (strcmp(argv[i], "--api") == 0 && i + 1 < argc) {
+            c.api = argv[++i];         /* provider name, or a full base URL */
+        } else if (strcmp(argv[i], "--api-model") == 0 && i + 1 < argc) {
+            c.api_model = argv[++i];
         } else if ((strcmp(argv[i], "-s") == 0 || strcmp(argv[i], "--system") == 0)
                    && i + 1 < argc) {
             c.system_override = argv[++i];
@@ -1561,14 +1660,38 @@ static Cli parse_args(int argc, char **argv) {
                    "                  code/dirs you trust.\n"
                    "  --deepsearch    Run multi-round deep research (web + KB) non-interactively, then exit\n"
                    "  --resume <file> Reload a session file and skip the picker (used by /model)\n"
+                   "  --api <who>     Use a hosted OpenAI-compatible API instead of a local\n"
+                   "                  llama-server. <who> is a provider name or a full base URL.\n"
+                   "                  Needs --api-model; reads the key from the environment.\n"
+                   "  --api-model <id>  Model id to send to that endpoint.\n"
                    "  -d              Debug mode (verbose tool output)\n"
                    "  -h              Show this help\n\n"
                    "Model selection:\n"
                    "  With no -m, BASI uses the saved default (set by the first-run picker or\n"
                    "  the in-chat /model command), then $BASI_MODEL, then the picker. So after\n"
                    "  you pick once, later launches go straight to chat; /model switches later.\n\n"
+                   "Hosted APIs (--api):\n"
+                   "  No GGUF, no VRAM fit, no spawned server — BASI is a plain HTTP client.\n"
+                   "  Providers: fireworks openai openrouter together groq deepseek mistral cerebras\n"
+                   "  Example:\n"
+                   "    export FIREWORKS_API_KEY=...\n"
+                   "    basi --api fireworks --api-model accounts/fireworks/models/kimi-k3\n"
+                   "  Only the CHAT model moves; embeddings (RAG/compaction) stay local.\n\n"
                    "Environment:\n"
                    "  BASI_MODEL             Fallback model path if -m and no saved default\n"
+                   "  BASI_API               Same as --api (provider name or base URL)\n"
+                   "  BASI_API_MODEL         Same as --api-model\n"
+                   "  BASI_API_BASE          Override the base URL for the selected provider\n"
+                   "  BASI_API_KEY           Bearer token; else the provider's own var\n"
+                   "                         (FIREWORKS_API_KEY, OPENAI_API_KEY, …)\n"
+                   "  BASI_API_CTX           Context budget for --api (default 131072).\n"
+                   "                         Set it to the model's real window, e.g. 1000000.\n"
+                   "  BASI_API_EXTRA_JSON    JSON object merged into every request body, for\n"
+                   "                         provider-specific knobs, e.g. '{\"top_k\":40}'\n"
+                   "  BASI_API_PRICE_IN      USD per 1M prompt tokens   \\  from your provider's\n"
+                   "  BASI_API_PRICE_OUT     USD per 1M output tokens    | pricing page; enables\n"
+                   "  BASI_API_PRICE_CACHED  USD per 1M cached prompt    /  cost in /cost and\n"
+                   "                         tokens (default: same as _IN)  the per-turn line\n"
                    "  BASI_DEEPSEARCH_ROUNDS Max deep-research rounds (default 5)\n"
                    "  BASI_DEEPSEARCH_CTX    Deep-research context size (default 32768; lower for\n"
                    "                         interactive /deepsearch on a single GPU)\n\n");
@@ -1695,6 +1818,82 @@ static int basi_srv_ctx_total = 0;
 
 static int context_used_tokens(void) {
     return basi_srv_ctx_used;
+}
+
+/* ── Spend accounting (hosted APIs) ──────────────────────────────────────────
+ * Cost = token counts × a price the USER declares. There is deliberately NO
+ * built-in price table: provider prices change, vary per model, and differ by
+ * region and tier — a stale hardcoded number would report a confident WRONG
+ * figure, which is worse than reporting none. With no prices set, /cost shows
+ * tokens and says how to turn them into money.
+ *
+ * Prices are USD per 1M tokens:
+ *   BASI_API_PRICE_IN      prompt tokens that missed the provider's cache
+ *   BASI_API_PRICE_OUT     completion tokens (reasoning tokens are inside these)
+ *   BASI_API_PRICE_CACHED  prompt tokens served from that cache; defaults to
+ *                          PRICE_IN, so an undeclared discount never UNDERSTATES
+ *
+ * Summing every turn's prompt_tokens is not double counting: a hosted API is
+ * stateless, so each turn really does resend — and pay for — the whole
+ * conversation. That is why cost grows quadratically over a long session, and
+ * why the per-turn figure is worth seeing. */
+static double price_in = 0, price_out = 0, price_cached = 0;
+static bool   pricing_known = false;
+
+static size_t session_cached_tokens = 0, session_reasoning_tokens = 0;
+static double session_cost_usd = 0.0, last_turn_cost_usd = 0.0;
+
+static void pricing_init(void) {
+    const char *i = getenv("BASI_API_PRICE_IN");
+    const char *o = getenv("BASI_API_PRICE_OUT");
+    const char *c = getenv("BASI_API_PRICE_CACHED");
+    bool have_in = (i && *i), have_out = (o && *o);
+    if (have_in)  price_in  = atof(i);
+    if (have_out) price_out = atof(o);
+    price_cached = (c && *c) ? atof(c) : price_in;   /* no declared discount → full price */
+    pricing_known = (have_in || have_out);
+}
+
+/* Bill one turn. prompt_tokens INCLUDES cached, so the two are priced apart
+ * rather than summed. Returns this turn's cost (0 when no prices are declared). */
+static double cost_add_turn(size_t prompt_tokens, size_t cached, size_t gen) {
+    session_cached_tokens += cached;
+    if (!pricing_known) return 0.0;
+    if (cached > prompt_tokens) cached = prompt_tokens;   /* defensive: never negative fresh */
+    size_t fresh = prompt_tokens - cached;
+    double c = (fresh  / 1e6) * price_in
+             + (cached / 1e6) * price_cached
+             + (gen    / 1e6) * price_out;
+    session_cost_usd  += c;
+    last_turn_cost_usd = c;
+    return c;
+}
+
+/* Money, at a readable precision for figures that are often sub-cent. */
+static void fmt_usd(char *buf, size_t n, double usd) {
+    if (usd >= 1.0)        snprintf(buf, n, "$%.2f", usd);
+    else if (usd >= 0.01)  snprintf(buf, n, "$%.3f", usd);
+    else                   snprintf(buf, n, "$%.5f", usd);
+}
+
+/* End-of-run accounting. Goes to stderr so --no-tools keeps stdout to the
+ * completion alone (its contract for scripting), and is skipped entirely on a
+ * local server, where none of this costs anything. */
+static void print_session_spend(size_t prompt_tokens, size_t gen_tokens) {
+    if (!srvchat_remote_active() || (!prompt_tokens && !gen_tokens)) return;
+    fprintf(stderr, "\033[90m[usage] %zu in", prompt_tokens);
+    if (session_cached_tokens)    fprintf(stderr, " (%zu cached)", session_cached_tokens);
+    fprintf(stderr, " + %zu out", gen_tokens);
+    if (session_reasoning_tokens) fprintf(stderr, " (%zu reasoning)", session_reasoning_tokens);
+    fprintf(stderr, " = %zu tokens", prompt_tokens + gen_tokens);
+    if (pricing_known) {
+        char s[24]; fmt_usd(s, sizeof s, session_cost_usd);
+        fprintf(stderr, "  \033[0m\033[1m%s\033[0m", s);
+    } else {
+        fprintf(stderr, "  \033[0m\033[90m(set BASI_API_PRICE_IN / BASI_API_PRICE_OUT "
+                        "for cost)");
+    }
+    fprintf(stderr, "\033[0m\n");
 }
 
 /* Compact human token count: "830", "12.3k", "131k". */
@@ -2686,11 +2885,28 @@ static void handle_slash_command(char *user_input,
                 printf("\033[90m[Session: %zu prompt tokens, %zu generated tokens, %zu total]\033[0m\n",
                        session_prompt_tokens, session_gen_tokens,
                        session_prompt_tokens + session_gen_tokens);
+                if (session_cached_tokens || session_reasoning_tokens)
+                    printf("\033[90m[         of which %zu prompt tokens cached, "
+                           "%zu generated tokens were reasoning]\033[0m\n",
+                           session_cached_tokens, session_reasoning_tokens);
                 int used  = context_used_tokens();
                 int total = basi_srv_ctx_total;
                 int pct   = total > 0 ? (int)((100.0 * used) / total) : 0;
                 printf("\033[90m[Context: %d/%d tokens in window (%d%%), %d free]\033[0m\n",
                        used, total, pct, total - used);
+                /* Spend. Only meaningful against a paid endpoint, so the hint that
+                   explains how to get it is only shown there. */
+                if (pricing_known) {
+                    char s[24]; fmt_usd(s, sizeof s, session_cost_usd);
+                    printf("\033[90m[Spend:   %s  (in $%.2f", s, price_in);
+                    if (price_cached != price_in) printf(", cached $%.2f", price_cached);
+                    printf(", out $%.2f per 1M tokens)]\033[0m\n", price_out);
+                } else if (srvchat_remote_active()) {
+                    printf("\033[90m[Spend:   no prices set — export BASI_API_PRICE_IN "
+                           "and BASI_API_PRICE_OUT\n"
+                           "          (USD per 1M tokens, from your provider's pricing "
+                           "page) to see cost here]\033[0m\n");
+                }
                 fflush(stdout);
                 free(user_input);
                 return;
@@ -3311,6 +3527,9 @@ static void run_agentic_turn(char *user_input,
             reset_sigint_handler();
             session_prompt_tokens += result.prompt_tokens;
             session_gen_tokens    += result.gen_tokens;
+            session_reasoning_tokens += result.reasoning_tokens;
+            double turn_usd = cost_add_turn(result.prompt_tokens,
+                                            result.cached_tokens, result.gen_tokens);
 
             /* Performance metrics */
             /* The server's own prefill rate (over the tokens it actually evaluated).
@@ -3322,8 +3541,18 @@ static void run_agentic_turn(char *user_input,
                 ? result.gen_tokens / result.gen_time_s : 0;
             char meter[80];
             format_context_meter(meter, sizeof meter);
-            printf("\033[90m[ Prompt: %.1f t/s | Generation: %.1f t/s | %s ]\033[0m\n",
-                   prompt_tps, gen_tps, meter);
+            /* Cost per turn AND running total: on a stateless API the per-turn
+               figure climbs as the history grows, and only seeing both makes that
+               visible while the session is still short enough to act on. */
+            char cost_note[64] = "";
+            if (pricing_known) {
+                char t[24], s[24];
+                fmt_usd(t, sizeof t, turn_usd);
+                fmt_usd(s, sizeof s, session_cost_usd);
+                snprintf(cost_note, sizeof cost_note, " | %s turn, %s total", t, s);
+            }
+            printf("\033[90m[ Prompt: %.1f t/s | Generation: %.1f t/s | %s%s ]\033[0m\n",
+                   prompt_tps, gen_tps, meter, cost_note);
             fflush(stdout);
             statusbar_draw();   /* refresh the pinned ctx meter after this turn */
 
@@ -3525,12 +3754,22 @@ static void run_agentic_turn(char *user_input,
             reset_sigint_handler();
             session_prompt_tokens += final_result.prompt_tokens;
             session_gen_tokens    += final_result.gen_tokens;
+            session_reasoning_tokens += final_result.reasoning_tokens;
+            double final_usd = cost_add_turn(final_result.prompt_tokens,
+                                             final_result.cached_tokens, final_result.gen_tokens);
 
             double gen_tps = final_result.gen_time_s > 0
                 ? final_result.gen_tokens / final_result.gen_time_s : 0;
             char meter[80];
             format_context_meter(meter, sizeof meter);
-            printf("\033[90m[ Generation: %.1f t/s | %s ]\033[0m\n", gen_tps, meter);
+            char fcost[64] = "";
+            if (pricing_known) {
+                char t[24], s[24];
+                fmt_usd(t, sizeof t, final_usd);
+                fmt_usd(s, sizeof s, session_cost_usd);
+                snprintf(fcost, sizeof fcost, " | %s turn, %s total", t, s);
+            }
+            printf("\033[90m[ Generation: %.1f t/s | %s%s ]\033[0m\n", gen_tps, meter, fcost);
             fflush(stdout);
             statusbar_draw();   /* refresh the pinned ctx meter after this turn */
 
@@ -3563,6 +3802,14 @@ int main(int argc, char **argv) {
 
     /* `basi-cli study ...`: the discovery loop runs without loading a model —
      * executing an experiment and applying its decision rule is deterministic. */
+    if (argc >= 2 && (strcmp(argv[1], "study") == 0 ||
+                      strcmp(argv[1], "factory") == 0)) {
+        /* These dispatch ahead of parse_args, so --api/--api-model never reach
+         * them. Honour BASI_API/BASI_API_MODEL from the environment instead so
+         * the theory/propose step can run against a hosted endpoint; without
+         * this they are hard-wired to a local llama-server. */
+        if (api_setup_remote(NULL, NULL) < 0) return 2;
+    }
     if (argc >= 2 && strcmp(argv[1], "study") == 0) {
         return cmd_study(argc - 2, argv + 2);
     }
@@ -3590,6 +3837,27 @@ int main(int argc, char **argv) {
     { const char *e = getenv("BASI_TOP_K"); if (e && cli.cli_top_k == 0) top_k = atoi(e); }
     { const char *e = getenv("BASI_TOP_P"); if (e && cli.cli_top_p == 1.0f) top_p = (float)atof(e); }
     const char *resume_path          = cli.resume_path;
+
+    /* --api <provider|url>: drive a hosted OpenAI-compatible endpoint instead of a
+       local llama-server. Resolved BEFORE the model picker, because in this mode
+       there is no GGUF to pick, no VRAM to fit and nothing to spawn — the whole
+       local-server path below is skipped. */
+    static char api_label[256];
+    const bool remote_api = (api_setup_remote(cli.api, cli.api_model) == 1);
+    if (!remote_api && (cli.api || cli.api_model || getenv("BASI_API"))) {
+        /* api_setup_remote already explained why; only a hard request is fatal. */
+        if (cli.api || getenv("BASI_API") || getenv("BASI_API_BASE")) return 1;
+    }
+    if (remote_api) {
+        /* The rest of main treats model_path as "which model is this session
+           running" — for display, the session tag and the system prompt. Give it
+           the remote id, so /cost, the banner and session files all name the model
+           actually answering rather than a stale local default. */
+        snprintf(api_label, sizeof api_label, "%s", srvchat_remote_model());
+        model_path = api_label;
+        n_gpu_layers = 0;                       /* nothing is offloaded here */
+        pricing_init();                         /* tokens → money, if prices declared */
+    }
 
     /* --yolo/--bypass: auto-approve every tool action. Without it, a
      * non-interactive -p run that triggers an approval prompt reads EOF on
@@ -3711,8 +3979,10 @@ int main(int argc, char **argv) {
        drops straight into chat instead of the picker. Covers the picker pick,
        -m, and $BASI_MODEL uniformly. Seed only when no default file exists yet,
        so a one-off `-m other.gguf` never overwrites a default the user chose (via
-       the picker or /model); those paths write the file explicitly elsewhere. */
-    if (!oneshot && model_path && !loaded_from_default && !default_model_file_exists())
+       the picker or /model); those paths write the file explicitly elsewhere.
+       In --api mode model_path is a remote model id, not a GGUF on disk — writing
+       it as the local default would leave a path that never resolves again. */
+    if (!oneshot && model_path && !remote_api && !loaded_from_default && !default_model_file_exists())
         save_default_model(model_path, n_gpu_layers, ctx_override);
 
     /* Warm up the local SearXNG (web_search backend) while the model loads.
@@ -3782,14 +4052,39 @@ int main(int argc, char **argv) {
 
     /* In --no-tools mode stdout must carry only the completion, so load chatter
      * goes to stderr. */
-    fprintf(no_tools ? stderr : stdout, "BASI-CLI - Loading model...\n");
-    fflush(no_tools ? stderr : stdout);
+    if (!remote_api) {
+        fprintf(no_tools ? stderr : stdout, "BASI-CLI - Loading model...\n");
+        fflush(no_tools ? stderr : stdout);
+    }
 
     /* Server-backed generation only: the weights + KV + templating + tool grammar
        all live in the spawned llama-server. BASI loads NO model in-process — the
        model/vocab/ctx handles stay NULL (retained only in the signatures of
-       functions that no longer touch them). */
-    const bool use_server = true;
+       functions that no longer touch them).
+
+       --api is the same client against someone else's server: nothing to load,
+       nothing to spawn, nothing to tear down. */
+    const bool use_server = !remote_api;
+
+    if (remote_api) {
+        /* The ctx meter and the compaction trigger both budget against this. There
+           is no /props to ask as there is for a local llama-server, so: an explicit
+           -c / BASI_API_CTX wins, else ASK the provider (GET /models reports
+           context_length), else fall back. Detecting beats defaulting because the
+           real window ranges from 8k to 1M across models on the same endpoint, and
+           guessing low compacts conversations that would have been accepted whole. */
+        int rctx = cli_ctx > 0 ? cli_ctx : 0;
+        if (!rctx) { const char *e = getenv("BASI_API_CTX"); if (e && *e) rctx = atoi(e); }
+        const char *ctx_src = "declared";
+        if (rctx <= 0) {
+            rctx = srvchat_remote_context_length();
+            ctx_src = "reported by the provider";
+        }
+        if (rctx <= 0) { rctx = 131072; ctx_src = "fallback — pass -c if the model has more"; }
+        basi_srv_ctx_total = rctx;
+        fprintf(stderr, "\033[90m[api] %s  model %s  ctx %d (%s)\033[0m\n",
+                srvchat_remote_base(), srvchat_remote_model(), basi_srv_ctx_total, ctx_src);
+    }
 
     /* In one-shot deep-research shrink the server context to free VRAM. */
     if (oneshot_deepsearch_q) ctx_override = 4096;
@@ -4098,6 +4393,13 @@ int main(int argc, char **argv) {
         GenerateResult r = generate_chat(messages, msg_count, NULL, NULL);
         printf("%s\n", r.text ? r.text : "");
         fflush(stdout);
+        /* This path bypasses the agent loop's accounting, so bill it here — a
+           scripted data-gen run over a paid API is exactly where an unnoticed
+           bill accumulates. */
+        session_prompt_tokens    += r.prompt_tokens;
+        session_gen_tokens       += r.gen_tokens;
+        session_reasoning_tokens += r.reasoning_tokens;
+        cost_add_turn(r.prompt_tokens, r.cached_tokens, r.gen_tokens);
         free(r.text);
         goto cleanup;
     }
@@ -4261,6 +4563,8 @@ cleanup:
         free((void *)messages[i].content);
     free(messages);
     history_free_all();
+
+    print_session_spend(session_prompt_tokens, session_gen_tokens);
 
     /* --no-tools keeps stdout to the completion alone; no sign-off banner. */
     if (!no_tools) printf("\nGoodbye!\n");

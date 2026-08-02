@@ -2148,8 +2148,13 @@ static char *propose_artifact(const StudyLoopOpts *opts, const char *user_msg,
             if (r && r->reasoning && *r->reasoning)
                 snprintf(line, sizeof(line),
                     "loop: model produced %d tokens of reasoning but no answer (finish=%s); "
-                    "stopping. Try BASI_NO_THINK=1.\n",
-                    r->completion_tokens, r->finish_reason ? r->finish_reason : "?");
+                    "stopping. Try BASI_NO_THINK=1%s.\n",
+                    r->completion_tokens, r->finish_reason ? r->finish_reason : "?",
+                    srvchat_remote_active()
+                        ? " (on a hosted endpoint this sends reasoning_effort=none; if the "
+                          "provider ignores it, override with "
+                          "BASI_API_EXTRA_JSON='{\"reasoning_effort\":\"none\"}')"
+                        : "");
             else
                 snprintf(line, sizeof(line),
                     "loop: no response from llama-server on port %d; stopping.\n", opts->port);
@@ -3597,8 +3602,10 @@ int cmd_factory(int argc, char **argv) {
     if (maxth < 1) maxth = 1;
     if (maxth > FACTORY_MAX_THEORIES) maxth = FACTORY_MAX_THEORIES;
 
-    char hc[192]; snprintf(hc, sizeof(hc), "curl -sf -o /dev/null http://127.0.0.1:%d/health", port);
-    if (system(hc) != 0) { fprintf(stderr, "factory: no healthy llama-server on :%d (the theory step needs one).\n", port); return 1; }
+    if (!srvchat_remote_active()) {
+        char hc[192]; snprintf(hc, sizeof(hc), "curl -sf -o /dev/null http://127.0.0.1:%d/health", port);
+        if (system(hc) != 0) { fprintf(stderr, "factory: no healthy llama-server on :%d (the theory step needs one).\n", port); return 1; }
+    }
     if (repeat < 1) repeat = 1;
     if (repeat > FACTORY_MAX_REPEAT) repeat = FACTORY_MAX_REPEAT;
     regex_t re;
@@ -3818,15 +3825,17 @@ int cmd_study(int argc, char **argv) {
             fprintf(stderr, "study loop: --max-rounds must be 0..1000 (0 = until STOP)\n");
             return 2;
         }
-        char hc[192];
-        snprintf(hc, sizeof(hc),
-                 "curl -sf -o /dev/null http://127.0.0.1:%d/health", o.port);
-        if (system(hc) != 0) {
-            fprintf(stderr,
-                "study loop: no healthy llama-server on 127.0.0.1:%d.\n"
-                "The loop needs one to propose hypotheses; start it, or pass --port.\n",
-                o.port);
-            return 1;
+        if (!srvchat_remote_active()) {
+            char hc[192];
+            snprintf(hc, sizeof(hc),
+                     "curl -sf -o /dev/null http://127.0.0.1:%d/health", o.port);
+            if (system(hc) != 0) {
+                fprintf(stderr,
+                    "study loop: no healthy llama-server on 127.0.0.1:%d.\n"
+                    "The loop needs one to propose hypotheses; start it, or pass --port.\n",
+                    o.port);
+                return 1;
+            }
         }
         char *rep = study_loop(argv[1], &o);
         fputs(rep, stdout);
