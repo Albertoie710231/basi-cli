@@ -3468,6 +3468,21 @@ static void run_agentic_turn(char *user_input,
            (a phase was measured re-reading .basi/findings.md 8x without ever editing). */
         unsigned long seen_results[256];
         int n_seen_results = 0;
+
+        /* Repeat detector. The re-read dedup above is keyed on the RESULT and only
+           fires above 200 bytes, so a SHORT command that keeps failing identically
+           slips straight past it: measured 2026-08-01, an agent issued the same
+           `export LD_LIBRARY_PATH=… && llama-bench` 30+ times against the same
+           6-line error and burned its whole turn budget without ever changing
+           approach. This keys on the CALL (name+arguments) instead, and escalates:
+           warn on the 2nd identical call, stop the turn on the 5th. Repeating a
+           call that already failed cannot produce new information. */
+        unsigned long seen_calls[128];
+        unsigned long seen_calls_res[128];   /* last result hash seen for that call */
+        int           seen_calls_n[128];
+        int           n_seen_calls    = 0;
+        const int     repeat_warn     = 2;
+        const int     repeat_give_up  = 5;
         {
             const char *mi = getenv("BASI_MAX_TOOL_ITERS");
             if (mi) { int v = atoi(mi); if (v > 0 && v <= 200) max_tool_iterations = v; }
@@ -3566,6 +3581,7 @@ static void run_agentic_turn(char *user_input,
             char *call_env = NULL;         /* native: structured assistant tool-call envelope */
             char *call_name = NULL;        /* native: tool name, for the result envelope */
             bool have_call = false;
+            unsigned long call_sig = 0;    /* name+args hash, for the repeat detector */
 
             /* Structured tool calls come straight from the server (one per turn). */
             if (n_ncalls > 0) {
@@ -3581,6 +3597,9 @@ static void run_agentic_turn(char *user_input,
                 if (!tool_result) unknown_tool = strdup(nm);
                 call_name = strdup(nm);
                 call_env  = tool_call_envelope(ncalls[0].name, ncalls[0].arguments);
+                /* Signature captured here: ncalls is freed before the check below. */
+                call_sig  = tool_result_hash(nm) * 31u +
+                            tool_result_hash(ncalls[0].arguments ? ncalls[0].arguments : "");
                 have_call = true;
             }
 
@@ -3603,6 +3622,60 @@ static void run_agentic_turn(char *user_input,
                    is lossless even when the in-context copy is trimmed or later
                    elided. The model can grep it to recall anything. */
                 journal_append(call_name, tool_result);
+
+                /* Repeat detector (see seen_calls above). Keyed on the call, not the
+                   result, and with no size floor — the failure mode it exists for is a
+                   short error repeated forever. The result is kept and the warning
+                   appended, never substituted: the model still needs to see the error
+                   in order to change course. */
+                if (call_sig) {
+                    /* Re-issuing the SAME command is only a flail if it also returns the
+                       SAME answer. Repeating a benchmark or a stochastic simulation to
+                       build a sample is correct science, and an earlier version of this
+                       check killed a physics run at iteration 23/150 for doing exactly
+                       that. So escalate only when call AND result are both unchanged;
+                       a differing result means the call is still producing information,
+                       and the counter restarts. */
+                    unsigned long res_h = tool_result_hash(tool_result ? tool_result : "");
+                    int idx = -1;
+                    for (int i = 0; i < n_seen_calls; i++)
+                        if (seen_calls[i] == call_sig) { idx = i; break; }
+                    if (idx < 0) {
+                        if (n_seen_calls < (int)(sizeof(seen_calls)/sizeof(seen_calls[0]))) {
+                            seen_calls[n_seen_calls]     = call_sig;
+                            seen_calls_res[n_seen_calls] = res_h;
+                            seen_calls_n[n_seen_calls]   = 1;
+                            n_seen_calls++;
+                        }
+                    } else if (seen_calls_res[idx] != res_h) {
+                        seen_calls_res[idx] = res_h;   /* new information — not stuck */
+                        seen_calls_n[idx]   = 1;
+                    } else if (++seen_calls_n[idx] >= repeat_warn) {
+                        int c = seen_calls_n[idx];
+                        const char *body = tool_result ? tool_result : "";
+                        size_t n = strlen(body) + 400;
+                        char *w = malloc(n);
+                        if (w) {
+                            snprintf(w, n,
+                                "%s\n\n[REPEAT: you have issued this exact call %d times and "
+                                "received the SAME result each time. It will not change. Do NOT "
+                                "issue it again — change the approach, or say plainly that you "
+                                "are blocked and why.]", body, c);
+                            free(tool_result);
+                            tool_result = w;
+                        }
+                        if (c >= repeat_give_up) {
+                            printf("\033[1;31m[repeat: same call %d× — ending the turn, "
+                                   "the loop is not progressing]\033[0m\n", c);
+                            /* Exhaust the budget rather than break: the rest of this
+                               iteration still frees call_name/call_env normally. */
+                            tool_iterations = max_tool_iterations;
+                        } else {
+                            printf("\033[33m[repeat: same call %d× — nudging]\033[0m\n", c);
+                        }
+                        fflush(stdout);
+                    }
+                }
 
                 /* Re-read dedup: if this substantial result is byte-identical to one the
                    model already received this turn, re-reading it added nothing — replace
