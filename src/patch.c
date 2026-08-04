@@ -285,7 +285,7 @@ static char *reindent_line(const char *repl, const char *model_ref, const char *
 
 /* Replace one occurrence of `find` with `repl` in `cur`. Returns NULL on
  * success, else a malloc'd model-facing error. */
-static char *replace_one(StringBuf *cur, const char *find, const char *repl,
+char *patch_replace_one(StringBuf *cur, const char *find, const char *repl,
                          const char *path, int idx) {
     /* 1. exact substring (primary). */
     size_t find_len = strlen(find);
@@ -372,6 +372,11 @@ static char *replace_one(StringBuf *cur, const char *find, const char *repl,
     return NULL;
 }
 
+bool patch_block_is_noop(const char *find, const char *repl) {
+    /* An empty SEARCH means "write the whole file", which is never a no-op. */
+    return find && repl && find[0] && strcmp(find, repl) == 0;
+}
+
 char *execute_edit(const char *args) {
     ParsedEdit *p = parse_edit(args);
     if (p->error) {
@@ -397,7 +402,7 @@ char *execute_edit(const char *args) {
 
     /* Reject no-op blocks early (identical find/replace). */
     for (int i = 0; i < p->n_blocks; i++) {
-        if (p->blocks[i].find[0] && strcmp(p->blocks[i].find, p->blocks[i].repl) == 0) {
+        if (patch_block_is_noop(p->blocks[i].find, p->blocks[i].repl)) {
             char *e = malloc(256);
             snprintf(e, 256, "edit: block %d — SEARCH and REPLACE are identical; nothing to change.", i + 1);
             free_parsed_edit(p);
@@ -475,7 +480,7 @@ char *execute_edit(const char *args) {
             free_parsed_edit(p);
             return e;
         }
-        char *err = replace_one(&cur, find, repl, path, i);
+        char *err = patch_replace_one(&cur, find, repl, path, i);
         if (err) { sb_free(&cur); free_parsed_edit(p); return err; }
     }
 
