@@ -791,6 +791,58 @@ static char *read_file_window(const char *filepath, long start, long count) {
 /* djb2 hash of a tool result, for the re-read dedup: a tool call that returns bytes
    IDENTICAL to a prior result gave the model no new information, so it is a flail (a
    phase measured re-reading .basi/findings.md 8 times without ever acting). */
+/* ── Re-read overlap detection ──────────────────────────────────────────
+ * The byte-identical dedup below cannot see the shape this actually takes. A
+ * model pages a large file at shifting offsets, so every result differs by a few
+ * lines while carrying the same content again and again, and none of them ever
+ * hash alike. Measured on one hair-simulation run: 56 reads, 55 of them
+ * byte-distinct, 510 KB — 88% of everything the model was fed. That drove the
+ * context into an elision which threw away the very file it was reading, and the
+ * turn collapsed into repetition. So track LINES, not whole results.
+ *
+ * Short lines are ignored: braces, blanks and single keywords recur in every
+ * source file and would make any two of them look like the same text. */
+#define LINESEEN_SLOTS 32768u
+#define LINESEEN_MINLEN 24       /* a line long enough to identify content */
+static unsigned long g_line_seen[LINESEEN_SLOTS];
+
+static void line_seen_reset(void) { memset(g_line_seen, 0, sizeof(g_line_seen)); }
+
+/* Open-addressed set. Returns whether `h` was already present; inserts if not.
+ * A crowded neighbourhood reports "new" rather than risking a false duplicate —
+ * wrongly withholding a result the model has not seen is the worse error. */
+static bool line_seen_hit(unsigned long h) {
+    if (!h) h = 1;
+    unsigned base = (unsigned)(h % LINESEEN_SLOTS);
+    for (unsigned probe = 0; probe < 64; probe++) {
+        unsigned i = (base + probe) % LINESEEN_SLOTS;
+        if (g_line_seen[i] == h) return true;
+        if (g_line_seen[i] == 0) { g_line_seen[i] = h; return false; }
+    }
+    return false;
+}
+
+/* Fraction of this result's substantial lines the model has already been given,
+ * recording them as it goes. *n_counted receives how many such lines there were,
+ * so a caller can require a big page before acting on the ratio. */
+static double lines_already_seen(const char *s, int *n_counted) {
+    int total = 0, dup = 0;
+    for (const char *p = s; *p; ) {
+        const char *e = strchr(p, '\n');
+        size_t len = e ? (size_t)(e - p) : strlen(p);
+        if (len >= LINESEEN_MINLEN) {
+            unsigned long h = 5381;
+            for (size_t i = 0; i < len; i++) h = ((h << 5) + h) + (unsigned char)p[i];
+            total++;
+            if (line_seen_hit(h)) dup++;
+        }
+        if (!e) break;
+        p = e + 1;
+    }
+    if (n_counted) *n_counted = total;
+    return total ? (double)dup / (double)total : 0.0;
+}
+
 static unsigned long tool_result_hash(const char *s) {
     unsigned long h = 5381; int c;
     while ((c = (unsigned char)*s++)) h = ((h << 5) + h) + (unsigned long)c;
@@ -3600,17 +3652,62 @@ static void journal_append(const char *tag, const char *full_result) {
  * with a stub. Returns how many were elided. The journal holds the full text, so
  * this loses nothing the model cannot grep back. This is the compaction reclaim
  * cannot do inside a single agentic turn. */
+/* Results reach the model enveloped as {"name":"<tool>","content":...}, so the
+ * tool that produced one can be recovered from the message itself. */
+static bool envelope_tool_name(const char *c, char *out, size_t outlen) {
+    static const char *pfx = "{\"name\":\"";
+    if (!c || strncmp(c, pfx, strlen(pfx)) != 0) return false;
+    const char *p = c + strlen(pfx);
+    size_t k = 0;
+    while (*p && *p != '"' && k + 1 < outlen) {
+        if (*p == '\\' && p[1]) p++;          /* keep an escaped char, drop the slash */
+        out[k++] = *p++;
+    }
+    out[k] = '\0';
+    return k > 0;
+}
+
+/* Replace the content of tool_result messages older than the most recent `keep`
+ * with a stub. Returns how many were elided. The journal holds the full text, so
+ * this loses nothing the model cannot grep back. This is the compaction reclaim
+ * cannot do inside a single agentic turn.
+ *
+ * The stub NAMES what it replaced. A constant one cost more than it saved: eliding
+ * 77 results put 77 byte-identical sentences into the context — a block of exactly
+ * repeated text, which is its own reason for a model to start repeating itself —
+ * and stripped the model of any idea what it used to know. Told only that
+ * "something" was elided it cannot target the grep the message recommends, so it
+ * re-reads the file from scratch, refills the context, and forces the next
+ * elision. Naming the entry breaks that cycle and keeps the stubs distinct. */
 static int elide_old_tool_results(BasiMsg *messages, size_t mc, int keep) {
-    int seen = 0, elided = 0;
+    /* Journal entries are numbered in the order results were produced, so the
+     * k-th tool_result message is journal entry k. Count forwards, elide
+     * backwards, and a stub can name the exact entry to grep for. */
+    int total = 0;
+    for (size_t i = 0; i < mc; i++)
+        if (messages[i].role && strcmp(messages[i].role, "tool_result") == 0) total++;
+
+    int seen = 0, elided = 0, seq = total;
     for (size_t i = mc; i-- > 0; ) {
         const char *role = messages[i].role, *c = messages[i].content;
         if (!role || strcmp(role, "tool_result") != 0) continue;
+        int my_seq = seq--;
         if (c && strncmp(c, ELIDE_STUB_PREFIX, strlen(ELIDE_STUB_PREFIX)) == 0) continue;
         if (++seen <= keep) continue;
-        char stub[256];
-        snprintf(stub, sizeof(stub),
-            "%s — full output is in %s (grep it to recall this).]",
-            ELIDE_STUB_PREFIX, journal_path());
+
+        char name[48], stub[400];
+        size_t bytes = c ? strlen(c) : 0;
+        if (envelope_tool_name(c, name, sizeof(name)))
+            snprintf(stub, sizeof(stub),
+                "%s: entry #%d was `%s`, %zu bytes. You HAVE already seen it — do not "
+                "redo the call. To recall it: bash grep -A40 '## \\[%d\\] %s' %s]",
+                ELIDE_STUB_PREFIX, my_seq, name, bytes, my_seq, name, journal_path());
+        else
+            snprintf(stub, sizeof(stub),
+                "%s: entry #%d, %zu bytes. You HAVE already seen it — do not redo the "
+                "call. To recall it: bash grep -A40 '## \\[%d\\]' %s]",
+                ELIDE_STUB_PREFIX, my_seq, bytes, my_seq, journal_path());
+
         free((void *)messages[i].content);
         messages[i].content = strdup(stub);
         elided++;
@@ -3720,6 +3817,7 @@ static void run_agentic_turn(char *user_input,
            (a phase was measured re-reading .basi/findings.md 8x without ever editing). */
         unsigned long seen_results[256];
         int n_seen_results = 0;
+        line_seen_reset();          /* line-level view of the same, per turn */
 
         /* Repeat detector. The re-read dedup above is keyed on the RESULT and only
            fires above 200 bytes, so a SHORT command that keeps failing identically
@@ -3935,16 +4033,34 @@ static void run_agentic_turn(char *user_input,
                    re-reading one file. Journaled above first, so the log stays lossless. */
                 if (tool_result && strlen(tool_result) > 200) {
                     unsigned long h = tool_result_hash(tool_result);
-                    bool dup = false;
+                    bool exact = false;
                     for (int i = 0; i < n_seen_results; i++)
-                        if (seen_results[i] == h) { dup = true; break; }
-                    if (dup) {
+                        if (seen_results[i] == h) { exact = true; break; }
+
+                    /* Byte-identical is the easy case and the rare one. The costly
+                       case is a re-page: the same file at a shifted offset, mostly
+                       familiar, byte-distinct every time. Require a big page before
+                       judging on the ratio, so a short verification read around an
+                       edit still comes back in full — that one is legitimate. */
+                    int nlines = 0;
+                    double seen_frac = lines_already_seen(tool_result, &nlines);
+                    bool repage = (nlines >= 40 && seen_frac >= 0.85);
+
+                    if (exact || repage) {
+                        char nudge[480];
+                        snprintf(nudge, sizeof(nudge),
+                            "[%s — you already have this content. Reading it again spends context "
+                            "without adding anything, and a full context is what forces the elision "
+                            "that takes your earlier reads away. Do NOT read it again: act on what "
+                            "you know (make the edit, run the build), read a DIFFERENT file, or "
+                            "grep %s for one specific detail.]",
+                            exact ? "IDENTICAL to a result you already have"
+                                  : "NEARLY ALL of this was in an earlier result",
+                            journal_path());
                         free(tool_result);
-                        tool_result = strdup(
-                            "[IDENTICAL to a result you already have — re-reading it gives you "
-                            "nothing new. Do NOT read it again. Act on what you know: make the "
-                            "edit / run the command, or read a DIFFERENT file.]");
-                        printf("\033[33m[dedup: identical re-read — nudging toward action]\033[0m\n");
+                        tool_result = strdup(nudge);
+                        printf("\033[33m[dedup: %s re-read — nudging toward action]\033[0m\n",
+                               exact ? "identical" : "overlapping");
                         fflush(stdout);
                     } else if (n_seen_results < (int)(sizeof(seen_results)/sizeof(seen_results[0]))) {
                         seen_results[n_seen_results++] = h;
