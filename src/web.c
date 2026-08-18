@@ -89,6 +89,11 @@ static bool url_has_pdf_suffix(const char *url) {
                "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 #define WEB_MAX_REDIRECTS       5
 #define WEB_FETCH_MAX_CHARS  6000
+/* Ceiling on the text pulled out of one document before it is spilled to disk.
+   A SIGGRAPH paper runs ~50k characters, so 6000 shows the abstract and stops —
+   every method section sits past the cut. Extract the whole thing, hand back the
+   head, and leave the rest somewhere the read/grep tools can reach. */
+#define WEB_FETCH_FULL_CHARS 1500000
 #define WEB_SEARCH_MAX_RESULTS  8
 #define WEB_SEARCH_FETCH_COUNT  3     /* pages auto-fetched for a single-query call */
 #define WEB_SEARCH_FETCH_MAX    8     /* hard ceiling once sub-queries raise the budget */
@@ -537,8 +542,24 @@ WebSearchStatus web_ensure_searxng(void) {
    malloc'd content (NULL if nothing could be fetched/extracted). If
    final_url_out != NULL it receives the post-redirect URL (malloc'd; caller
    frees). Shared by execute_web_fetch and the web_search auto-fetch. */
-static char *web_fetch_extract(const char *url, int max_chars, char **final_url_out) {
+/* djb2 over the URL: a stable name for the spill file, so re-fetching the same
+   document reuses it instead of littering /tmp with copies. */
+static unsigned long url_hash(const char *s) {
+    unsigned long h = 5381;
+    for (; *s; s++) h = ((h << 5) + h) + (unsigned char)*s;
+    return h;
+}
+
+/* spill_out/full_len_out are optional. When spill_out is non-NULL and the
+   document is longer than max_chars, the FULL text is written to a file and its
+   path returned there — the caller tells the model how to read the rest. Passing
+   NULL keeps the old behaviour, which is what the search auto-fetch wants: three
+   short page summaries, not three files on disk. */
+static char *web_fetch_extract(const char *url, int max_chars, char **final_url_out,
+                               char **spill_out, size_t *full_len_out) {
     if (final_url_out) *final_url_out = NULL;
+    if (spill_out) *spill_out = NULL;
+    if (full_len_out) *full_len_out = 0;
     if (!url || !url[0]) return NULL;
 
     char *norm;
@@ -565,17 +586,38 @@ static char *web_fetch_extract(const char *url, int max_chars, char **final_url_
 
     bool is_pdf = (ctype && strcasestr(ctype, "pdf")) || url_has_pdf_suffix(final_url);
 
+    int grab = spill_out ? WEB_FETCH_FULL_CHARS : max_chars;
     char cmd[2048];
     if (is_pdf) {
         snprintf(cmd, sizeof(cmd),
             "pdftotext -enc UTF-8 '%s' - 2>/dev/null | sed '/^[[:space:]]*$/d' | head -c %d",
-            body, max_chars);
+            body, grab);
     } else {
         snprintf(cmd, sizeof(cmd),
             "w3m -dump -T text/html -cols 120 '%s' 2>/dev/null | sed '/^[[:space:]]*$/d' | head -c %d",
-            body, max_chars);
+            body, grab);
     }
-    char *content = run_command(cmd, (size_t)max_chars + 256);
+    char *content = run_command(cmd, (size_t)grab + 256);
+
+    /* Longer than the caller wants to see: keep all of it on disk, return the
+       head. Truncate on a line boundary so the visible part does not end
+       mid-sentence. */
+    if (spill_out && content && strlen(content) > (size_t)max_chars) {
+        size_t full = strlen(content);
+        char path[128];
+        snprintf(path, sizeof(path), "/tmp/basi-fetch-%08lx.txt", url_hash(url));
+        FILE *f = fopen(path, "wb");
+        if (f) {
+            fwrite(content, 1, full, f);
+            fclose(f);
+            *spill_out = strdup(path);
+            if (full_len_out) *full_len_out = full;
+        }
+        size_t cut = (size_t)max_chars;
+        while (cut > 0 && content[cut] != '\n') cut--;
+        if (cut == 0) cut = (size_t)max_chars;
+        content[cut] = '\0';
+    }
 
     /* tier-2 thin fallback for HTML: <title> + og/meta description. */
     char *fallback = NULL;
@@ -630,7 +672,7 @@ static void web_fetch_parallel(char *const *urls, int n, int max_chars, char **o
         pids[i] = fork();
         if (pids[i] == 0) {
             close(pipes[i][0]);
-            char *c = web_fetch_extract(urls[i], max_chars, NULL);
+            char *c = web_fetch_extract(urls[i], max_chars, NULL, NULL, NULL);
             if (c && c[0]) { ssize_t w = write(pipes[i][1], c, strlen(c)); (void)w; }
             close(pipes[i][1]);
             _exit(0);
@@ -974,8 +1016,9 @@ char *execute_web_search(const char *query, const char *time_filter) {
 char *execute_web_fetch(const char *url) {
     if (!url || !url[0]) return strdup("Error: web_fetch requires a URL.");
 
-    char *final_url = NULL;
-    char *content = web_fetch_extract(url, WEB_FETCH_MAX_CHARS, &final_url);
+    char *final_url = NULL, *spill = NULL;
+    size_t full_len = 0;
+    char *content = web_fetch_extract(url, WEB_FETCH_MAX_CHARS, &final_url, &spill, &full_len);
 
     StringBuf out;
     sb_init(&out);
@@ -990,6 +1033,21 @@ char *execute_web_fetch(const char *url) {
             "blocked, a private/internal address, or require JavaScript.)");
     }
 
+    /* Say plainly that this is the head of a longer document and how to get the
+       rest, in terms of tools the model already has. Silence here reads as "that
+       is the whole paper", which is how a method section gets missed. */
+    if (spill) {
+        char note[512];
+        snprintf(note, sizeof(note),
+            "\n\n[TRUNCATED] This is the first %d of %zu characters. The FULL text is saved at "
+            "%s — page through it with `read %s start=<line> count=400`, or `grep` it for a "
+            "section heading. For a paper, the method and equations are well past this point; "
+            "do not conclude from the abstract alone.\n",
+            WEB_FETCH_MAX_CHARS, full_len, spill, spill);
+        sb_append_str(&out, note);
+    }
+
+    free(spill);
     free(content);
     free(final_url);
     return sb_to_str(&out);

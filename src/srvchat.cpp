@@ -200,6 +200,25 @@ static std::string build_request(const char *messages_json, const char *tools_js
                 if (samp->repeat_last_n >= 0) req["repeat_last_n"] = samp->repeat_last_n;
             }
             if (samp->min_p >= 0) req["min_p"] = samp->min_p;
+        } else if (samp->repeat_penalty > 1.0) {
+            /* A hosted endpoint has no repeat_penalty, so until now the remote
+             * path shipped with NO repetition control at all — the very knob
+             * that took agent-loop degeneration from 4/4 runs to 0/4 locally was
+             * silently dropped for every --api run. Watched a turn collapse into
+             * "I'll write METHOD.md." repeated until the budget ran out.
+             *
+             * frequency_penalty is the OpenAI-standard equivalent, but it is a
+             * different shape: llama.cpp's is multiplicative over the last
+             * repeat_last_n tokens, this one additive over the whole context and
+             * scaling with count. Map it conservatively and cap it — a CODING
+             * agent repeats tokens for good reasons (identifiers, indentation,
+             * boilerplate), so an aggressive value would cost more than the
+             * degeneration it prevents. 1.1 lands at 0.2, enough to break a loop
+             * without taxing ordinary code. BASI_API_EXTRA_JSON is merged after
+             * this and can override or clear it. */
+            double fp = (samp->repeat_penalty - 1.0) * 2.0;
+            if (fp > 0.5) fp = 0.5;
+            req["frequency_penalty"] = fp;
         }
     }
     if (!remote) req["cache_prompt"] = true;   /* llama-server KV reuse; no remote analogue */

@@ -45,7 +45,7 @@ static const BasiToolDef TOOLS[] = {
       OBJ(STR("file", "Path to the C file") "," STR("symbol", "Top-level identifier name"), "[\"file\",\"symbol\"]") },
     { "web_search", "Search the web. Use for any current/latest/version/price/news question. Returns ranked results plus the full text of the top pages. When a question spans distinct sub-areas, cover them ALL in one call by separating up to 4 sub-queries with ' | ' — results are merged and deduplicated. Searching one sub-area, getting good results and stopping is the most common way to miss the answer.",
       OBJ(STR("query", "The search query. Up to 4 sub-queries separated by ' | ' to cover distinct sub-areas in a single call.") "," STR("recency", "Optional recency filter: day|week|month|year"), "[\"query\"]") },
-    { "web_fetch", "Fetch and extract the readable text of one web page.",
+    { "web_fetch", "Fetch and extract the readable text of one web page or PDF. Long documents (papers, specs) are truncated in the reply and the FULL text is saved to a file whose path is given at the end — read or grep that file to reach the parts past the cut, such as a paper's method and equations. Never conclude from the abstract alone.",
       OBJ(STR("url", "The URL to fetch (http/https)"), "[\"url\"]") },
     { "readfile", "Read a local document (pdf/docx/odt/epub/text). Only when the user gave a concrete path.",
       OBJ(STR("path", "Path to the local document") "," STR("regex", "Optional regex to narrow output"), "[\"path\"]") },
