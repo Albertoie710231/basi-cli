@@ -70,8 +70,37 @@ static const BasiToolDef TOOLS[] = {
       OBJ(STR("id", "Optional row id, e.g. 1.2"), "[]") },
 };
 
+/* ── Extra (dynamically discovered) tools ───────────────────────────────
+ * MCP servers are declared by the user and enumerated at startup, so their
+ * tools cannot live in the static table above. They are appended here instead
+ * of at each call site: basi_tool_defs() is the single place every consumer
+ * asks for the tool set — including the save/restore dance that deepsearch, the
+ * compaction summary and study grounding each perform — so merging here means
+ * none of them needs to know that MCP exists. */
+#define TOOLS_N ((int)(sizeof(TOOLS) / sizeof(TOOLS[0])))
+
+static BasiToolDef *merged   = NULL;   /* TOOLS ++ extras, built on registration */
+static int          merged_n = 0;
+
+void basi_tooldefs_set_extra(const BasiToolDef *defs, int n) {
+    free(merged);
+    merged = NULL;
+    merged_n = 0;
+    if (!defs || n <= 0) return;
+
+    merged = malloc(sizeof(BasiToolDef) * (size_t)(TOOLS_N + n));
+    if (!merged) return;                     /* OOM: fall back to the native set */
+    memcpy(merged, TOOLS, sizeof(TOOLS));
+    memcpy(merged + TOOLS_N, defs, sizeof(BasiToolDef) * (size_t)n);
+    merged_n = TOOLS_N + n;
+}
+
 const BasiToolDef *basi_tool_defs(int *n) {
-    if (n) *n = (int)(sizeof(TOOLS) / sizeof(TOOLS[0]));
+    if (merged) {
+        if (n) *n = merged_n;
+        return merged;
+    }
+    if (n) *n = TOOLS_N;
     return TOOLS;
 }
 

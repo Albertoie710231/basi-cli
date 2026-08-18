@@ -36,6 +36,11 @@ Type `/` for an autocomplete dropdown of every slash command:
   when a compiler (LLVM IR) or the language's own parser (AST) proves them equivalent; a **behavior
   guard** confirms a suspected regression against your test suite and hard-blocks a green→red change.
   Across C/C++/Python/Go/JS/TS. See [Reuse & behavior guards](#reuse--behavior-guards).
+- **MCP client** — BASI is an [MCP](https://modelcontextprotocol.io) host: declare servers in
+  `mcp.json` and their tools join the native set as `mcp__<server>__<tool>`, behind the same
+  approval prompt as `bash`. Both transports (stdio and Streamable HTTP) and both protocol eras
+  (the 2026-07-28 per-request-metadata revision *and* the legacy `initialize` handshake) are
+  supported, detected per server. See [MCP servers](#mcp-servers).
 - **Planning pillar** — an A3 / spike / pre-mortem plan workflow with phase-gated tools.
 - **Native chat templates** — each model is driven in its *own* chat format via llama.cpp's jinja
   engine (Qwen, Gemma, DeepSeek, custom merges…), not a one-size-fits-all fallback.
@@ -130,6 +135,88 @@ Downloads resolve against the HuggingFace API and stream in with `curl`, so ther
 
 ![cookbook search](docs/cookbook-search.png)
 
+### Hosted models (`--api`)
+
+BASI's chat path is plain `/v1/chat/completions`, so any OpenAI-compatible provider is the same
+client pointed at a different base URL — no GGUF, no VRAM fit, no spawned `llama-server`:
+
+```sh
+export FIREWORKS_API_KEY=...
+./basi-cli --api fireworks --api-model accounts/fireworks/models/deepseek-v4-flash
+```
+
+Providers: `fireworks openai openrouter together groq deepseek mistral cerebras`, or pass a full
+base URL. Only the **chat** model moves — embeddings (RAG, compaction) stay local.
+
+An explicit `--api` is **remembered**, the same way the model picker remembers a GGUF, so later
+launches need no flags at all:
+
+```sh
+./basi-cli api                                       # show the saved default
+./basi-cli api set fireworks <model-id>              # verify key + endpoint, then save
+./basi-cli api clear                                 # forget it, back to local GGUF
+./basi-cli --local                                   # ignore it for one run
+```
+
+Without this, a bare `basi` always resolves the last *local* model — which silently answers "local
+or hosted?" with whatever GGUF happened to be picked once. A saved backend takes precedence over
+`default-model`: no GGUF is resolved and no server is spawned. The API **key is never written to
+the file** — it stays in the environment.
+
+### MCP servers
+
+BASI connects to [Model Context Protocol](https://modelcontextprotocol.io) servers at startup and
+advertises their tools to the model alongside its own. Declare them in any of these (later files
+override earlier entries with the same name):
+
+| File | Scope |
+|---|---|
+| `~/.config/basi-cli/mcp.json` | you, everywhere |
+| `./.basi/mcp.json` | this project |
+| `./.mcp.json` | this project (shared convention) |
+| `--mcp-config <file>` / `BASI_MCP_CONFIG` | this run |
+
+```json
+{
+  "mcpServers": {
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "."]
+    },
+    "github": {
+      "url": "https://api.githubcopilot.com/mcp/",
+      "headers": { "Authorization": "Bearer ${GITHUB_TOKEN}" }
+    },
+    "staging-only": { "command": "./tools/mcp-server", "disabled": true }
+  }
+}
+```
+
+`${VAR}` and `${VAR:-default}` expand from the environment in every value, so a token lives in your
+shell rather than in a file you might commit. An entry with `command` speaks stdio; one with `url`
+speaks Streamable HTTP. Other keys: `args`, `env`, `cwd`, `disabled`, `timeoutMs`.
+
+Tools arrive namespaced as `mcp__<server>__<tool>` — two servers can each expose a `search` without
+colliding. **Every MCP call goes through the y/n/a approval prompt**, which shows the server and the
+exact arguments before anything leaves the machine; `--yolo` auto-approves (required for
+non-interactive `-p` runs, which otherwise auto-deny). A server's own `readOnlyHint` is shown as a
+label but never skips the prompt — it is self-reported by the thing being gated.
+
+Inspect and debug servers **without loading a model**, since connecting and calling is pure protocol:
+
+```sh
+./basi-cli mcp list                                   # connect; report era, version, tool counts
+./basi-cli mcp tools [server]                         # also list every tool
+./basi-cli mcp call mcp__fs__read_file '{"path":"x"}' # invoke one directly
+```
+
+In-session: `/mcp` for status, `/mcp tools [server]`, `/mcp reconnect [server]` to restart one after
+editing its config. `--no-mcp` (or `BASI_MCP=0`) skips MCP entirely; a `--tools` scope that names no
+`mcp__` tool skips it automatically, so hard-scoped factory phases pay nothing for it.
+
+A server that fails to start is reported and skipped — one broken entry never stops BASI launching.
+When one misbehaves, `BASI_MCP_DEBUG=1` keeps its stderr in `/tmp/basi-mcp-<name>.log`.
+
 ### Model & sampling flags
 
 These apply to every mode (interactive, `-p`, `--no-tools`, `--deepsearch`):
@@ -144,7 +231,7 @@ These apply to every mode (interactive, `-p`, `--no-tools`, `--deepsearch`):
 Explicit flags win over the model picker's chosen values. Example — reproducible CPU-only
 completion: `./basi-cli -m model.gguf -ngl 0 --seed 42 -p "..." --no-tools`.
 
-Interactive slash commands: `/help`, `/model`, `/cookbook`, `/deepsearch <q>`, `/plan`,
+Interactive slash commands: `/help`, `/model`, `/cookbook`, `/mcp`, `/deepsearch <q>`, `/plan`,
 `/premortem`, `/permissions`, `/memory`, `/note`, `/edit`, `/save`, `/clear`, `/cost`. Type `/`
 for an autocomplete dropdown (↑/↓ to pick, Tab to complete).
 
@@ -156,6 +243,11 @@ for an autocomplete dropdown (↑/↓ to pick, Tab to complete).
 | `SEARXNG_INSTANCE` | `http://localhost:8888` | SearXNG endpoint for `web_search` |
 | `SEARXNG_HOME` | `~/Documentos/searxng` | Local SearXNG to auto-launch at startup |
 | `BASI_NO_SEARXNG` | — | Set to disable the SearXNG auto-launch |
+| `BASI_MCP` | on | Set to `0` to disable MCP (same as `--no-mcp`) |
+| `BASI_MCP_CONFIG` | — | Extra MCP config file (same as `--mcp-config`) |
+| `BASI_MCP_PROBE_MS` | `5000` | Era-probe / handshake timeout per server |
+| `BASI_MCP_TIMEOUT_MS` | `60000` | Per-request timeout for MCP calls |
+| `BASI_MCP_DEBUG` | — | Set to `1` to keep each stdio server's stderr in `/tmp/basi-mcp-<name>.log` |
 | `BASI_DEEPSEARCH_ROUNDS` | `5` | Max deep-research rounds |
 | `BASI_DEEPSEARCH_CTX` | `32768` | Deep-research context size (lower for interactive `/deepsearch` on a single GPU) |
 | `BASI_REUSE_GATE` / `BASI_REUSE_AUTOFIX` / `BASI_REUSE_REGRESS` | off | Enable the reuse gate / verified autofix / behavior guard — see [Reuse & behavior guards](#reuse--behavior-guards) |

@@ -44,6 +44,7 @@
 #include "deepsearch.h"
 #include "chat_tmpl.h"
 #include "tooldefs.h"
+#include "mcp.h"
 #include "cookbook.h"
 #include "slashmenu.h"
 #include "srvgen.h"
@@ -595,6 +596,10 @@ bool debug_mode = false;
 bool bash_always_allowed = false;
 bool apply_patch_always_allowed = false;
 bool scaffold_always_allowed = false;
+/* Per-session "always" for MCP tool calls, set by answering `a` at the prompt.
+ * Deliberately NOT shared with bash_always_allowed: approving a local build
+ * command is not approving a third-party server to act on your behalf. */
+static bool mcp_always_allowed = false;
 
 PermissionMode permission_mode = PERM_DEFAULT;
 
@@ -797,6 +802,15 @@ static unsigned long tool_result_hash(const char *s) {
  * server derives the tool grammar from the registered set, so an unlisted tool can't
  * even be emitted). Returns a malloc'd array of the matched defs and sets *out_n;
  * the process keeps it alive. Unknown names are ignored. */
+/* The --tools scope in force for this session, NULL when unscoped. Kept so the
+ * tool set can be rebuilt later (an MCP server reconnect changes what exists)
+ * without widening a phase that was deliberately narrowed. */
+static const char *active_tool_subset = NULL;
+
+/* MCP was never contacted this run (--no-mcp, or a --tools scope that named no
+ * MCP tool). Distinguishes "off" from "nothing configured" in /mcp. */
+static bool mcp_skipped_this_run = false;
+
 static BasiToolDef *filter_tool_defs(const char *csv, int *out_n) {
     int n; const BasiToolDef *all = basi_tool_defs(&n);
     BasiToolDef *sub = malloc(sizeof(BasiToolDef) * (size_t)n);
@@ -819,6 +833,22 @@ static BasiToolDef *filter_tool_defs(const char *csv, int *out_n) {
     }
     *out_n = m;
     return sub;
+}
+
+/* Advertise the current tool table to the model, honouring the session's
+ * --tools scope. Called at startup and again whenever the table changes. */
+static void reregister_tools(void) {
+    static BasiToolDef *scoped = NULL;      /* freed on the next call, not leaked per reconnect */
+    int n = 0;
+    const BasiToolDef *defs = basi_tool_defs(&n);
+    BasiToolDef *fresh = NULL;
+    if (active_tool_subset && *active_tool_subset) {
+        fresh = filter_tool_defs(active_tool_subset, &n);
+        defs = fresh;
+    }
+    basi_set_tools(defs, n);                /* copies, so the array need not survive */
+    free(scoped);
+    scoped = fresh;
 }
 
 /* Truncate an oversized tool result keeping the HEAD and the TAIL — the middle
@@ -1267,9 +1297,48 @@ static char *tool_result_envelope(const char *name, const char *content) {
  * space) survives intact instead of being silently re-split (CODE_REVIEW_PLAN
  * Task 3). Returns a malloc'd result string, or NULL if `name` is not a known
  * tool (the caller then reports the unknown-tool error). */
+/* An MCP tool is code BASI did not write, running wherever its server runs, so
+ * it goes through the same y/n/a gate as bash — and the prompt shows the actual
+ * arguments, because the spec's own guidance is that the user should see a tool's
+ * inputs before the call leaves the machine (that is the moment an exfiltration
+ * attempt is visible). readOnlyHint is only a LABEL: it is self-reported by the
+ * server being gated, so trusting it to skip the prompt would be circular. */
+static char *execute_mcp_tool(const char *name, const char *args_json) {
+    bool auto_approve = (permission_mode == PERM_BYPASS) || mcp_always_allowed;
+    if (!auto_approve) {
+        const char *srv = mcp_tool_server(name);
+        int ro = mcp_tool_readonly(name);
+        char label[128];
+        snprintf(label, sizeof(label), "mcp:%s%s", srv ? srv : "?",
+                 ro == 1 ? " (server says read-only)" : "");
+
+        /* Show the call the way the model made it, truncated — a schema-shaped
+           argument blob can be arbitrarily large and this is a terminal prompt. */
+        char shown[1024];
+        snprintf(shown, sizeof(shown), "%s %.700s%s", name,
+                 args_json, strlen(args_json) > 700 ? " …" : "");
+
+        int decision = request_approval(label, shown);
+        if (decision == 0) return strdup("User denied execution.");
+        if (decision == 2) mcp_always_allowed = true;
+    }
+    return mcp_call_tool(name, args_json);
+}
+
 static char *execute_tool_native(const char *name, const char *args_json) {
     if (!name) return NULL;
     if (!args_json) args_json = "{}";
+
+    /* MCP tools first: they carry arbitrary server-defined schemas, so they must
+     * never reach basi_build_command's flattening into a command string. The
+     * phase gate still applies — a plan's drafting phase is read-only, and a tool
+     * from a third-party server is exactly the kind of side effect it blocks. */
+    if (mcp_is_tool(name)) {
+        if (!plan_tool_allowed(plan_phase, "bash"))
+            return plan_block_msg(plan_phase, name);
+        if (plan_phase == PHASE_SPIKE) spike_calls++;
+        return execute_mcp_tool(name, args_json);
+    }
 
     /* Tools dispatched directly here (parsed args → handler / escaped shell
      * command). Every other tool falls through to basi_build_command +
@@ -1461,6 +1530,66 @@ static bool default_model_file_exists(void) {
     return access(file, F_OK) == 0;
 }
 
+/* ── Persisted default BACKEND ──────────────────────────────────────────
+ * The saved default-model file answers "which GGUF", which silently assumes the
+ * answer to a prior question: local at all? Once --api exists, a bare `basi` that
+ * always lands on the last local GGUF is wrong for anyone whose everyday model is
+ * hosted — you either retype --api/--api-model on every launch or get dropped into
+ * whatever small model happened to be picked once. So the backend choice persists
+ * the same way the model does, and takes precedence: a saved API default means no
+ * GGUF is resolved, no VRAM is fitted and no llama-server is spawned.
+ * `--local` ignores it for one run; `basi-cli api clear` forgets it. */
+static bool api_ignore_saved = false;                  /* --local */
+
+static void save_default_api(const char *provider, const char *model) {
+    if (!provider || !*provider || !model || !*model) return;
+    char dir[512]; default_model_dir(dir, sizeof dir);
+    if (mkdir(dir, 0755) != 0 && errno == ENOENT) {
+        char *slash = strrchr(dir, '/');
+        if (slash) { *slash = '\0'; mkdir(dir, 0755); *slash = '/'; mkdir(dir, 0755); }
+    }
+    char file[600]; snprintf(file, sizeof file, "%s/default-api", dir);
+    FILE *f = fopen(file, "w");
+    if (!f) return;
+    /* The KEY is never written here — it stays in the environment, where a config
+       file that gets copied, backed up or committed cannot leak it. */
+    fprintf(f, "provider=%s\nmodel=%s\n", provider, model);
+    fclose(f);
+}
+
+/* Bounded copy, not snprintf("%s"): the source is a whole config line and the
+ * destinations are small fixed fields, which -Wformat-truncation rightly flags. */
+static void copy_bounded(char *dst, size_t n, const char *src) {
+    if (!n) return;
+    size_t l = strlen(src);
+    if (l >= n) l = n - 1;
+    memcpy(dst, src, l);
+    dst[l] = '\0';
+}
+
+static bool load_default_api(char *prov, size_t np, char *model, size_t nm) {
+    char dir[512]; default_model_dir(dir, sizeof dir);
+    char file[600]; snprintf(file, sizeof file, "%s/default-api", dir);
+    FILE *f = fopen(file, "r");
+    if (!f) return false;
+    prov[0] = '\0'; model[0] = '\0';
+    char line[1100];
+    while (fgets(line, sizeof line, f)) {
+        size_t l = strlen(line);
+        while (l && (line[l-1] == '\n' || line[l-1] == '\r')) line[--l] = '\0';
+        if (strncmp(line, "provider=", 9) == 0)   copy_bounded(prov,  np, line + 9);
+        else if (strncmp(line, "model=", 6) == 0) copy_bounded(model, nm, line + 6);
+    }
+    fclose(f);
+    return prov[0] && model[0];
+}
+
+static bool clear_default_api(void) {
+    char dir[512]; default_model_dir(dir, sizeof dir);
+    char file[600]; snprintf(file, sizeof file, "%s/default-api", dir);
+    return unlink(file) == 0;
+}
+
 /* ── Hosted (remote) OpenAI-compatible endpoints ─────────────────────────────
  * BASI already talks to llama-server over /v1/chat/completions, so pointing it at
  * a hosted provider is a URL + a bearer token + an explicit model id. This table
@@ -1506,11 +1635,24 @@ static void api_list_providers(FILE *f) {
  *
  * Returns 1 when a remote is now active, 0 when none was requested, -1 on a
  * request that could not be satisfied (already reported to stderr). */
+/* Nonzero once the active remote came from the saved default rather than this
+ * command line — so the banner can say so instead of looking like magic. */
+static bool api_from_saved_default = false;
+
 static int api_setup_remote(const char *cli_api, const char *cli_api_model) {
+    static char saved_prov[128], saved_model[512];
+    bool have_saved = !api_ignore_saved &&
+                      load_default_api(saved_prov, sizeof saved_prov,
+                                       saved_model, sizeof saved_model);
+
     const char *sel = cli_api;
     if (!sel || !*sel) sel = getenv("BASI_API");
     const char *base_env = getenv("BASI_API_BASE");
     if ((!sel || !*sel) && base_env && *base_env) sel = base_env;
+    if ((!sel || !*sel) && have_saved) {                /* the persisted choice */
+        sel = saved_prov;
+        api_from_saved_default = true;
+    }
     if (!sel || !*sel) return 0;                       /* no remote requested */
 
     const ApiProvider *pv = api_provider_by_name(sel);
@@ -1527,6 +1669,10 @@ static int api_setup_remote(const char *cli_api, const char *cli_api_model) {
 
     const char *model = cli_api_model;
     if (!model || !*model) model = getenv("BASI_API_MODEL");
+    /* A saved model only applies to the provider it was saved for — reusing one
+       provider's model id against another endpoint would 404 at the first turn. */
+    if ((!model || !*model) && have_saved && strcmp(sel, saved_prov) == 0)
+        model = saved_model;
     if (!model || !*model) {
         fprintf(stderr, "\033[1;31mError: --api %s needs a model id.\033[0m\n", sel);
         fprintf(stderr, "  Pass --api-model <id> or set BASI_API_MODEL.\n");
@@ -1550,6 +1696,11 @@ static int api_setup_remote(const char *cli_api, const char *cli_api_model) {
         fprintf(stderr, "\033[1;31mError: could not configure the API endpoint (base='%s').\033[0m\n", base);
         return -1;
     }
+    /* An explicit --api on the command line is a deliberate choice, so remember
+       it — the same rule the model picker follows. Env vars and the saved default
+       itself are NOT persisted: BASI_API is for scoping one shell, and rewriting
+       the file from itself would just churn it. */
+    if (cli_api && *cli_api) save_default_api(sel, model);
     return 1;
 }
 
@@ -1574,6 +1725,8 @@ typedef struct {
     bool        pick;               /* --pick: force the model picker (used by /model) */
     const char *api;                /* --api <provider|base-url>: hosted endpoint, no local server */
     const char *api_model;          /* --api-model <id>: the model id to send to that endpoint */
+    const char *mcp_config;         /* --mcp-config <file>: extra MCP server config, applied last */
+    bool        no_mcp;             /* --no-mcp: skip MCP entirely for this run */
     bool        want_exit;          /* -h/--help: caller should return exit_code */
     int         exit_code;
 } Cli;
@@ -1586,6 +1739,7 @@ static Cli parse_args(int argc, char **argv) {
         .cli_top_k = 0, .cli_top_p = 1.0f,
         .cli_seed = BASI_DEFAULT_SEED, .bypass = false, .resume_path = NULL,
         .pick = false, .api = NULL, .api_model = NULL,
+        .mcp_config = NULL, .no_mcp = false,
         .want_exit = false, .exit_code = 0,
     };
     for (int i = 1; i < argc; i++) {
@@ -1630,6 +1784,12 @@ static Cli parse_args(int argc, char **argv) {
             c.api = argv[++i];         /* provider name, or a full base URL */
         } else if (strcmp(argv[i], "--api-model") == 0 && i + 1 < argc) {
             c.api_model = argv[++i];
+        } else if (strcmp(argv[i], "--mcp-config") == 0 && i + 1 < argc) {
+            c.mcp_config = argv[++i];
+        } else if (strcmp(argv[i], "--no-mcp") == 0) {
+            c.no_mcp = true;
+        } else if (strcmp(argv[i], "--local") == 0) {
+            api_ignore_saved = true;    /* ignore a saved API default this run */
         } else if ((strcmp(argv[i], "-s") == 0 || strcmp(argv[i], "--system") == 0)
                    && i + 1 < argc) {
             c.system_override = argv[++i];
@@ -1664,6 +1824,13 @@ static Cli parse_args(int argc, char **argv) {
                    "                  llama-server. <who> is a provider name or a full base URL.\n"
                    "                  Needs --api-model; reads the key from the environment.\n"
                    "  --api-model <id>  Model id to send to that endpoint.\n"
+                   "                  An explicit --api is REMEMBERED: later launches use it with\n"
+                   "                  no flags. `--local` ignores it for one run; `basi-cli api clear`\n"
+                   "                  forgets it; `basi-cli api` shows it.\n"
+                   "  --local         Ignore the saved API default and use a local GGUF this run\n"
+                   "  --mcp-config <f>  Extra MCP server config file, applied after the standard\n"
+                   "                  ones (~/.config/basi-cli/mcp.json, ./.basi/mcp.json, ./.mcp.json)\n"
+                   "  --no-mcp        Do not connect to any MCP server this run\n"
                    "  -d              Debug mode (verbose tool output)\n"
                    "  -h              Show this help\n\n"
                    "Model selection:\n"
@@ -1677,6 +1844,12 @@ static Cli parse_args(int argc, char **argv) {
                    "    export FIREWORKS_API_KEY=...\n"
                    "    basi --api fireworks --api-model accounts/fireworks/models/kimi-k3\n"
                    "  Only the CHAT model moves; embeddings (RAG/compaction) stay local.\n\n"
+                   "MCP (Model Context Protocol):\n"
+                   "  Servers declared in mcp.json are connected at startup and their tools are\n"
+                   "  advertised to the model as mcp__<server>__<tool>, gated by the same y/n/a\n"
+                   "  approval prompt as bash. `/mcp` shows status; `/mcp tools` lists them.\n"
+                   "  Both transports are supported: stdio (\"command\"/\"args\") and Streamable\n"
+                   "  HTTP (\"url\"/\"headers\"). ${VAR} in any value expands from the environment.\n\n"
                    "Environment:\n"
                    "  BASI_MODEL             Fallback model path if -m and no saved default\n"
                    "  BASI_API               Same as --api (provider name or base URL)\n"
@@ -1692,6 +1865,11 @@ static Cli parse_args(int argc, char **argv) {
                    "  BASI_API_PRICE_OUT     USD per 1M output tokens    | pricing page; enables\n"
                    "  BASI_API_PRICE_CACHED  USD per 1M cached prompt    /  cost in /cost and\n"
                    "                         tokens (default: same as _IN)  the per-turn line\n"
+                   "  BASI_MCP=0             Disable MCP (same as --no-mcp)\n"
+                   "  BASI_MCP_CONFIG        Extra MCP config file (same as --mcp-config)\n"
+                   "  BASI_MCP_PROBE_MS      Era-probe/handshake timeout per server (default 5000)\n"
+                   "  BASI_MCP_TIMEOUT_MS    Per-request timeout for MCP calls (default 60000)\n"
+                   "  BASI_MCP_DEBUG=1       Keep each stdio server's stderr in /tmp/basi-mcp-<name>.log\n"
                    "  BASI_DEEPSEARCH_ROUNDS Max deep-research rounds (default 5)\n"
                    "  BASI_DEEPSEARCH_CTX    Deep-research context size (default 32768; lower for\n"
                    "                         interactive /deepsearch on a single GPU)\n\n");
@@ -2856,6 +3034,8 @@ static void handle_slash_command(char *user_input,
                     "                        others covered; findings ranked by measured effect\n"
                     "  /model [name]         switch model (no arg: picker; name: match; keeps your chat)\n"
                     "  /cookbook [sub]       download & manage models (list | search | get <repo> | rm)\n"
+                    "  /mcp [tools|reconnect [server]]\n"
+                    "                        MCP servers: status, the tools they expose, or restart one\n"
                     "\n"
                     "Subcommands (run before model load):\n"
                     "  basi-cli docs add <file.md> [--shelf=notes|pinned|docs]\n"
@@ -2866,7 +3046,8 @@ static void handle_slash_command(char *user_input,
                     "  docs_toc, docs_get, docs_search, docs_recent_notes,\n"
                     "  docs_vector_search,\n"
                     "  plan_write (drafting/premortem), assumptions (drafting),\n"
-                    "  spike_write (spike), plan_verify (active).\n\n");
+                    "  spike_write (spike), plan_verify (active),\n"
+                    "  plus every tool your MCP servers expose (see /mcp).\n\n");
                 fflush(stdout);
                 free(user_input);
                 return;
@@ -2908,6 +3089,42 @@ static void handle_slash_command(char *user_input,
                            "page) to see cost here]\033[0m\n");
                 }
                 fflush(stdout);
+                free(user_input);
+                return;
+            }
+            if (strncmp(user_input, "/mcp", 4) == 0 &&
+                (user_input[4] == '\0' || user_input[4] == ' ')) {
+                const char *arg = user_input + 4;
+                while (*arg == ' ') arg++;
+                char *out = NULL;
+                if (mcp_skipped_this_run) {
+                    printf("\n\033[90m[MCP was not started this run "
+                           "(--no-mcp, or a --tools scope naming no MCP tool)]\033[0m\n\n");
+                    fflush(stdout);
+                    free(user_input);
+                    return;
+                }
+                if (strncmp(arg, "reconnect", 9) == 0) {
+                    const char *who = arg + 9;
+                    while (*who == ' ') who++;
+                    out = mcp_reconnect(*who ? who : NULL);
+                } else if (strncmp(arg, "tools", 5) == 0) {
+                    const char *who = arg + 5;
+                    while (*who == ' ') who++;
+                    out = mcp_status_report(1, *who ? who : NULL);
+                } else {
+                    out = mcp_status_report(0, *arg ? arg : NULL);
+                }
+                /* A reconnect can add or drop tools; what the model is shown next
+                   turn has to match, still inside this session's --tools scope. */
+                reregister_tools();
+                printf("\n%s", out ? out : "");
+                if (mcp_configured())
+                    printf("\033[90m/mcp tools [server]   list the tools\n"
+                           "/mcp reconnect [server]   restart and re-list\033[0m\n");
+                printf("\n");
+                fflush(stdout);
+                free(out);
                 free(user_input);
                 return;
             }
@@ -3723,10 +3940,21 @@ static void run_agentic_turn(char *user_input,
                     StringBuf tr;
                     sb_init(&tr);
                     sb_append_str(&tr, tool_result);
-                    char budget[256];
+                    /* Restate the original request, exactly as the legacy path below
+                       already does. Without it a long native-mode turn loses its goal:
+                       elision rewrites old tool results into "grep the journal" stubs,
+                       so after enough rounds the model sees one distant user message
+                       and a wall of stubs. Measured 2026-08-02 — two calls after
+                       eliding 35 results, a 35B local model answered "you haven't
+                       asked a specific question yet. What would you like me to do?"
+                       and ended a study it was halfway through. The user message is
+                       never elided (elide_old_tool_results only touches tool_result),
+                       so this is drift, not loss, and an echo is enough to fix it. */
+                    char budget[512];
                     snprintf(budget, sizeof(budget),
-                        "\n[Context: %d/%d tokens used, %d remaining. Answer now if remaining < 8000.]",
-                        used, basi_srv_ctx_total, remaining);
+                        "\n[Context: %d/%d tokens used, %d remaining. Answer now if "
+                        "remaining < 8000. Original request: \"%.180s\"]",
+                        used, basi_srv_ctx_total, remaining, user_input);
                     sb_append_str(&tr, budget);
                     char *res_env = tool_result_envelope(call_name, sb_to_str(&tr));
                     sb_free(&tr);
@@ -3862,6 +4090,45 @@ static void run_agentic_turn(char *user_input,
 }
 
 int main(int argc, char **argv) {
+    /* --local has to be seen before the subcommands below, which configure the
+       remote endpoint on their own (they dispatch ahead of parse_args). */
+    for (int i = 1; i < argc; i++)
+        if (strcmp(argv[i], "--local") == 0) api_ignore_saved = true;
+
+    /* `basi-cli api ...`: show, set or forget the default backend. */
+    if (argc >= 2 && strcmp(argv[1], "api") == 0) {
+        const char *sub = argc >= 3 ? argv[2] : "show";
+        char prov[128], model[512];
+        if (strcmp(sub, "show") == 0) {
+            if (load_default_api(prov, sizeof prov, model, sizeof model))
+                printf("Default backend: %s  model %s\n"
+                       "  (a bare `basi` uses this; `--local` or `basi-cli api clear` "
+                       "goes back to a local GGUF)\n", prov, model);
+            else
+                printf("No default backend saved — a bare `basi` loads the default local model.\n"
+                       "  Set one with: basi-cli api set <provider> <model-id>\n");
+            return 0;
+        }
+        if (strcmp(sub, "clear") == 0) {
+            printf(clear_default_api() ? "Default backend cleared; back to local models.\n"
+                                       : "No default backend was saved.\n");
+            return 0;
+        }
+        if (strcmp(sub, "set") == 0 && argc >= 5) {
+            /* Configure it for real before saving: a typo'd provider or a missing
+               key should fail HERE, not on the next launch. */
+            if (api_setup_remote(argv[3], argv[4]) != 1) return 1;
+            printf("Default backend: %s  model %s\n", argv[3], argv[4]);
+            return 0;
+        }
+        fprintf(stderr,
+            "Usage:\n"
+            "  basi-cli api                          show the saved default backend\n"
+            "  basi-cli api set <provider> <model>   use it for every later launch\n"
+            "  basi-cli api clear                    forget it (back to local GGUF)\n");
+        return 2;
+    }
+
     /* `basi-cli docs ...` subcommand: handle and exit before model load. */
     if (argc >= 2 && strcmp(argv[1], "docs") == 0) {
         if (argc >= 3 && strcmp(argv[2], "add") == 0) {
@@ -3870,6 +4137,55 @@ int main(int argc, char **argv) {
         fprintf(stderr,
             "Usage:\n"
             "  basi-cli docs add <file.md> [--shelf=notes|pinned|docs]\n");
+        return 2;
+    }
+
+    /* `basi-cli mcp ...`: inspect and exercise MCP servers with NO model loaded.
+     * Connecting, listing and calling are pure protocol, so a server can be
+     * debugged — is it reachable, which era does it speak, what does this tool
+     * actually return — without spending a single token on the question. */
+    if (argc >= 2 && strcmp(argv[1], "mcp") == 0) {
+        const char *sub = argc >= 3 ? argv[2] : "list";
+        const char *cfg = NULL;
+        for (int i = 2; i + 1 < argc; i++)
+            if (strcmp(argv[i], "--mcp-config") == 0) cfg = argv[i + 1];
+
+        if (strcmp(sub, "call") == 0) {
+            if (argc < 4) {
+                fprintf(stderr, "Usage: basi-cli mcp call <mcp__server__tool> ['{\"json\":\"args\"}']\n");
+                return 2;
+            }
+            mcp_init(cfg, /*verbose=*/1, NULL);
+            const char *name = argv[3];
+            const char *args = argc >= 5 ? argv[4] : "{}";
+            if (!mcp_is_tool(name)) {
+                fprintf(stderr, "No such MCP tool: %s (see `basi-cli mcp tools`)\n", name);
+                mcp_shutdown();
+                return 2;
+            }
+            char *out = mcp_call_tool(name, args);
+            printf("%s\n", out ? out : "(null)");
+            free(out);
+            mcp_shutdown();
+            return 0;
+        }
+
+        if (strcmp(sub, "list") == 0 || strcmp(sub, "tools") == 0) {
+            mcp_init(cfg, /*verbose=*/1, NULL);
+            char *rep = mcp_status_report(strcmp(sub, "tools") == 0 ? 1 : 0,
+                                          argc >= 4 && argv[3][0] != '-' ? argv[3] : NULL);
+            printf("\n%s", rep ? rep : "");
+            free(rep);
+            mcp_shutdown();
+            return 0;
+        }
+
+        fprintf(stderr,
+            "Usage:\n"
+            "  basi-cli mcp list [server]                    connect and report status\n"
+            "  basi-cli mcp tools [server]                   also list every tool\n"
+            "  basi-cli mcp call <tool> ['<json args>']      invoke one tool\n"
+            "  (any of the above accept --mcp-config <file>)\n");
         return 2;
     }
 
@@ -4155,8 +4471,9 @@ int main(int argc, char **argv) {
         }
         if (rctx <= 0) { rctx = 131072; ctx_src = "fallback — pass -c if the model has more"; }
         basi_srv_ctx_total = rctx;
-        fprintf(stderr, "\033[90m[api] %s  model %s  ctx %d (%s)\033[0m\n",
-                srvchat_remote_base(), srvchat_remote_model(), basi_srv_ctx_total, ctx_src);
+        fprintf(stderr, "\033[90m[api] %s  model %s  ctx %d (%s)%s\033[0m\n",
+                srvchat_remote_base(), srvchat_remote_model(), basi_srv_ctx_total, ctx_src,
+                api_from_saved_default ? "  [saved default — `--local` for a GGUF]" : "");
     }
 
     /* In one-shot deep-research shrink the server context to free VRAM. */
@@ -4480,14 +4797,27 @@ int main(int argc, char **argv) {
     /* Native tool-calling (phase 2a): register the tool set, then ask whether
        the server templates them and returns STRUCTURED tool_calls. Server-only, so
        tools are always "native" (the /v1/chat/completions path owns the format). */
-    int tool_n = 0;
-    const BasiToolDef *tool_defs = basi_tool_defs(&tool_n);
-    if (cli.tool_subset && *cli.tool_subset) {         /* --tools: hard-scope this phase */
-        tool_defs = filter_tool_defs(cli.tool_subset, &tool_n);
-        printf("\033[36m[Tools scoped to: %s (%d tool%s)]\033[0m\n",
-               cli.tool_subset, tool_n, tool_n == 1 ? "" : "s");
+    /* MCP servers are enumerated BEFORE the tool set is read, because their tools
+       are appended to the very table basi_tool_defs() returns. Skipped when the
+       phase is hard-scoped to native tools only: a `--tools read,edit` factory
+       step would pay every server's startup cost and then advertise none of them,
+       and those steps run in their hundreds. */
+    bool want_mcp = !cli.no_mcp;
+    if (want_mcp && cli.tool_subset && *cli.tool_subset && !strstr(cli.tool_subset, "mcp__"))
+        want_mcp = false;
+    if (want_mcp) {
+        int mcp_n = 0;
+        mcp_init(cli.mcp_config, /*verbose=*/!oneshot_prompt || debug_mode, &mcp_n);
+    } else {
+        mcp_skipped_this_run = true;   /* so /mcp says "off", not "unconfigured" */
     }
-    basi_set_tools(tool_defs, tool_n);
+
+    active_tool_subset = cli.tool_subset;              /* --tools: hard-scope this phase */
+    reregister_tools();
+    int tool_n = basi_tools_registered();
+    if (active_tool_subset && *active_tool_subset)
+        printf("\033[36m[Tools scoped to: %s (%d tool%s)]\033[0m\n",
+               active_tool_subset, tool_n, tool_n == 1 ? "" : "s");
     int native_tools = 1;
     generate_native_tools = native_tools;
     /* Render the answer stream as markdown, but only for the interactive REPL on
@@ -4630,6 +4960,7 @@ cleanup:
     statusbar_disable();   /* release the reserved bottom row before we exit */
     if (session_fp) fclose(session_fp);
     lsp_shutdown();
+    mcp_shutdown();     /* close each server's stdin, then escalate — spec order */
     embed_shutdown();
     mem_clear();
     for (size_t i = 0; i < msg_count; i++)
