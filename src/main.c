@@ -44,6 +44,7 @@
 #include "deepsearch.h"
 #include "chat_tmpl.h"
 #include "tooldefs.h"
+#include "toolstat.h"
 #include "mcp.h"
 #include "cookbook.h"
 #include "slashmenu.h"
@@ -944,10 +945,24 @@ static void sh_append_arg(StringBuf *sb, const char *arg) {
     }
 }
 
+static bool toolstat_nested;   /* defined with execute_tool_native, below */
+
 static char *execute_tool(const char *command) {
     /* trim whitespace */
     while (*command == ' ' || *command == '\t' || *command == '\n') command++;
     if (!*command) return strdup("Error: Empty command");
+
+    /* Count the dispatch by tool name. This is the denominator the end-of-run
+     * report needs: "1 of 9 calls failed" is a hiccup, "9 of 9" means the answer
+     * was written without a capability the model believed it had. */
+    {
+        char nm[64];
+        size_t i = 0;
+        while (i + 1 < sizeof(nm) && command[i] && command[i] != ' ' &&
+               command[i] != '\t' && command[i] != '\n') { nm[i] = command[i]; i++; }
+        nm[i] = '\0';
+        if (nm[0] && !toolstat_nested) basi_toolstat_call(nm);
+    }
 
     /* Phase gate (Decision #5): single check covers bash/edit/scaffold
      * blocking during drafting/spike/premortem AND plan_write availability. */
@@ -1325,9 +1340,18 @@ static char *execute_mcp_tool(const char *name, const char *args_json) {
     return mcp_call_tool(name, args_json);
 }
 
+/* Set while the native dispatcher is delegating to execute_tool, so the call is
+ * counted once by whichever dispatcher the model actually entered through. */
+static bool toolstat_nested = false;
+
 static char *execute_tool_native(const char *name, const char *args_json) {
     if (!name) return NULL;
     if (!args_json) args_json = "{}";
+
+    /* Native calls that run a tool DIRECTLY never reach execute_tool, so count
+     * here — web_search is one of them, which is exactly how the first version
+     * of this report managed to say "1 of 0 calls failed". */
+    basi_toolstat_call(name);
 
     /* MCP tools first: they carry arbitrary server-defined schemas, so they must
      * never reach basi_build_command's flattening into a command string. The
@@ -1354,7 +1378,9 @@ static char *execute_tool_native(const char *name, const char *args_json) {
     if (!direct) {
         char *cmd = basi_build_command(name, args_json);
         if (!cmd) return NULL;                 /* unknown tool */
+        toolstat_nested = true;                 /* already counted just above */
         char *r = execute_tool(cmd);            /* gate + accounting happen here */
+        toolstat_nested = false;
         free(cmd);
         return r;
     }
@@ -1865,6 +1891,15 @@ static Cli parse_args(int argc, char **argv) {
                    "  BASI_API_PRICE_OUT     USD per 1M output tokens    | pricing page; enables\n"
                    "  BASI_API_PRICE_CACHED  USD per 1M cached prompt    /  cost in /cost and\n"
                    "                         tokens (default: same as _IN)  the per-turn line\n"
+                   "  SEARXNG_INSTANCE       SearXNG base URL web_search queries\n"
+                   "                         (default http://localhost:8888)\n"
+                   "  SEARXNG_HOME           Local SearXNG checkout to auto-start; otherwise\n"
+                   "                         ~/searxng, ~/Documentos/searxng, ~/Documents/searxng\n"
+                   "  BASI_NO_SEARXNG=1      Never auto-start SearXNG (probing still happens, so\n"
+                   "                         a dead backend is still reported rather than silent)\n"
+                   "  BRAVE_API_KEY          Hosted search fallback when no SearXNG answers.\n"
+                   "                         With neither, web_search is withdrawn from the tool\n"
+                   "                         set for the run and the model is told it has none.\n"
                    "  BASI_MCP=0             Disable MCP (same as --no-mcp)\n"
                    "  BASI_MCP_CONFIG        Extra MCP config file (same as --mcp-config)\n"
                    "  BASI_MCP_PROBE_MS      Era-probe/handshake timeout per server (default 5000)\n"
@@ -4376,7 +4411,20 @@ int main(int argc, char **argv) {
 
     /* Warm up the local SearXNG (web_search backend) while the model loads.
      * --no-tools never touches the web, so don't spin SearXNG up for it. */
-    if (!no_tools) web_ensure_searxng();
+    if (!no_tools) {
+        const char *bkey = getenv("BRAVE_API_KEY");
+        bool searchable = (web_ensure_searxng() != WEB_SEARCH_UNAVAILABLE) ||
+                          (bkey && bkey[0]);
+        /* Don't advertise a capability that cannot work. Left in the table it
+         * costs turns — the model tries it, reads the failure as an empty web,
+         * and moves on without ever telling anyone search was missing. */
+        if (!searchable) {
+            basi_tooldefs_disable("web_search");
+            fprintf(stderr, "\033[33m[web] web_search withdrawn from the tool set for "
+                            "this run — better the model knows it has no search than "
+                            "discovers it one failed call at a time.\033[0m\n");
+        }
+    }
 
     /* Server-backed generation spike (M1): BASI_SERVER_SELFTEST=1 spawns a
        llama-server, streams a completion over its SSE /completion, and exits —
@@ -4969,6 +5017,8 @@ cleanup:
     history_free_all();
 
     print_session_spend(session_prompt_tokens, session_gen_tokens);
+    /* Last thing on screen: what was broken while that answer was produced. */
+    basi_toolstat_report(stderr);
 
     /* --no-tools keeps stdout to the completion alone; no sign-off banner. */
     if (!no_tools) printf("\nGoodbye!\n");

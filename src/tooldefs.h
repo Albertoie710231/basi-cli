@@ -21,6 +21,13 @@ const BasiToolDef *basi_tool_defs(int *n);
  * pass NULL/0 to drop them again. Replaces any previous block. */
 void basi_tooldefs_set_extra(const BasiToolDef *defs, int n);
 
+/* Withdraw a tool from the advertised set for the rest of the run. Used when a
+ * tool's backend is known to be down at startup: advertising a capability that
+ * cannot work invites the model to spend turns discovering that for itself, and
+ * (worse) to read the failures as "the web has nothing on this". `name` is
+ * referenced, not copied. */
+void basi_tooldefs_disable(const char *name);
+
 /* Translate a parsed native tool call into the command string that
  * execute_tool() already understands (so all dispatch + plan-phase gating is
  * reused). Returns a malloc'd string (caller frees), or NULL for an unknown
