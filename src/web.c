@@ -479,20 +479,36 @@ void web_ensure_searxng(void) {
     /* Only ever auto-launch a local instance — never a remote URL the user set. */
     if (!strstr(inst, "localhost") && !strstr(inst, "127.0.0.1")) return;
 
+    /* SEARXNG_HOME wins; otherwise probe the layouts an install actually uses.
+       The venv interpreter is the marker. Hard-coding one guess here meant a
+       checkout one directory over was never found, and web_search then failed
+       on EVERY call for the life of the session. */
     const char *home_env = getenv("SEARXNG_HOME");
-    char home[512];
+    char home[512], py[600];
+    bool found = false;
     if (home_env && home_env[0]) {
         snprintf(home, sizeof(home), "%s", home_env);
+        snprintf(py, sizeof(py), "%s/venv/bin/python", home);
+        found = (access(py, X_OK) == 0);
     } else {
         const char *h = getenv("HOME");
         if (!h || !h[0]) return;                 /* no home dir — nowhere to look */
-        snprintf(home, sizeof(home), "%s/searxng", h);
+        static const char *rel[] = { "searxng", "Documentos/searxng", "Documents/searxng" };
+        for (size_t i = 0; i < sizeof(rel) / sizeof(rel[0]) && !found; i++) {
+            snprintf(home, sizeof(home), "%s/%s", h, rel[i]);
+            snprintf(py, sizeof(py), "%s/venv/bin/python", home);
+            found = (access(py, X_OK) == 0);
+        }
+    }
+    /* Say it once. Silence here reads to the user as "search works but the web
+       is empty", which is the most expensive way to be wrong. */
+    if (!found) {
+        fprintf(stderr, "\033[33m[web] nothing serving %s and no local SearXNG install "
+                        "found — web_search will return no results. Set SEARXNG_HOME "
+                        "or SEARXNG_INSTANCE.\033[0m\n", inst);
+        return;
     }
     if (strchr(home, '\'')) return;
-
-    char py[600];
-    snprintf(py, sizeof(py), "%s/venv/bin/python", home);
-    if (access(py, X_OK) != 0) return;   /* no local install — nothing to start */
 
     char launch[4096];
     snprintf(launch, sizeof(launch),
