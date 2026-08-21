@@ -10,6 +10,8 @@
 #include <time.h>
 #include <signal.h>
 #include <sys/wait.h>
+#include <dirent.h>
+#include <strings.h>
 #include <sys/stat.h>
 #include <fcntl.h>
 
@@ -97,6 +99,40 @@ static pid_t srvgen_wait_health(pid_t pid, int port, int timeout_s) {
     return -1;
 }
 
+/* A vision model ships its projector as a SEPARATE gguf beside the weights, and
+ * llama-server will not accept an image without it: view_image against a local
+ * model failed the whole request with "image input is not supported - hint: you
+ * may need to provide the mmproj", which ends the turn rather than degrading.
+ * The file is always a sibling named mmproj*.gguf, so find it instead of asking
+ * the user to know about it. Writes the path into `out` and returns 1 if found. */
+int srvgen_find_mmproj(const char *model_path, char *out, size_t outn) {
+    if (out && outn) out[0] = '\0';
+    if (!model_path || !*model_path || !out) return 0;
+    char dir[1024];
+    snprintf(dir, sizeof dir, "%s", model_path);
+    char *slash = strrchr(dir, '/');
+    if (!slash) return 0;
+    *slash = '\0';
+    /* The model itself must not be mistaken for its own projector. */
+    const char *base = slash + 1;
+    if (strncasecmp(base, "mmproj", 6) == 0) return 0;
+
+    DIR *d = opendir(dir);
+    if (!d) return 0;
+    int found = 0;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        if (strncasecmp(e->d_name, "mmproj", 6) != 0) continue;
+        const char *dot = strrchr(e->d_name, '.');
+        if (!dot || strcasecmp(dot, ".gguf") != 0) continue;
+        snprintf(out, outn, "%s/%s", dir, e->d_name);
+        found = 1;
+        break;
+    }
+    closedir(d);
+    return found;
+}
+
 int srvgen_write_launch_script(const SrvLaunch *cfg, const char *path) {
     if (!cfg || !path) return -1;
     /* Best-effort create of the parent dir (e.g. .basi/). */
@@ -124,6 +160,13 @@ int srvgen_write_launch_script(const SrvLaunch *cfg, const char *path) {
     fprintf(f, "exec \"%s\" \\\n", bin);
     fprintf(f, "  -m \"%s\" \\\n", model);
     fprintf(f, "  -ngl %d -c %d \\\n", cfg->ngl, cfg->ctx);
+    /* Vision, when the model brought a projector. Without this llama-server
+     * rejects every image outright and the agent's view_image dies mid-turn. */
+    {
+        char mmproj[1024];
+        if (srvgen_find_mmproj(model, mmproj, sizeof mmproj))
+            fprintf(f, "  --mmproj \"%s\" \\\n", mmproj);
+    }
     /* Per-binary defaults from the backend config (e.g. "-b 2048 -ub 2048": ubatch
      * is the prefill lever, worth more on SYCL than on Vulkan). */
     if (cfg->extra_flags && *cfg->extra_flags) fprintf(f, "  %s \\\n", cfg->extra_flags);

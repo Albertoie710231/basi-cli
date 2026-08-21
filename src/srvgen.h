@@ -56,6 +56,11 @@ typedef struct {
  * parent dir). The script carries a "# BASI-MODEL: <path>" marker so BASI can tell
  * a stale/other-model script from a user-edited one for the same model. Returns 0
  * on success, -1 on error. */
+/* Find the sibling multimodal projector (mmproj*.gguf) next to `model_path`.
+ * A vision model's projector is a separate file, and llama-server refuses every
+ * image without it. Returns 1 and fills `out` when one exists. */
+int srvgen_find_mmproj(const char *model_path, char *out, size_t outn);
+
 int srvgen_write_launch_script(const SrvLaunch *cfg, const char *path);
 
 /* If `path` exists and its "# BASI-MODEL:" marker equals model_path, return 1
