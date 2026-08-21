@@ -997,6 +997,102 @@ static void sh_append_arg(StringBuf *sb, const char *arg) {
     }
 }
 
+/* ── "you just rendered something — go and look at it" ──────────────────────
+ * A capability the model never reads about is a capability it never uses.
+ * Measured on this codebase: 79% of all tool calls are bash, code_context got
+ * 0 calls out of 312, and the fix that worked was putting the capability where
+ * the model was ALREADY reading — ctags in the bash description took discovery
+ * from 36% to 100%.
+ *
+ * view_image has the same problem in a sharper form. A run given the literal
+ * command line to render three azimuths and told "then call view_image and
+ * JUDGE THE PICTURE" rendered them and never once looked: 16 tool calls, zero
+ * looks. So the reminder goes in the RESULT of the call that produced the
+ * image, which the model cannot skip reading.
+ *
+ * Deterministic, not a guess: only literal paths that appear in the command
+ * itself, that exist, and whose mtime falls inside this command's own run. A
+ * path built from a shell variable simply is not named — better silent than
+ * wrong. */
+static bool path_is_image(const char *p) {
+    const char *d = strrchr(p, '.');
+    if (!d) return false;
+    static const char *EXT[] = { ".png", ".jpg", ".jpeg", ".webp", ".gif",
+                                 ".ppm", ".pgm", ".pnm", ".bmp", ".tga", NULL };
+    for (int i = 0; EXT[i]; i++) if (strcasecmp(d, EXT[i]) == 0) return true;
+    return false;
+}
+
+/* Collect an image path if it is real, non-empty, and was written by THIS
+ * command. Returns 1 if it was added. */
+static int img_consider(const char *cand, time_t started,
+                        const char **found, int *n_found, int cap) {
+    if (*n_found >= cap || !cand || !*cand) return 0;
+    if (!path_is_image(cand) || strchr(cand, '$') || strchr(cand, '*')) return 0;
+    struct stat st;
+    if (stat(cand, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size == 0) return 0;
+    if (st.st_mtime + 2 < started) return 0;          /* predates the command */
+    for (int i = 0; i < *n_found; i++)
+        if (strcmp(found[i], cand) == 0) return 0;
+    found[(*n_found)++] = strdup(cand);
+    return 1;
+}
+
+/* Pull whitespace/shell-punctuation-separated tokens out of `text` and test each. */
+static void img_scan_text(const char *text, time_t started,
+                          const char **found, int *n_found, int cap) {
+    if (!text) return;
+    char tok[PATH_MAX];
+    for (const char *p = text; *p && *n_found < cap; ) {
+        while (*p && (isspace((unsigned char)*p) || strchr("'\"><|;,()[]{}=", *p))) p++;
+        size_t k = 0;
+        while (*p && !isspace((unsigned char)*p) && !strchr("'\"><|;,()[]{}=", *p)
+               && k + 1 < sizeof tok)
+            tok[k++] = *p++;
+        tok[k] = '\0';
+        if (k) img_consider(tok, started, found, n_found, cap);
+    }
+}
+
+/* Append the note to `result` (which it takes ownership of) and return the new
+ * buffer, or `result` unchanged when the command wrote no image. */
+static char *bash_note_images(char *result, const char *cmd, time_t started) {
+    if (!result) return result;
+    const char *found[3]; int n_found = 0;
+
+    /* Three places a written image can be named, cheapest first. The command is
+     * not enough on its own: the very first test of this ran `./render.sh`, and
+     * the path it wrote lived inside the script, so nothing was detected. What
+     * a command WRITES is not generally visible in how it was invoked. */
+    img_scan_text(cmd, started, found, &n_found, 3);
+    img_scan_text(result, started, found, &n_found, 3);   /* "render complete: chart.png" */
+    if (n_found < 3) {                                     /* freshly written into cwd */
+        DIR *d = opendir(".");
+        if (d) {
+            struct dirent *e;
+            while ((e = readdir(d)) != NULL && n_found < 3)
+                if (e->d_name[0] != '.') img_consider(e->d_name, started, found, &n_found, 3);
+            closedir(d);
+        }
+    }
+    if (!n_found) return result;
+
+    StringBuf m; sb_init(&m);
+    sb_append_str(&m, result);
+    sb_append_str(&m, "\n\n[this command wrote ");
+    for (int i = 0; i < n_found; i++) {
+        if (i) sb_append_str(&m, i + 1 == n_found ? " and " : ", ");
+        sb_append_str(&m, found[i]);
+    }
+    sb_append_str(&m, " — you have VISION: call view_image on ");
+    sb_append_str(&m, found[0]);
+    sb_append_str(&m, " and judge the picture. Do not reason about what it probably "
+                      "looks like from the code; a look costs ~500 tokens.]");
+    for (int i = 0; i < n_found; i++) free((void *) found[i]);
+    free(result);
+    return sb_to_str(&m);
+}
+
 static bool toolstat_nested;   /* defined with execute_tool_native, below */
 
 static char *execute_tool(const char *command) {
@@ -1192,6 +1288,7 @@ static char *execute_tool(const char *command) {
             if (tenv) { int v = atoi(tenv); if (v > 0) bash_tmo = v; }
             if (bash_tmo > 2400) bash_tmo = 2400;   /* 40 min: an experiment phase may build */
             int timed_out = 0;
+            time_t bash_started = time(NULL);
             char *result = run_command_timeout(sb_to_str(&wrapped), 512 * 1024,
                                                bash_tmo, &timed_out);
             sb_free(&wrapped);
@@ -1211,7 +1308,7 @@ static char *execute_tool(const char *command) {
                 sb_append_str(&m, note);
                 return sb_to_str(&m);
             }
-            return result;
+            return bash_note_images(result, shell_cmd, bash_started);
         }
     }
 
@@ -2045,7 +2142,21 @@ static Cli parse_args(int argc, char **argv) {
             c.bypass = true;
         } else if (strcmp(argv[i], "--resume") == 0 && i + 1 < argc) {
             c.resume_path = argv[++i];
-        } else if (strcmp(argv[i], "--tools") == 0 && i + 1 < argc) {
+        } else if (strcmp(argv[i], "--tools") == 0) {
+            /* --tools TAKES A LIST, and used to consume the next argv whatever it
+               was. `basi --tools --yolo -p '...'` therefore scoped the session to a
+               tool named "--yolo" — which matches nothing — and swallowed --yolo on
+               the way: a fully autonomous agent with zero tools, announced in the
+               same colour as every other startup line. It cost a whole run before
+               anyone noticed. A flag is never a tool name. */
+            if (i + 1 >= argc || argv[i + 1][0] == '-') {
+                fprintf(stderr, "basi: --tools takes a comma-separated tool list "
+                                "(e.g. --tools read,edit,bash)");
+                if (i + 1 < argc) fprintf(stderr, ", not the flag %s", argv[i + 1]);
+                fprintf(stderr, "\n");
+                c.want_exit = true; c.exit_code = 2;
+                return c;
+            }
             c.tool_subset = argv[++i];   /* factory: hard-scope this phase's tools */
         } else if (strcmp(argv[i], "--pick") == 0) {
             c.pick = true;
@@ -3839,6 +3950,28 @@ static void journal_append(const char *tag, const char *full_result) {
     fclose(f);
 }
 
+/* Append what the model SAID between calls. The journal recorded every tool
+ * result and nothing else, so a post-mortem could see 16 calls — six reads, six
+ * greps, zero of the tool the prompt named — and still not see why. Actions
+ * without reasoning is half an instrument.
+ *
+ * Deliberately does NOT touch g_journal_seq: elide_old_tool_results builds its
+ * stubs on the invariant that the k-th tool_result message is journal entry k,
+ * so an extra NUMBERED entry would silently shift every stub's grep pointer by
+ * one. Hence a "###" sub-heading rather than a "## [n]" one. */
+static void journal_say(const char *text) {
+    if (!text || !*text) return;
+    const char *t = text;
+    while (*t == ' ' || *t == '\n' || *t == '\t') t++;
+    if (!*t) return;
+    FILE *f = fopen(journal_path(), "a");
+    if (!f) return;
+    fprintf(f, "\n### said before [%d]\n\n", g_journal_seq + 1);
+    fwrite(t, 1, strlen(t), f);
+    fputc('\n', f);
+    fclose(f);
+}
+
 /* Replace the content of tool_result messages older than the most recent `keep`
  * with a stub. Returns how many were elided. The journal holds the full text, so
  * this loses nothing the model cannot grep back. This is the compaction reclaim
@@ -4024,6 +4157,38 @@ static void run_agentic_turn(char *user_input,
         int           n_seen_calls    = 0;
         const int     repeat_warn     = 2;
         const int     repeat_give_up  = 5;
+
+        /* Named-tool gate. A run was handed the literal command line to render
+           three views and told "then call view_image and JUDGE THE PICTURE". It
+           rendered nothing and looked nothing: 16 tool calls, six reads, six
+           greps, zero looks. Nothing in the loop noticed, because the loop has
+           no opinion about what the request asked for.
+           This is the exact, non-guessing half of noticing: if the prompt names
+           an actual tool and that tool has still not been called after a patient
+           number of rounds, say so ONCE. Only names containing '_' qualify —
+           "read"/"edit"/"grep"/"head" are ordinary English and would fire on
+           almost every prompt, while "view_image" in a prompt can only mean one
+           thing. Once, never repeatedly: a nudge re-sent every round is itself
+           repeated text in the context, which is the failure mode the elision
+           work exists to prevent. */
+        const char *asked_tools[4]; int n_asked = 0;
+        char        called_tools[24][40]; int n_called = 0;
+        bool        gate_fired = false;
+        int         gate_after = 8;          /* tool calls of patience */
+        { const char *g = getenv("BASI_GATE_AFTER");
+          if (g) { int v = atoi(g); if (v > 0 && v <= 100) gate_after = v; } }
+        {
+            int ntd = 0;
+            const BasiToolDef *td = basi_tool_defs(&ntd);
+            for (int i = 0; i < ntd && n_asked < 4; i++) {
+                if (!td[i].name || !strchr(td[i].name, '_')) continue;
+                /* Never nudge toward a tool this session scoped away with --tools:
+                   the model would be told to call something it cannot see. */
+                if (active_tool_subset && *active_tool_subset &&
+                    !strstr(active_tool_subset, td[i].name)) continue;
+                if (strstr(user_input, td[i].name)) asked_tools[n_asked++] = td[i].name;
+            }
+        }
         {
             const char *mi = getenv("BASI_MAX_TOOL_ITERS");
             if (mi) { int v = atoi(mi); if (v > 0 && v <= 200) max_tool_iterations = v; }
@@ -4079,6 +4244,7 @@ static void run_agentic_turn(char *user_input,
             generation_interrupted = 0;
             setup_sigint_handler();
             GenerateResult result = generate_chat(messages, msg_count, &ncalls, &n_ncalls);
+            journal_say(result.text);   /* what it said, beside what it did */
             basi_srv_ctx_used = (int) result.prompt_tokens;   /* honest ctx meter from usage */
             reset_sigint_handler();
             session_prompt_tokens += result.prompt_tokens;
@@ -4163,6 +4329,17 @@ static void run_agentic_turn(char *user_input,
                    is lossless even when the in-context copy is trimmed or later
                    elided. The model can grep it to recall anything. */
                 journal_append(call_name, tool_result);
+
+                /* Remember which tools this turn has actually used (named-tool gate). */
+                if (call_name && n_called < 24) {
+                    bool known = false;
+                    for (int i = 0; i < n_called; i++)
+                        if (strcmp(called_tools[i], call_name) == 0) { known = true; break; }
+                    if (!known) {
+                        snprintf(called_tools[n_called], sizeof(called_tools[0]), "%s", call_name);
+                        n_called++;
+                    }
+                }
 
                 /* Repeat detector (see seen_calls above). Keyed on the call, not the
                    result, and with no size floor — the failure mode it exists for is a
@@ -4255,6 +4432,36 @@ static void run_agentic_turn(char *user_input,
                         fflush(stdout);
                     } else if (n_seen_results < (int)(sizeof(seen_results)/sizeof(seen_results[0]))) {
                         seen_results[n_seen_results++] = h;
+                    }
+                }
+
+                /* Named-tool gate: the request named a tool by name and, this
+                   many rounds in, it has still never been called. Say it once,
+                   attached to the result the model is already reading. */
+                if (!gate_fired && n_asked > 0 && tool_iterations >= gate_after && tool_result) {
+                    const char *missing = NULL;
+                    for (int a = 0; a < n_asked && !missing; a++) {
+                        bool used = false;
+                        for (int i = 0; i < n_called; i++)
+                            if (strcmp(called_tools[i], asked_tools[a]) == 0) { used = true; break; }
+                        if (!used) missing = asked_tools[a];
+                    }
+                    if (missing) {
+                        gate_fired = true;
+                        StringBuf g; sb_init(&g);
+                        sb_append_str(&g, tool_result);
+                        char note[400];
+                        snprintf(note, sizeof note,
+                            "\n\n[GATE: the request asks you to use `%s`, and %d tool calls in "
+                            "you have not called it once. It is available to you right now. "
+                            "Call it, or say plainly why you cannot — do not keep investigating "
+                            "around it.]", missing, tool_iterations);
+                        sb_append_str(&g, note);
+                        free(tool_result);
+                        tool_result = sb_to_str(&g);
+                        printf("\033[33m[gate: `%s` requested but never called after %d rounds "
+                               "— nudging once]\033[0m\n", missing, tool_iterations);
+                        fflush(stdout);
                     }
                 }
 
@@ -5179,9 +5386,20 @@ int main(int argc, char **argv) {
     active_tool_subset = cli.tool_subset;              /* --tools: hard-scope this phase */
     reregister_tools();
     int tool_n = basi_tools_registered();
-    if (active_tool_subset && *active_tool_subset)
+    if (active_tool_subset && *active_tool_subset) {
+        /* A subset that matches nothing is never what anyone meant, and it used to
+           be reported in the same cyan as a healthy startup line. Refuse: an agent
+           with no tools cannot do the job it was launched for, and the failure is
+           invisible from the outside — it looks like a model that chose not to act. */
+        if (tool_n == 0) {
+            fprintf(stderr, "basi: --tools %s matched no tools — the session would run "
+                            "with nothing to act with. Check the names against `basi --help`.\n",
+                    active_tool_subset);
+            return 2;
+        }
         printf("\033[36m[Tools scoped to: %s (%d tool%s)]\033[0m\n",
                active_tool_subset, tool_n, tool_n == 1 ? "" : "s");
+    }
     int native_tools = 1;
     generate_native_tools = native_tools;
     /* Render the answer stream as markdown, but only for the interactive REPL on
