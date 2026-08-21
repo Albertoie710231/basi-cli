@@ -105,7 +105,8 @@ static std::string http_get(const std::string &url) {
 static int ctxlen_of(const json &m) {
     if (!m.is_object()) return 0;
     for (const char *k : { "context_length", "context_window",
-                           "max_context_length", "contextLength" })
+                           "max_context_length", "contextLength",
+                           "max_model_len" })   /* vLLM / any OpenAI-compatible self-host */
         if (m.contains(k) && m[k].is_number_integer()) {
             long v = m[k].get<long>();
             if (v > 0 && v < (1L << 31)) return (int) v;
@@ -200,7 +201,20 @@ static std::string build_request(const char *messages_json, const char *tools_js
                 if (samp->repeat_last_n >= 0) req["repeat_last_n"] = samp->repeat_last_n;
             }
             if (samp->min_p >= 0) req["min_p"] = samp->min_p;
-        } else if (samp->repeat_penalty > 1.0) {
+        } else {
+            /* A hosted endpoint is not a llama-server, but it is not OpenAI-only
+             * either: top_k and min_p are widely accepted (Fireworks takes both),
+             * and the vendors publish sampling settings that ASSUME they are
+             * applied. Qwen3.8's model card asks for top_p 0.95 with top_k 20 and
+             * names presence_penalty as the repetition knob. Sending a penalty
+             * while dropping the clips that bound its tail is how a turn ends up
+             * emitting "yp yp yp zp zp": the penalty pushes mass off the common
+             * tokens and nothing clips where it lands. Send what the numbers
+             * assume. */
+            if (samp->top_k > 0)  req["top_k"] = samp->top_k;
+            if (samp->min_p >= 0) req["min_p"] = samp->min_p;
+        }
+        if (remote && samp->repeat_penalty > 1.0) {
             /* A hosted endpoint has no repeat_penalty, so until now the remote
              * path shipped with NO repetition control at all — the very knob
              * that took agent-loop degeneration from 4/4 runs to 0/4 locally was
@@ -215,10 +229,16 @@ static std::string build_request(const char *messages_json, const char *tools_js
              * boilerplate), so an aggressive value would cost more than the
              * degeneration it prevents. 1.1 lands at 0.2, enough to break a loop
              * without taxing ordinary code. BASI_API_EXTRA_JSON is merged after
-             * this and can override or clear it. */
-            double fp = (samp->repeat_penalty - 1.0) * 2.0;
-            if (fp > 0.5) fp = 0.5;
-            req["frequency_penalty"] = fp;
+             * this and can override or clear it.
+             *
+             * presence_penalty, not frequency_penalty: it is the knob the model
+             * cards actually name for endless repetition, and it is a flat charge
+             * for a token having appeared at all rather than one that grows with
+             * every use — which matters for code, where the same identifiers and
+             * indentation legitimately recur on every line. */
+            double pp = (samp->repeat_penalty - 1.0) * 2.0;
+            if (pp > 0.5) pp = 0.5;
+            req["presence_penalty"] = pp;
         }
     }
     if (!remote) req["cache_prompt"] = true;   /* llama-server KV reuse; no remote analogue */
@@ -239,7 +259,26 @@ static std::string build_request(const char *messages_json, const char *tools_js
             }
         }
     }
-    return req.dump();
+    std::string out = req.dump();
+    /* BASI_DUMP_REQUEST=<path>: write the outgoing body for inspection. Images
+     * are the reason this exists — "did the picture actually reach the wire?"
+     * is not answerable from the transcript, and a base64 payload is invisible
+     * in any log that truncates. Base64 is elided so the dump stays readable. */
+    if (const char *dp = getenv("BASI_DUMP_REQUEST"); dp && *dp) {
+        if (FILE *df = fopen(dp, "a")) {
+            std::string red = out;
+            for (size_t at = red.find(";base64,"); at != std::string::npos;
+                 at = red.find(";base64,", at + 1)) {
+                size_t end = red.find('"', at);
+                if (end == std::string::npos) break;
+                size_t n = end - (at + 8);
+                red.replace(at + 8, n, "<" + std::to_string(n) + " base64 chars>");
+            }
+            fprintf(df, "%s\n", red.c_str());
+            fclose(df);
+        }
+    }
+    return out;
 }
 
 /* One streamed tool call, accumulated across deltas (arguments arrive in pieces). */
