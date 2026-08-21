@@ -146,6 +146,11 @@ static void chat_on_content(const char *chunk, void *ud) {
  * JSON, streams /v1/chat/completions, and returns the answer text plus STRUCTURED
  * tool calls in tc_out/n_tc_out (caller frees via basi_free_tool_calls).
  * res.prompt_tokens carries the server's exact prompt count for ctx accounting. */
+/* The reasoning text of the most recent generate_chat, or NULL. Valid until the
+ * next call; the caller does not own it. See the note at the assignment. */
+static char *g_last_reasoning = NULL;
+const char *basi_last_reasoning(void) { return g_last_reasoning; }
+
 GenerateResult generate_chat(const BasiMsg *messages, size_t msg_count,
                              BasiToolCall **tc_out, int *n_tc_out) {
     GenerateResult res = { NULL, 0, 0, 0, 0.0, 0.0, 0.0, 0, 0 };
@@ -272,6 +277,18 @@ single_sample:
         md_end();                                        /* close the answer stream */
     }
     if (!generate_quiet) { printf("\033[0m\n"); fflush(stdout); }
+
+    /* Keep the reasoning where the journal can reach it. A reasoning model doing
+       tool calls returns EMPTY content every round — all the deciding happens in
+       the reasoning stream — so a journal that records only `text` records
+       nothing at all for exactly the runs worth investigating: measured on a
+       12-call agentic run, journal_say wrote zero entries.
+       A static, refreshed per call, rather than a field on GenerateResult: the
+       struct's `text` is freed at eight different exit points across three files,
+       and a second owned pointer would leak at most of them. */
+    free(g_last_reasoning);
+    g_last_reasoning = (r->reasoning && r->reasoning[0] && !answer_in_reasoning)
+                       ? strdup(r->reasoning) : NULL;
 
     res.text          = strdup(answer);
     res.prompt_tokens    = (size_t) r->prompt_tokens;

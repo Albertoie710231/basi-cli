@@ -3959,17 +3959,27 @@ static void journal_append(const char *tag, const char *full_result) {
  * stubs on the invariant that the k-th tool_result message is journal entry k,
  * so an extra NUMBERED entry would silently shift every stub's grep pointer by
  * one. Hence a "###" sub-heading rather than a "## [n]" one. */
-static void journal_say(const char *text) {
+static void journal_write_said(const char *label, const char *text) {
     if (!text || !*text) return;
-    const char *t = text;
-    while (*t == ' ' || *t == '\n' || *t == '\t') t++;
-    if (!*t) return;
+    while (*text == ' ' || *text == '\n' || *text == '\t') text++;
+    if (!*text) return;
     FILE *f = fopen(journal_path(), "a");
     if (!f) return;
-    fprintf(f, "\n### said before [%d]\n\n", g_journal_seq + 1);
-    fwrite(t, 1, strlen(t), f);
+    fprintf(f, "\n### %s before [%d]\n\n", label, g_journal_seq + 1);
+    fwrite(text, 1, strlen(text), f);
     fputc('\n', f);
     fclose(f);
+}
+
+/* Both halves of a turn's output. On a reasoning model mid-tool-loop `text` is
+ * empty every single round — the model emits a tool call and nothing else, and
+ * every reason it had lives in the reasoning stream. Journaling only `text`
+ * therefore recorded NOTHING across a whole 12-call run, which is precisely the
+ * kind of run a journal exists for. model.c keeps the reasoning borrowed until
+ * the next generation, which is long enough to write it here. */
+static void journal_say(const char *text) {
+    journal_write_said("thought", basi_last_reasoning());
+    journal_write_said("said", text);
 }
 
 /* Replace the content of tool_result messages older than the most recent `keep`

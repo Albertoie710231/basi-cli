@@ -75,6 +75,12 @@ extern int basi_srv_no_think;
    prompt token count (res.prompt_tokens) and fills tc_out/n_tc_out with the
    STRUCTURED tool calls (caller frees via basi_free_tool_calls). */
 struct BasiToolCall;
+/* Reasoning text from the most recent generate_chat call, or NULL if there was
+ * none. Borrowed, valid until the next call — do not free. Exists because a
+ * reasoning model emitting a tool call returns empty content, so `text` alone
+ * cannot tell you why the turn did what it did. */
+const char *basi_last_reasoning(void);
+
 GenerateResult generate_chat(const BasiMsg *messages, size_t msg_count,
                              struct BasiToolCall **tc_out, int *n_tc_out);
 
