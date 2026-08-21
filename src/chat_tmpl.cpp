@@ -18,6 +18,54 @@
 namespace {
 struct Tool { std::string name, description, parameters; };
 std::vector<Tool> g_tools;   // the registered tool set (session-constant)
+
+std::string b64(const std::string &in) {
+    static const char *T = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out;
+    out.reserve((in.size() + 2) / 3 * 4);
+    size_t i = 0;
+    while (i + 2 < in.size()) {
+        unsigned v = ((unsigned char)in[i] << 16) | ((unsigned char)in[i+1] << 8) | (unsigned char)in[i+2];
+        out += T[(v >> 18) & 63]; out += T[(v >> 12) & 63];
+        out += T[(v >> 6) & 63];  out += T[v & 63];
+        i += 3;
+    }
+    if (i + 1 == in.size()) {
+        unsigned v = (unsigned char)in[i] << 16;
+        out += T[(v >> 18) & 63]; out += T[(v >> 12) & 63]; out += "==";
+    } else if (i + 2 == in.size()) {
+        unsigned v = ((unsigned char)in[i] << 16) | ((unsigned char)in[i+1] << 8);
+        out += T[(v >> 18) & 63]; out += T[(v >> 12) & 63]; out += T[(v >> 6) & 63]; out += '=';
+    }
+    return out;
+}
+
+// Images live on disk and are read HERE, at serialization time, rather than
+// being carried inside the message. A 900x500 PNG is ~300KB of base64; holding
+// that in BasiMsg.content would make every char-based context estimate and
+// every compaction pass believe the conversation is ~70k tokens larger than it
+// is, for an image the model bills at ~500. The message stays a path.
+bool read_file_bytes(const std::string &path, std::string &out) {
+    FILE *f = fopen(path.c_str(), "rb");
+    if (!f) return false;
+    char buf[65536]; size_t n;
+    while ((n = fread(buf, 1, sizeof buf, f)) > 0) out.append(buf, n);
+    fclose(f);
+    return !out.empty();
+}
+
+// data: URI mime from the extension. The dispatcher normalizes everything to
+// PNG before it gets here, so this is a fallback for a hand-written path.
+const char *mime_of(const std::string &path) {
+    size_t d = path.rfind('.');
+    if (d == std::string::npos) return "image/png";
+    std::string e = path.substr(d + 1);
+    for (auto &c : e) c = (char) tolower((unsigned char) c);
+    if (e == "jpg" || e == "jpeg") return "image/jpeg";
+    if (e == "webp")               return "image/webp";
+    if (e == "gif")                return "image/gif";
+    return "image/png";
+}
 }
 
 extern "C" void basi_set_tools(const BasiToolDef *defs, int n) {
@@ -98,6 +146,38 @@ extern "C" char *basi_messages_to_json(const BasiMsg *msgs, int n_msgs) {
                 } catch (...) {}
                 m["content"] = body;
                 arr.push_back(std::move(m));
+            } else if (strcmp(role, "image") == 0) {
+                /* content = {"path":..., "text":...} — an image the agent asked
+                 * to look at. OpenAI has no way to put an image in a role:"tool"
+                 * result, so a view_image call lands as the text result plus
+                 * THIS user message carrying the pixels. Kept under its own
+                 * internal role so compaction's user-boundary walk does not
+                 * mistake it for a real user turn. */
+                std::string path, text;
+                try {
+                    auto j = nlohmann::ordered_json::parse(content);
+                    if (j.contains("path") && j["path"].is_string()) path = j["path"].get<std::string>();
+                    if (j.contains("text") && j["text"].is_string()) text = j["text"].get<std::string>();
+                } catch (...) {}
+                std::string bytes;
+                if (path.empty() || !read_file_bytes(path, bytes)) {
+                    /* The render was overwritten or cleaned up between the call
+                     * and this turn. Say so as text rather than dropping the
+                     * message: a silent disappearance would leave the model
+                     * arguing about an image nobody can see. */
+                    std::string note = text.empty() ? std::string() : text + "\n";
+                    note += "[image at " + (path.empty() ? std::string("(no path)") : path) +
+                            " could not be read — it may have been overwritten or deleted]";
+                    arr.push_back({ {"role", "user"}, {"content", note} });
+                } else {
+                    nlohmann::ordered_json parts = nlohmann::ordered_json::array();
+                    if (!text.empty())
+                        parts.push_back({ {"type", "text"}, {"text", text} });
+                    parts.push_back({ {"type", "image_url"},
+                                      {"image_url", { {"url", std::string("data:") + mime_of(path) +
+                                                              ";base64," + b64(bytes)} }} });
+                    arr.push_back({ {"role", "user"}, {"content", std::move(parts)} });
+                }
             } else {
                 arr.push_back({ {"role", role}, {"content", content} });
             }

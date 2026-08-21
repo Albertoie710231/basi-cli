@@ -1392,6 +1392,190 @@ static char *execute_mcp_tool(const char *name, const char *args_json) {
     return mcp_call_tool(name, args_json);
 }
 
+/* ── Vision: put a picture in front of the model ─────────────────────────────
+ * An OpenAI-compatible endpoint carries images only inside a user message's
+ * content array — there is no way to return one from a role:"tool" result. So
+ * view_image does two things: it answers the tool call with ordinary text, and
+ * it parks the image here for the agent loop to append as the next message.
+ *
+ * The file is normalized to a downscaled PNG first. A 4K screenshot tells the
+ * model nothing a 1024px one doesn't and costs several thousand more tokens;
+ * at this size a look is ~500 tokens, which is what makes "render, then look"
+ * affordable after every single change. */
+static char *g_pending_image = NULL;   /* {"path":...,"text":...}, or NULL */
+
+/* Single-quote for /bin/sh: wrap in '...', and close/escape/reopen each '. */
+static void sh_quote_into(StringBuf *sb, const char *s) {
+    sb_append_char(sb, '\'');
+    for (const char *p = s; *p; p++) {
+        if (*p == '\'') sb_append_str(sb, "'\\''");
+        else            sb_append_char(sb, *p);
+    }
+    sb_append_char(sb, '\'');
+}
+
+/* Per-process scratch dir for converted frames. They must OUTLIVE the call: the
+ * serializer re-reads the file on every turn, so an image deleted after the
+ * call would silently vanish from the conversation one round later. */
+static const char *image_scratch_dir(void) {
+    static char dir[256];
+    static bool tried = false;
+    if (!tried) {
+        tried = true;
+        snprintf(dir, sizeof dir, "/tmp/basi-img-%d", (int) getpid());
+        if (mkdir_p(dir) != 0) dir[0] = '\0';
+    }
+    return dir[0] ? dir : NULL;
+}
+
+/* Width/height straight out of the PNG IHDR (bytes 16..23, big-endian). Reading
+ * the header beats shelling out to `identify` for a number we can just look at,
+ * and it means the size reported to the model is measured, not assumed. */
+static bool png_dimensions(const char *path, unsigned *w, unsigned *h) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return false;
+    unsigned char hdr[24];
+    bool ok = fread(hdr, 1, sizeof hdr, f) == sizeof hdr &&
+              memcmp(hdr, "\x89PNG\r\n\x1a\n", 8) == 0 &&
+              memcmp(hdr + 12, "IHDR", 4) == 0;
+    fclose(f);
+    if (!ok) return false;
+    *w = ((unsigned)hdr[16] << 24) | ((unsigned)hdr[17] << 16) | ((unsigned)hdr[18] << 8) | hdr[19];
+    *h = ((unsigned)hdr[20] << 24) | ((unsigned)hdr[21] << 16) | ((unsigned)hdr[22] << 8) | hdr[23];
+    return *w > 0 && *h > 0;
+}
+
+static bool have_binary(const char *name) {
+    StringBuf c; sb_init(&c);
+    sb_append_str(&c, "command -v ");
+    sh_quote_into(&c, name);
+    sb_append_str(&c, " >/dev/null 2>&1");
+    char *cmd = sb_to_str(&c);
+    int rc = system(cmd);
+    free(cmd);
+    return rc == 0;
+}
+
+/* Normalize `in` to a downscaled PNG at `out`. Returns true on success. */
+static bool image_normalize(const char *in, const char *out) {
+    static const char *IM[] = { "magick", "convert", NULL };
+    for (int i = 0; IM[i]; i++) {
+        if (!have_binary(IM[i])) continue;
+        StringBuf c; sb_init(&c);
+        sb_append_str(&c, IM[i]);
+        sb_append_char(&c, ' ');
+        sh_quote_into(&c, in);
+        /* '>' inside the geometry means "only shrink" — never upscale a small
+         * plot into a blurry big one. Quoted so the shell cannot redirect on it. */
+        sb_append_str(&c, " -background black -alpha remove -alpha off -resize '1024x1024>' -strip ");
+        sh_quote_into(&c, out);
+        sb_append_str(&c, " >/dev/null 2>&1");
+        char *cmd = sb_to_str(&c);
+        int rc = system(cmd);
+        free(cmd);
+        if (rc == 0 && access(out, R_OK) == 0) return true;
+    }
+    if (have_binary("ffmpeg")) {
+        StringBuf c; sb_init(&c);
+        sb_append_str(&c, "ffmpeg -y -i ");
+        sh_quote_into(&c, in);
+        sb_append_str(&c, " -vf \"scale='min(1024,iw)':-2\" ");
+        sh_quote_into(&c, out);
+        sb_append_str(&c, " >/dev/null 2>&1");
+        char *cmd = sb_to_str(&c);
+        int rc = system(cmd);
+        free(cmd);
+        if (rc == 0 && access(out, R_OK) == 0) return true;
+    }
+    return false;
+}
+
+static bool ext_is_api_native(const char *path) {
+    const char *d = strrchr(path, '.');
+    if (!d) return false;
+    return strcasecmp(d, ".png")  == 0 || strcasecmp(d, ".jpg") == 0 ||
+           strcasecmp(d, ".jpeg") == 0 || strcasecmp(d, ".webp") == 0 ||
+           strcasecmp(d, ".gif")  == 0;
+}
+
+static char *execute_view_image(const char *path, const char *note) {
+    if (!path || !*path) return strdup("Error: view_image requires a path");
+
+    struct stat st;
+    if (stat(path, &st) != 0 || !S_ISREG(st.st_mode)) {
+        size_t n = strlen(path) + 160;
+        char *m = malloc(n);
+        snprintf(m, n, "Error: no image file at '%s'. Render or save it first, "
+                       "then call view_image on the path it wrote.", path);
+        return m;
+    }
+    if (st.st_size == 0) {
+        size_t n = strlen(path) + 128;
+        char *m = malloc(n);
+        snprintf(m, n, "Error: '%s' is empty (0 bytes) — the render wrote nothing.", path);
+        return m;
+    }
+
+    const char *dir = image_scratch_dir();
+    char outbuf[320];
+    const char *shown = NULL;              /* the file the API will actually read */
+    if (dir) {
+        static int seq = 0;
+        snprintf(outbuf, sizeof outbuf, "%s/%03d.png", dir, ++seq);
+        if (image_normalize(path, outbuf)) shown = outbuf;
+    }
+    if (!shown) {
+        /* No converter available. A format the API already understands can still
+         * be sent as-is; anything else genuinely cannot be shown. */
+        if (!ext_is_api_native(path)) {
+            size_t n = strlen(path) + 320;
+            char *m = malloc(n);
+            snprintf(m, n,
+                "Error: cannot convert '%s' — no ImageMagick (`magick`/`convert`) or "
+                "`ffmpeg` on PATH. Either install one, or have the program write "
+                "png/jpg directly.", path);
+            return m;
+        }
+        shown = path;
+    }
+
+    unsigned w = 0, h = 0;
+    bool have_dim = png_dimensions(shown, &w, &h);
+
+    /* Park the image for the loop to append as the next message. */
+    free(g_pending_image);
+    StringBuf env; sb_init(&env);
+    /* json_escape_into writes its OWN surrounding quotes — do not add a second
+       pair, or the envelope is malformed and the serializer silently drops the
+       image (it parses under a catch-all, so a bad envelope reads exactly like
+       a deleted file). */
+    sb_append_str(&env, "{\"path\":");
+    json_escape_into(&env, shown);
+    sb_append_str(&env, ",\"text\":");
+    {
+        StringBuf cap; sb_init(&cap);
+        sb_append_str(&cap, "Image: ");
+        sb_append_str(&cap, path);
+        if (note && *note) { sb_append_str(&cap, "\nLooking for: "); sb_append_str(&cap, note); }
+        char *capstr = sb_to_str(&cap);
+        json_escape_into(&env, capstr);
+        free(capstr);
+    }
+    sb_append_str(&env, "}");
+    g_pending_image = sb_to_str(&env);
+
+    StringBuf r; sb_init(&r);
+    sb_append_str(&r, "Image attached below — look at it and describe what you actually see.\n  source: ");
+    sb_append_str(&r, path);
+    if (have_dim) {
+        char d[96];
+        snprintf(d, sizeof d, "\n  shown at: %ux%u px", w, h);
+        sb_append_str(&r, d);
+    }
+    if (shown == outbuf) sb_append_str(&r, " (downscaled copy)");
+    return sb_to_str(&r);
+}
+
 /* Set while the native dispatcher is delegating to execute_tool, so the call is
  * counted once by whichever dispatcher the model actually entered through. */
 static bool toolstat_nested = false;
@@ -1425,7 +1609,7 @@ static char *execute_tool_native(const char *name, const char *args_json) {
                   strcmp(name, "tail") == 0  || strcmp(name, "grep") == 0 ||
                   strcmp(name, "wc")   == 0  || strcmp(name, "web_search") == 0 ||
                   strcmp(name, "web_fetch") == 0 || strcmp(name, "readfile") == 0 ||
-                  strcmp(name, "symbols") == 0;
+                  strcmp(name, "symbols") == 0 || strcmp(name, "view_image") == 0;
 
     if (!direct) {
         char *cmd = basi_build_command(name, args_json);
@@ -1457,6 +1641,13 @@ static char *execute_tool_native(const char *name, const char *args_json) {
         long count = jx_get_int(args_json, "count");   /* 0 if absent */
         char *r = read_file_window(file, start, count);
         free(file);
+        return r;
+    }
+    if (strcmp(name, "view_image") == 0) {
+        char *ipath = jx_get_string(args_json, "path");
+        char *inote = jx_get_string(args_json, "note");     /* may be NULL */
+        char *r = execute_view_image(ipath, inote);
+        free(ipath); free(inote);
         return r;
     }
     if (strcmp(name, "symbols") == 0) {
@@ -4111,6 +4302,15 @@ static void run_agentic_turn(char *user_input,
                     sb_free(&tr);
                     ADD_MESSAGE("tool_call", call_env);     /* assistant: the call */
                     ADD_MESSAGE("tool_result", res_env);    /* tool: the result   */
+                    /* view_image parked pixels for us. They have to ride in a
+                       user message — the tool result above can only carry text —
+                       and it must come AFTER that result so the call/result pair
+                       stays adjacent, which the API requires. */
+                    if (g_pending_image) {
+                        ADD_MESSAGE("image", g_pending_image);
+                        free(g_pending_image);
+                        g_pending_image = NULL;
+                    }
                     free(res_env);
                     free(result.text);
                 } else {

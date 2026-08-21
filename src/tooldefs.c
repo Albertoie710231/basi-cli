@@ -69,6 +69,9 @@ static const BasiToolDef TOOLS[] = {
       OBJ(STR("slug", "Slug of the study to run"), "[\"slug\"]") },
     { "plan_verify", "Run the verify clause of every Implementation Plan row (active phase), or one row by id.",
       OBJ(STR("id", "Optional row id, e.g. 1.2"), "[]") },
+    { "view_image", "LOOK at an image file — you have vision. Use it whenever the question is about what something LOOKS like: a render, a screenshot, a plot, a photo, a diagram. Render to a file, then view_image it, and judge the picture instead of guessing from the code. png/jpg/webp/gif work directly; ppm/bmp/tga and any other format are converted first. Large images are downscaled, so a shot costs roughly 500 tokens — viewing one after every change is cheap and is the point.",
+      OBJ(STR("path", "Path to the image file") ","
+          STR("note", "Optional: what to look for, e.g. 'is the hair attached to the scalp?'"), "[\"path\"]") },
 };
 
 /* ── Extra (dynamically discovered) tools ───────────────────────────────
