@@ -1792,7 +1792,16 @@ static char *execute_tool_native(const char *name, const char *args_json) {
     StringBuf sh;
     sb_init(&sh);
     if (strcmp(name, "grep") == 0) {
-        sb_append_str(&sh, "grep -n");
+        /* -E, not plain grep. A model writes alternation as `a|b` without a
+           second thought, and in BASIC regex `|` is a literal — so
+           `grep shellVolume|innerRadius` searched for that exact 25-character
+           string and returned NOTHING on a file containing four matches. Silent,
+           and worse than silent: an empty result reads as "this symbol does not
+           exist here", which is a wrong answer rather than a missing one. Caught
+           twice in two runs of the same investigation, each time costing a round
+           to notice and re-issue through bash. Extended regex is what the model
+           already believes it is writing. */
+        sb_append_str(&sh, "grep -nE");
         long ctx = jx_get_int(args_json, "context");
         if (ctx > 0) { char b[32]; snprintf(b, sizeof(b), " -C %ld", ctx); sb_append_str(&sh, b); }
         char *pattern = jx_get_string(args_json, "pattern");

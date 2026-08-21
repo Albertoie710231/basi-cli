@@ -27,8 +27,8 @@ static const BasiToolDef TOOLS[] = {
       OBJ(STR("file", "Path to the file") "," INT("lines", "Number of lines (default 10)"), "[\"file\"]") },
     { "tail", "Read the last N lines of a file.",
       OBJ(STR("file", "Path to the file") "," INT("lines", "Number of lines (default 10)"), "[\"file\"]") },
-    { "grep", "Search a file for a pattern; returns matching lines with line numbers.",
-      OBJ(STR("pattern", "Text or regex to search for") "," STR("file", "Path to the file") ","
+    { "grep", "Search a file for a pattern; returns matching lines with line numbers. EXTENDED regex (grep -E), so alternation is a|b and groups are (a|b) — no backslashes needed.",
+      OBJ(STR("pattern", "Text or extended regex (grep -E) to search for, e.g. shellVolume|innerRadius") "," STR("file", "Path to the file") ","
           INT("context", "Lines of surrounding context to include (optional)"), "[\"pattern\",\"file\"]") },
     { "wc", "Count lines, words and characters in a file.",
       OBJ(STR("file", "Path to the file"), "[\"file\"]") },
