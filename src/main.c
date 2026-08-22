@@ -49,6 +49,7 @@
 #include "cookbook.h"
 #include "slashmenu.h"
 #include "srvgen.h"
+#include "sampling.h"
 #include "srvchat.h"
 #include "backend.h"
 #include "helpparse.h"
@@ -5332,11 +5333,50 @@ int main(int argc, char **argv) {
        thinking mode, and a hardcoded 0.05 quietly overrode the vendor's own
        recommendation with no flag, no env var and no way to tell. */
     float min_p_v = 0.05f;
+    bool  min_p_explicit = false, repeat_explicit = false;
     {
         const char *mp = getenv("BASI_MIN_P");
-        if (mp) { float v = (float) atof(mp); if (v >= 0.0f && v < 1.0f) min_p_v = v; }
+        if (mp) { float v = (float) atof(mp);
+                  if (v >= 0.0f && v < 1.0f) { min_p_v = v; min_p_explicit = true; } }
+        if (getenv("BASI_REPEAT_PENALTY")) repeat_explicit = true;
     }
-    basi_srv_sampling.temperature    = temp_override >= 0 ? temp_override : 0.4;
+
+    double temp_v = temp_override >= 0 ? temp_override : 0.4;
+
+    /* Per-model recommended sampling. BASI's defaults are one compromise applied
+       to every model, and against Qwen3.8 every one of the five was wrong —
+       silently, because nothing printed what was in use. A profile fills in only
+       what the caller did NOT specify: an explicit flag or env var still wins. */
+    {
+        /* Key on whatever identifies the model in THIS mode. A hosted run has no
+           local file — it has an id like "Qwen/Qwen3.8-27B-FP8", which is both
+           the natural key and where this bug was first found. */
+        const char *samp_key = remote_api ? srvchat_remote_model() : model_path;
+        SamplingProfile prof;
+        if (sampling_profile_for(samp_key, &prof) > 0) {
+            char applied[256]; size_t al = 0; applied[0] = '\0';
+            #define NOTE(fmt, ...) do { \
+                al += (size_t) snprintf(applied + al, sizeof(applied) - al, \
+                                        (al ? " " fmt : fmt), __VA_ARGS__); } while (0)
+            if (prof.temperature >= 0 && temp_override < 0) {
+                temp_v = prof.temperature;           NOTE("temp=%.2f", temp_v); }
+            if (prof.top_p >= 0 && cli.cli_top_p == 1.0f && !getenv("BASI_TOP_P")) {
+                top_p = (float) prof.top_p;          NOTE("top_p=%.2f", (double) top_p); }
+            if (prof.top_k >= 0 && cli.cli_top_k == 0 && !getenv("BASI_TOP_K")) {
+                top_k = prof.top_k;                  NOTE("top_k=%d", top_k); }
+            if (prof.min_p >= 0 && !min_p_explicit) {
+                min_p_v = (float) prof.min_p;        NOTE("min_p=%.2f", (double) min_p_v); }
+            if (prof.repeat_penalty >= 0 && !repeat_explicit) {
+                repeat_pen = (float) prof.repeat_penalty;
+                NOTE("repeat_penalty=%.2f", (double) repeat_pen); }
+            #undef NOTE
+            if (applied[0])
+                fprintf(stderr, "\033[90m[sampling] %s  (from %s)\033[0m\n",
+                        applied, prof.source);
+        }
+    }
+
+    basi_srv_sampling.temperature    = temp_v;
     basi_srv_sampling.repeat_penalty = repeat_pen;
     basi_srv_sampling.repeat_last_n  = 256;
     basi_srv_sampling.min_p          = min_p_v;
