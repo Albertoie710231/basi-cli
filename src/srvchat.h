@@ -121,6 +121,10 @@ const char *srvchat_remote_base(void);
  * (guessing LOW silently compacts what the provider would have accepted whole). */
 int srvchat_remote_context_length(void);
 
+/* 1 once a request has been refused because the model cannot take images, so a
+ * caller can stop sending them and degrade instead of losing the turn. */
+int srvchat_vision_unsupported(void);
+
 /* POST one text to a llama-server /embedding endpoint (spawned with --embedding).
  * Writes up to max_dim floats of the pooled embedding into out and returns the
  * count written (the embedding dimension), or -1 on transport/parse failure. */

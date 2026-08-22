@@ -102,6 +102,11 @@ static std::string http_get(const std::string &url) {
 
 /* Pull a positive context length out of one model object, across the field names
  * different providers use for the same number. */
+/* Set once a provider has refused a request because the model cannot accept
+ * images. Sticky for the process: capability does not come back mid-session. */
+static bool g_vision_unsupported = false;
+extern "C" int srvchat_vision_unsupported(void) { return g_vision_unsupported ? 1 : 0; }
+
 static int ctxlen_of(const json &m) {
     if (!m.is_object()) return 0;
     for (const char *k : { "context_length", "context_window",
@@ -485,6 +490,21 @@ extern "C" int srvchat_complete_n(
         } catch (...) { /* not JSON — show the raw body */ }
         while (!msg.empty() && (msg.back() == '\n' || msg.back() == '\r')) msg.pop_back();
         if (msg.size() > 600) msg.resize(600);
+        /* "This model does not support image inputs" (Fireworks), "Unsupported
+         * ChatMessageContent type: image_url" (gpt-oss), and llama-server's
+         * "image input is not supported - hint: provide the mmproj" all mean the
+         * same thing, and all of them fail the WHOLE request: no text, no tool
+         * call, turn over. Measured once at 11 tool calls — a build and three
+         * renders — discarded because the model could not look at the picture.
+         * Record it so the caller can drop the image and carry on. */
+        {
+            std::string low = msg;
+            for (auto &c : low) c = (char) tolower((unsigned char) c);
+            if (low.find("image") != std::string::npos &&
+                (low.find("not support") != std::string::npos ||
+                 low.find("unsupported")  != std::string::npos))
+                g_vision_unsupported = true;
+        }
         fprintf(stderr, "\033[1;31m[%s] request failed:\033[0m %s\n",
                 g_rem_on ? "api" : "server", msg.c_str());
     }

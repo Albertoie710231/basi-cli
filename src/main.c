@@ -1598,6 +1598,11 @@ static bool ext_is_api_native(const char *path) {
 
 static char *execute_view_image(const char *path, const char *note) {
     if (!path || !*path) return strdup("Error: view_image requires a path");
+    if (srvchat_vision_unsupported())
+        return strdup("Error: this model cannot accept images — a previous attempt was "
+                      "refused by the backend. Do NOT call view_image again this session. "
+                      "Judge from what the program PRINTS instead: measured numbers, "
+                      "pixel counts, extents, assertions.");
 
     struct stat st;
     if (stat(path, &st) != 0 || !S_ISREG(st.st_mode)) {
@@ -1672,6 +1677,25 @@ static char *execute_view_image(const char *path, const char *note) {
     }
     if (shown == outbuf) sb_append_str(&r, " (downscaled copy)");
     return sb_to_str(&r);
+}
+
+/* An image message the backend refused cannot stay in the array: every later
+ * request would carry it and fail the same way. Rewrite it in place as ordinary
+ * text — `role` is a borrowed literal and `content` is owned, so this is a free
+ * and a strdup, no array surgery, and the tool_call/tool_result ordering the
+ * elision stubs depend on is untouched. Returns how many were rewritten. */
+static int demote_image_messages(BasiMsg *msgs, size_t n) {
+    int changed = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (!msgs[i].role || strcmp(msgs[i].role, "image") != 0) continue;
+        free((void *) msgs[i].content);
+        msgs[i].role    = "user";
+        msgs[i].content = strdup("[an image was going to be attached here, but this model "
+                                 "cannot accept images. It was removed. Judge from what the "
+                                 "program prints, not from a picture you cannot see.]");
+        changed++;
+    }
+    return changed;
 }
 
 /* Set while the native dispatcher is delegating to execute_tool, so the call is
@@ -4578,6 +4602,25 @@ static void run_agentic_turn(char *user_input,
                    attempt, don't end the turn — nudge the model to re-emit a valid call
                    and keep looping. Bounded by a small consecutive-failure cap so a
                    persistently-degenerate model still terminates. */
+                /* The request came back with nothing at all because the provider
+                   refused the image. Ending the turn here throws away everything
+                   the run has done — measured once at 11 calls, a build and three
+                   renders. Strip the image, say why, and keep going. */
+                if (srvchat_vision_unsupported() &&
+                    demote_image_messages(messages, msg_count) > 0 &&
+                    tool_iterations < max_tool_iterations) {
+                    printf("\033[33m[vision: this model cannot accept images — image "
+                           "dropped, continuing without it]\033[0m\n");
+                    fflush(stdout);
+                    ADD_MESSAGE("user",
+                        "That image could not be sent: this model has no vision. Do not call "
+                        "view_image again. Continue the task using what the program PRINTS — "
+                        "measured numbers, extents, pixel counts, assertions — and say plainly "
+                        "in your write-up that the visual check could not be performed.");
+                    free(result.text);
+                    continue;
+                }
+
                 int looks_like_call = native_tools && result.text &&
                     (strstr(result.text, "<tool_call>") ||
                      strstr(result.text, "<function=") ||
