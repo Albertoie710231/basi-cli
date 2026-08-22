@@ -2196,6 +2196,10 @@ static Cli parse_args(int argc, char **argv) {
                    "  -t, --temp      Sampling temperature (default: 0.4; 0 = greedy)\n"
                    "  -k, --top-k     Top-k sampling (default: 0 = disabled). Also BASI_TOP_K.\n"
                    "  --top-p         Top-p / nucleus sampling (default: 1.0 = disabled). Also BASI_TOP_P.\n"
+                   "                  BASI_MIN_P sets min-p (default 0.05); BASI_REPEAT_PENALTY the\n"
+                   "                  repetition penalty (1.0 = off). Check your model card: Qwen3.8\n"
+                   "                  thinking mode asks for temp 1.0, top_p 0.95, top_k 20, min_p 0,\n"
+                   "                  repetition_penalty 1.0 — BASI's defaults match none of those.\n"
                    "  --seed          RNG seed for sampling (default: random). Fix it for\n"
                    "                  reproducible output.\n"
                    "  -p, --prompt    Run a single prompt non-interactively (with tools), then exit\n"
@@ -5323,10 +5327,19 @@ int main(int argc, char **argv) {
         const char *rp = getenv("BASI_REPEAT_PENALTY");
         if (rp) { float v = (float)atof(rp); if (v >= 1.0f && v <= 2.0f) repeat_pen = v; }
     }
+    /* min_p was the one sampling parameter with no way to reach it from outside,
+       which matters because model cards specify it: Qwen3.8 asks for min_p=0.0 in
+       thinking mode, and a hardcoded 0.05 quietly overrode the vendor's own
+       recommendation with no flag, no env var and no way to tell. */
+    float min_p_v = 0.05f;
+    {
+        const char *mp = getenv("BASI_MIN_P");
+        if (mp) { float v = (float) atof(mp); if (v >= 0.0f && v < 1.0f) min_p_v = v; }
+    }
     basi_srv_sampling.temperature    = temp_override >= 0 ? temp_override : 0.4;
     basi_srv_sampling.repeat_penalty = repeat_pen;
     basi_srv_sampling.repeat_last_n  = 256;
-    basi_srv_sampling.min_p          = 0.05;
+    basi_srv_sampling.min_p          = min_p_v;
     basi_srv_sampling.top_k          = top_k;
     basi_srv_sampling.top_p          = top_p;
     basi_srv_sampling.seed           = (cli_seed == BASI_DEFAULT_SEED) ? -1 : (long) cli_seed;
