@@ -22,7 +22,7 @@ static const BasiToolDef TOOLS[] = {
               "`count` lines from line `start`, with a footer telling you how to read the next window.",
       OBJ(STR("file", "Path to the file") ","
           INT("start", "1-based line to start at (optional; default 1)") ","
-          INT("count", "number of lines to read (optional; default 400)"), "[\"file\"]") },
+          INT("count", "number of lines to read (optional; defaults to the largest window, which is also the maximum)"), "[\"file\"]") },
     { "head", "Read the first N lines of a file.",
       OBJ(STR("file", "Path to the file") "," INT("lines", "Number of lines (default 10)"), "[\"file\"]") },
     { "tail", "Read the last N lines of a file.",

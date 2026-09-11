@@ -711,9 +711,15 @@ int request_approval(const char *tool_label, const char *cmd) {
 
 /* ── Execute tool command ──────────────────────────────────────────── */
 
-#define READ_WHOLE_MAX_BYTES   24000   /* <= this AND no window: return the file whole (~6k tokens) */
-#define READ_WINDOW_LINES        400   /* default lines per window for a larger file */
-#define READ_WINDOW_MAX_BYTES  24000   /* hard byte cap on one window */
+/* A read has to fit the tool-result cap whole. It used to allow 24 KB windows,
+ * three times what truncate_tool_result lets through, so the cut took the MIDDLE
+ * of every larger window, and the footer's "continue at line N" skipped what had
+ * gone. Measured on a 17 KB paper read whole: the 9.3 KB that went missing was its
+ * entire method section. A window now survives the cut (the header and footer are
+ * each under 512 bytes), and a file that does not fit is paged instead. */
+#define READ_WINDOW_LINES      (TOOL_RESULT_HEAD_LINES + TOOL_RESULT_TAIL_LINES - 10)
+#define READ_WINDOW_MAX_BYTES  (TOOL_RESULT_MAX_BYTES - 1024)
+#define READ_WHOLE_MAX_BYTES   READ_WINDOW_MAX_BYTES  /* and <= READ_WINDOW_LINES: returned whole */
 
 /* Read a WINDOW of a file's lines. 1-based `start`, `count` lines (<=0 => defaults).
  * A file that fits whole (<= READ_WHOLE_MAX_BYTES) and was requested without an
@@ -740,19 +746,21 @@ static char *read_file_window(const char *filepath, long start, long count) {
     buf[n] = '\0';
     fclose(f);
 
+    long total = 0;
+    for (size_t i = 0; i < n; i++) if (buf[i] == '\n') total++;
+    if (n > 0 && buf[n-1] != '\n') total++;
+    if (total == 0) total = 1;
+
     bool explicit_window = (start > 0 || count > 0);
-    if (!explicit_window && n <= READ_WHOLE_MAX_BYTES) {
+    if (!explicit_window && n <= READ_WHOLE_MAX_BYTES && total <= READ_WINDOW_LINES) {
         read_tracker_mark(filepath);
         return buf;                          /* small file: whole, unchanged */
     }
 
     if (start < 1) start = 1;
-    if (count <= 0) count = READ_WINDOW_LINES;
-
-    long total = 0;
-    for (size_t i = 0; i < n; i++) if (buf[i] == '\n') total++;
-    if (n > 0 && buf[n-1] != '\n') total++;
-    if (total == 0) total = 1;
+    /* A bigger count would only be cut again downstream. Clamping it here keeps the
+       footer's next start honest. */
+    if (count <= 0 || count > READ_WINDOW_LINES) count = READ_WINDOW_LINES;
 
     /* byte offset of the first byte of line `start` */
     long line = 1; size_t off = 0;
@@ -4510,10 +4518,23 @@ static void run_agentic_turn(char *user_input,
                     }
                 }
 
+                /* Truncate tool result if too large — line-aware, head+tail.
+                   The dim "└ <summary>" sub-line (printed below) reports the outcome
+                   (and any trim) directly under the activity header. */
+                size_t dropped = truncate_tool_result(tool_result,
+                        TOOL_RESULT_HEAD_LINES, TOOL_RESULT_TAIL_LINES,
+                        TOOL_RESULT_MAX_BYTES);
+
                 /* Re-read dedup: if this substantial result is byte-identical to one the
                    model already received this turn, re-reading it added nothing — replace
                    its context copy with a nudge to act, so a phase cannot burn its budget
-                   re-reading one file. Journaled above first, so the log stays lossless. */
+                   re-reading one file. Journaled above first, so the log stays lossless.
+                   It runs AFTER the truncation, on what the model actually receives.
+                   Run before it, every line of the cut middle was recorded as seen, so
+                   the one read that could recover it was refused as "NEARLY ALL of this
+                   was in an earlier result". Measured on a paper whose method section
+                   had been cut: the model asked for exactly those lines and was told it
+                   already had them. */
                 if (tool_result && strlen(tool_result) > 200) {
                     unsigned long h = tool_result_hash(tool_result);
                     bool exact = false;
@@ -4542,6 +4563,7 @@ static void run_agentic_turn(char *user_input,
                             journal_path());
                         free(tool_result);
                         tool_result = strdup(nudge);
+                        dropped = 0;               /* the nudge itself is not trimmed */
                         printf("\033[33m[dedup: %s re-read — nudging toward action]\033[0m\n",
                                exact ? "identical" : "overlapping");
                         fflush(stdout);
@@ -4580,12 +4602,6 @@ static void run_agentic_turn(char *user_input,
                     }
                 }
 
-                /* Truncate tool result if too large — line-aware, head+tail.
-                   The dim "└ <summary>" sub-line reports the outcome (and any
-                   trim) directly under the activity header. */
-                size_t dropped = truncate_tool_result(tool_result,
-                        TOOL_RESULT_HEAD_LINES, TOOL_RESULT_TAIL_LINES,
-                        TOOL_RESULT_MAX_BYTES);
                 print_tool_result_line(tool_result, dropped);
 
                 /* context_used_tokens() reads the server's tracked prompt count in

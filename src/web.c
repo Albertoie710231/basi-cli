@@ -1040,7 +1040,8 @@ char *execute_web_fetch(const char *url) {
         char note[512];
         snprintf(note, sizeof(note),
             "\n\n[TRUNCATED] This is the first %d of %zu characters. The FULL text is saved at "
-            "%s — page through it with `read %s start=<line> count=400`, or `grep` it for a "
+            "%s — page through it with `read %s start=<line>` (each window says where the next "
+            "one starts), or `grep` it for a "
             "section heading. For a paper, the method and equations are well past this point; "
             "do not conclude from the abstract alone.\n",
             WEB_FETCH_MAX_CHARS, full_len, spill, spill);
