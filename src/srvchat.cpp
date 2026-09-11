@@ -2,6 +2,7 @@
  * no libllama/ggml symbols (part of item 6 — dropping the in-process link). */
 #include "srvchat.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -63,16 +64,18 @@ static std::string shq(const std::string &s) {
 /* Write the bearer token to a fresh 0600 file in curl's -K config format and
  * return its path (empty when there is no key, or on failure — the caller then
  * simply sends no Authorization header). The key never goes on a command line:
- * argv is world-readable through `ps`. Caller unlinks. */
-static std::string write_auth_file(void) {
-    if (g_rem_key.empty()) return "";
+ * argv is world-readable through `ps`. Caller unlinks. The key is a parameter,
+ * not g_rem_key, because the /model picker lists a provider's models before any
+ * remote is configured. */
+static std::string write_auth_file(const std::string &key) {
+    if (key.empty()) return "";
     char path[] = "/tmp/basi_srvauth_XXXXXX";
     int fd = mkstemp(path);                     /* mkstemp creates it 0600 */
     if (fd < 0) return "";
     FILE *f = fdopen(fd, "w");
     if (!f) { close(fd); unlink(path); return ""; }
     std::string k;                              /* -K syntax: quoted, backslash-escaped */
-    for (char c : g_rem_key) { if (c == '"' || c == '\\') k += '\\'; k += c; }
+    for (char c : key) { if (c == '"' || c == '\\') k += '\\'; k += c; }
     fprintf(f, "header = \"Authorization: Bearer %s\"\n", k.c_str());
     fclose(f);
     return path;
@@ -85,8 +88,8 @@ static std::string write_auth_file(void) {
  * hardcoded number that is wrong for most models, and being wrong LOW silently
  * compacts conversations the provider would have accepted whole. */
 /* One authenticated GET, body returned as a string (empty on failure). */
-static std::string http_get(const std::string &url) {
-    std::string auth = write_auth_file();
+static std::string http_get(const std::string &url, const std::string &key) {
+    std::string auth = write_auth_file(key);
     std::string cmd = "curl -s --connect-timeout 5 --max-time 10 ";
     if (!auth.empty()) cmd += "-K " + shq(auth) + " ";
     cmd += shq(url);
@@ -124,7 +127,7 @@ extern "C" int srvchat_remote_context_length(void) {
 
     /* (1) The OpenAI-standard listing. Works anywhere it is implemented. */
     try {
-        json d = json::parse(http_get(g_rem_url + "/models"));
+        json d = json::parse(http_get(g_rem_url + "/models", g_rem_key));
         if (d.contains("data") && d["data"].is_array())
             for (const json &m : d["data"])
                 if (m.is_object() && m.value("id", std::string()) == g_rem_model) {
@@ -144,12 +147,63 @@ extern "C" int srvchat_remote_context_length(void) {
         std::string host = (host_end == std::string::npos) ? g_rem_url
                                                            : g_rem_url.substr(0, host_end);
         try {
-            json d = json::parse(http_get(host + "/v1/" + g_rem_model));
+            json d = json::parse(http_get(host + "/v1/" + g_rem_model, g_rem_key));
             int v = ctxlen_of(d);
             if (v > 0) return v;
         } catch (...) { /* fall through to the caller's default */ }
     }
     return 0;
+}
+
+/* The name a person would say: "kimi-k3", not "accounts/fireworks/models/kimi-k3". */
+static const char *id_leaf(const char *id) {
+    const char *s = strrchr(id, '/');
+    return s ? s + 1 : id;
+}
+
+extern "C" int srvchat_list_chat_models(const char *base_url, const char *api_key,
+                                        SrvRemoteModel **out) {
+    if (!out) return -1;
+    *out = nullptr;
+    if (!base_url || !*base_url) return -1;
+    std::string u = base_url;
+    while (!u.empty() && u.back() == '/') u.pop_back();
+
+    json d;
+    try { d = json::parse(http_get(u + "/models", api_key ? api_key : "")); }
+    catch (...) { return -1; }
+    if (!d.is_object() || !d.contains("data") || !d["data"].is_array()) return -1;
+
+    /* -1 when the provider does not say, so the picker can print nothing rather
+       than a confident "no tools" it never read. */
+    auto flag = [](const json &m, const char *k) {
+        return (m.contains(k) && m[k].is_boolean()) ? (m[k].get<bool>() ? 1 : 0) : -1;
+    };
+    std::vector<SrvRemoteModel> v;
+    for (const json &m : d["data"]) {
+        if (!m.is_object() || !m.contains("id") || !m["id"].is_string()) continue;
+        if (m.contains("kind") && m["kind"].is_string() &&
+            m["kind"].get<std::string>().find("EMBEDDING") != std::string::npos) continue;
+        if (flag(m, "supports_chat") == 0) continue;
+        char *id = dup_cstr(m["id"].get<std::string>());
+        if (!id) continue;
+        v.push_back({ id, ctxlen_of(m), flag(m, "supports_tools"), flag(m, "supports_image_input") });
+    }
+    std::sort(v.begin(), v.end(), [](const SrvRemoteModel &a, const SrvRemoteModel &b) {
+        return strcmp(id_leaf(a.id), id_leaf(b.id)) < 0;
+    });
+    if (v.empty()) return 0;
+
+    *out = (SrvRemoteModel *) malloc(v.size() * sizeof(SrvRemoteModel));
+    if (!*out) { for (auto &m : v) free(m.id); return -1; }
+    memcpy(*out, v.data(), v.size() * sizeof(SrvRemoteModel));
+    return (int) v.size();
+}
+
+extern "C" void srvchat_free_models(SrvRemoteModel *models, int n) {
+    if (!models) return;
+    for (int i = 0; i < n; i++) free(models[i].id);
+    free(models);
 }
 
 /* Assemble the request body: caller messages/tools + streaming + sampling.
@@ -363,7 +417,7 @@ extern "C" int srvchat_complete_n(
     std::string url, cmd, authpath;
     if (g_rem_on) {
         url = g_rem_url + "/chat/completions";
-        authpath = write_auth_file();
+        authpath = write_auth_file(g_rem_key);
         if (authpath.empty() && !g_rem_key.empty()) { unlink(reqpath); return -1; }
     } else {
         char b[96];

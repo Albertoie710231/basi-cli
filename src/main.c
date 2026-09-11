@@ -2024,6 +2024,14 @@ static const ApiProvider *api_provider_by_name(const char *n) {
     return NULL;
 }
 
+/* BASI_API_KEY is the generic override; otherwise the provider's own conventional
+ * variable, which is what its docs tell you to export. NULL when neither is set. */
+static const char *api_key_for(const ApiProvider *pv) {
+    const char *key = getenv("BASI_API_KEY");
+    if ((!key || !*key) && pv) key = getenv(pv->key_env);
+    return (key && *key) ? key : NULL;
+}
+
 static void api_list_providers(FILE *f) {
     fprintf(f, "  known providers:");
     for (int i = 0; i < N_API_PROVIDERS; i++) fprintf(f, " %s", API_PROVIDERS[i].name);
@@ -2081,11 +2089,8 @@ static int api_setup_remote(const char *cli_api, const char *cli_api_model) {
         return -1;
     }
 
-    /* BASI_API_KEY is the generic override; otherwise use the provider's own
-       conventional variable, which is what its docs tell you to export. */
-    const char *key = getenv("BASI_API_KEY");
-    if ((!key || !*key) && pv) key = getenv(pv->key_env);
-    if (!key || !*key) {
+    const char *key = api_key_for(pv);
+    if (!key) {
         fprintf(stderr, "\033[1;31mError: no API key in the environment.\033[0m\n");
         if (pv) fprintf(stderr, "  export %s=...   (or BASI_API_KEY=...)\n", pv->key_env);
         else    fprintf(stderr, "  export BASI_API_KEY=...\n");
@@ -2102,6 +2107,33 @@ static int api_setup_remote(const char *cli_api, const char *cli_api_model) {
        the file from itself would just churn it. */
     if (cli_api && *cli_api) save_default_api(sel, model);
     return 1;
+}
+
+/* The /model picker's hosted tab. Fireworks only: it is the provider this box
+ * runs, and its GET /models reports context length and tool/vision support per
+ * model. Base URL and key resolve exactly as `--api fireworks` would, so the tab
+ * lists what a pick will actually call. The in-use model — env first, then the
+ * saved default, the order api_setup_remote reads them — opens the tab on it. */
+static const PickerRemote *picker_remote_tab(void) {
+    static PickerRemote tab;
+    static char cur[512];
+    const ApiProvider *pv = api_provider_by_name("fireworks");
+    const char *base = getenv("BASI_API_BASE");
+    const char *env_api = getenv("BASI_API"), *env_model = getenv("BASI_API_MODEL");
+    char prov[128];
+
+    cur[0] = '\0';
+    if (env_api && *env_api) {
+        if (strcasecmp(env_api, pv->name) == 0 && env_model && *env_model)
+            copy_bounded(cur, sizeof cur, env_model);
+    } else if (!api_ignore_saved && load_default_api(prov, sizeof prov, cur, sizeof cur)) {
+        if (strcasecmp(prov, pv->name) != 0) cur[0] = '\0';
+    } else {
+        cur[0] = '\0';
+    }
+    tab = (PickerRemote){ "FIREWORKS AI", pv->name, (base && *base) ? base : pv->base_url,
+                          api_key_for(pv), pv->key_env, cur[0] ? cur : NULL };
+    return &tab;
 }
 
 /* ── CLI argument parsing ──────────────────────────────────────────── */
@@ -2254,7 +2286,9 @@ static Cli parse_args(int argc, char **argv) {
                    "Model selection:\n"
                    "  With no -m, BASI uses the saved default (set by the first-run picker or\n"
                    "  the in-chat /model command), then $BASI_MODEL, then the picker. So after\n"
-                   "  you pick once, later launches go straight to chat; /model switches later.\n\n"
+                   "  you pick once, later launches go straight to chat; /model switches later.\n"
+                   "  In the picker, Tab switches between local GGUFs and Fireworks' hosted\n"
+                   "  models (listed live; needs FIREWORKS_API_KEY). Either choice is remembered.\n\n"
                    "Hosted APIs (--api):\n"
                    "  No GGUF, no VRAM fit, no spawned server — BASI is a plain HTTP client.\n"
                    "  Providers: fireworks openai openrouter together groq deepseek mistral cerebras\n"
@@ -2457,6 +2491,18 @@ static void pricing_init(void) {
     if (have_out) price_out = atof(o);
     price_cached = (c && *c) ? atof(c) : price_in;   /* no declared discount → full price */
     pricing_known = (have_in || have_out);
+}
+
+/* Enter hosted mode — from --api, the saved default, or the picker's hosted tab.
+ * The rest of main treats model_path as "which model is this session running"
+ * (display, session tag, system prompt), so it gets the remote id: /cost, the
+ * banner and session files then name the model actually answering rather than a
+ * stale local default. Returns that label; the caller assigns it to model_path. */
+static const char *enter_hosted_mode(void) {
+    static char api_label[256];
+    snprintf(api_label, sizeof api_label, "%s", srvchat_remote_model());
+    pricing_init();                         /* tokens → money, if prices declared */
+    return api_label;
 }
 
 /* Bill one turn. prompt_tokens INCLUDES cached, so the two are priced apart
@@ -3131,7 +3177,20 @@ static void try_model_switch(const char *arg, char **argv, int argc,
             free(new_path); fflush(stdout);
             return;
         }
+        /* From a hosted session nothing local was ever resolved: the ngl it
+           carries is 0 (nothing is offloaded to a remote), and the saved
+           `backend=` line was never read, so the rewrite below would drop it.
+           Measured: the switch requested -ngl 0 and saved ngl=0 — a CPU-only
+           default. Use the -m default (every layer) and re-read the backend. */
+        if (srvchat_remote_active()) {
+            char prev[1024];
+            new_ngl = 99;
+            load_default_model(prev, sizeof prev, NULL, NULL);   /* applies backend= */
+        }
         save_default_model(new_path, new_ngl, 0);    /* persist as new default */
+        /* A named switch is always to a local GGUF, and a saved hosted default
+           outranks default-model — left in place, the next launch goes hosted. */
+        clear_default_api();
     }
 
     /* Hand off via re-exec. Replacing this process image releases the current
@@ -3142,18 +3201,26 @@ static void try_model_switch(const char *arg, char **argv, int argc,
     disable_raw_mode();
     printf("\033[?25h");                /* show cursor for the clean re-launch */
 
-    char **nv = calloc((size_t)argc + 8, sizeof(char *));
+    char **nv = calloc((size_t)argc + 10, sizeof(char *));
     int k = 0;
     nv[k++] = argv[0];
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
-        if (!strcmp(a, "--pick")) continue;                 /* valueless; may re-add */
+        if (!strcmp(a, "--pick") || !strcmp(a, "--local")) continue;   /* valueless; may re-add */
         if (!strcmp(a,"-m") || !strcmp(a,"-ngl") || !strcmp(a,"--ngl") ||
             !strcmp(a,"-c") || !strcmp(a,"--ctx") || !strcmp(a,"--resume") ||
             !strcmp(a,"-p") || !strcmp(a,"--prompt") || !strcmp(a,"--print") ||
-            !strcmp(a,"--deepsearch") || !strcmp(a,"-ds")) { i++; continue; }  /* + value */
+            !strcmp(a,"--deepsearch") || !strcmp(a,"-ds") ||
+            !strcmp(a,"--api") || !strcmp(a,"--api-model")) { i++; continue; }  /* + value */
         nv[k++] = (char *)a;
     }
+    /* Local vs hosted is re-stated, never carried: a launch-time --api would
+       override whatever the picker chooses, and a launch-time --local would hide
+       a hosted model chosen since. Going local (a named GGUF, or the picker opened
+       from a local session) passes --local, so a saved hosted default cannot take
+       over — nor claim a cancelled picker. A hosted session passes nothing: the
+       saved default, which the --api or pick that started it wrote, brings it back. */
+    if (!use_picker || !srvchat_remote_active()) nv[k++] = "--local";
     char nglbuf[16];
     if (use_picker) {
         nv[k++] = "--pick";
@@ -3459,7 +3526,7 @@ static void handle_slash_command(char *user_input,
                     "                        them, reports verdicts computed from the numbers (not argued).\n"
                     "                        Explores N DIFFERENT theories (default 3), each told what the\n"
                     "                        others covered; findings ranked by measured effect\n"
-                    "  /model [name]         switch model (no arg: picker; name: match; keeps your chat)\n"
+                    "  /model [name]         switch model (no arg: picker, Tab for Fireworks; name: local match; keeps your chat)\n"
                     "  /cookbook [sub]       download & manage models (list | search | get <repo> | rm)\n"
                     "  /mcp [tools|reconnect [server]]\n"
                     "                        MCP servers: status, the tools they expose, or restart one\n"
@@ -4852,25 +4919,72 @@ int main(int argc, char **argv) {
     { const char *e = getenv("BASI_TOP_P"); if (e && cli.cli_top_p == 1.0f) top_p = (float)atof(e); }
     const char *resume_path          = cli.resume_path;
 
+    bool oneshot = (oneshot_deepsearch_q != NULL) || (oneshot_prompt != NULL);
+
+    /* Model resolution order (interactive): -m (this invocation) > saved
+       default (set by the picker / /model) > $BASI_MODEL > first-run picker.
+       The saved default is what drops later launches straight into chat and
+       what lets a /model choice persist. */
+    static char picked_model[1024];
+    static char default_model[1024];
+    int ctx_override = 0;
+    float temp_override = -1;
+    int picker_spec = -1, picker_fa = -1, picker_cpumoe = -1;   /* server launch flags from the picker (-1 = not set) */
+    bool loaded_from_default = false;   /* model came from the saved-default file */
+
+    /* --pick (from /model): the picker runs FIRST — before the hosted endpoint is
+       resolved, because the picker is where local vs hosted gets decided. The
+       other way round, a saved API default claimed model_path and the picker never
+       opened: /model in a hosted session re-exec'd straight back into the same
+       model. It also runs before any model is loaded, so its VRAM probe / auto-fit
+       see the whole GPU free (the previous model was released when /model
+       re-exec'd into this fresh process). A cancel falls through to the saved
+       defaults below — i.e. reloads whatever was running. */
+    enum { PICKED_NONE, PICKED_LOCAL, PICKED_HOSTED } picked = PICKED_NONE;
+    if (cli.pick && !oneshot && !model_path) {
+        LaunchConfig cfg = pick_model(picker_remote_tab());
+        if (cfg.api_model) {
+            /* Through the same setup as --api, so it is validated and saved alike. */
+            if (api_setup_remote(cfg.api_provider, cfg.api_model) == 1) picked = PICKED_HOSTED;
+            free(cfg.api_model);
+        } else if (cfg.model_path) {
+            picked = PICKED_LOCAL;
+            strncpy(picked_model, cfg.model_path, sizeof(picked_model) - 1);
+            picked_model[sizeof(picked_model) - 1] = '\0';
+            free(cfg.model_path);
+            model_path = picked_model;
+            if (!ngl_set) n_gpu_layers = cfg.gpu_layers;
+            ctx_override  = cfg.ctx_size;
+            temp_override = cfg.temperature;
+            picker_spec   = cfg.spec_draft_mtp;
+            picker_fa     = cfg.flash_attn;
+            picker_cpumoe = cfg.cpu_moe;
+            /* Before the save: save_default_model persists whatever is selected. */
+            if (cfg.backend) backend_select(cfg.backend);
+            save_default_model(model_path, n_gpu_layers, cfg.ctx_size);
+            /* Choosing a local model is choosing local: a saved hosted default
+               outranks default-model and would take over again at the next launch. */
+            if (clear_default_api())
+                printf("\033[90m[saved hosted default cleared — later launches stay local]\033[0m\n");
+        }
+    }
+
     /* --api <provider|url>: drive a hosted OpenAI-compatible endpoint instead of a
-       local llama-server. Resolved BEFORE the model picker, because in this mode
-       there is no GGUF to pick, no VRAM to fit and nothing to spawn — the whole
-       local-server path below is skipped. */
-    static char api_label[256];
-    const bool remote_api = (api_setup_remote(cli.api, cli.api_model) == 1);
-    if (!remote_api && (cli.api || cli.api_model || getenv("BASI_API"))) {
-        /* api_setup_remote already explained why; only a hard request is fatal. */
-        if (cli.api || getenv("BASI_API") || getenv("BASI_API_BASE")) return 1;
+       local llama-server. Resolved BEFORE the local model resolution, because in
+       this mode there is no GGUF to pick, no VRAM to fit and nothing to spawn — the
+       whole local-server path below is skipped. A choice just made in the picker
+       stands for this run: it is not re-litigated against the env or saved file. */
+    bool remote_api = (picked == PICKED_HOSTED);
+    if (picked == PICKED_NONE) {
+        remote_api = (api_setup_remote(cli.api, cli.api_model) == 1);
+        if (!remote_api && (cli.api || cli.api_model || getenv("BASI_API"))) {
+            /* api_setup_remote already explained why; only a hard request is fatal. */
+            if (cli.api || getenv("BASI_API") || getenv("BASI_API_BASE")) return 1;
+        }
     }
     if (remote_api) {
-        /* The rest of main treats model_path as "which model is this session
-           running" — for display, the session tag and the system prompt. Give it
-           the remote id, so /cost, the banner and session files all name the model
-           actually answering rather than a stale local default. */
-        snprintf(api_label, sizeof api_label, "%s", srvchat_remote_model());
-        model_path = api_label;
+        model_path = enter_hosted_mode();
         n_gpu_layers = 0;                       /* nothing is offloaded here */
-        pricing_init();                         /* tokens → money, if prices declared */
     }
 
     /* --yolo/--bypass: auto-approve every tool action. Without it, a
@@ -4904,8 +5018,6 @@ int main(int argc, char **argv) {
         compact_mode = COMPACT_SUMMARY;
     }
 
-    bool oneshot = (oneshot_deepsearch_q != NULL) || (oneshot_prompt != NULL);
-
     /* --no-tools is a modifier on -p: it only makes sense for the one-shot
      * prompt path. Reject it standalone rather than silently ignoring it. */
     if (no_tools && !oneshot_prompt) {
@@ -4915,38 +5027,6 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    /* Model resolution order (interactive): -m (this invocation) > saved
-       default (set by the picker / /model) > $BASI_MODEL > first-run picker.
-       The saved default is what drops later launches straight into chat and
-       what lets a /model choice persist. */
-    static char picked_model[1024];
-    static char default_model[1024];
-    int ctx_override = 0;
-    float temp_override = -1;
-    int picker_spec = -1, picker_fa = -1, picker_cpumoe = -1;   /* server launch flags from the picker (-1 = not set) */
-    bool loaded_from_default = false;   /* model came from the saved-default file */
-    /* --pick (from /model): force the picker BEFORE any model is loaded, so its
-       VRAM probe / auto-fit see the whole GPU free (the previous model was
-       released when /model re-execed into this fresh process). A cancel falls
-       through to the saved default below — i.e. reloads the same model. */
-    if (cli.pick && !oneshot && !model_path) {
-        LaunchConfig cfg = pick_model();
-        if (cfg.model_path) {
-            strncpy(picked_model, cfg.model_path, sizeof(picked_model) - 1);
-            picked_model[sizeof(picked_model) - 1] = '\0';
-            free(cfg.model_path);
-            model_path = picked_model;
-            if (!ngl_set) n_gpu_layers = cfg.gpu_layers;
-            ctx_override  = cfg.ctx_size;
-            temp_override = cfg.temperature;
-            picker_spec   = cfg.spec_draft_mtp;
-            picker_fa     = cfg.flash_attn;
-            picker_cpumoe = cfg.cpu_moe;
-            /* Before the save: save_default_model persists whatever is selected. */
-            if (cfg.backend) backend_select(cfg.backend);
-            save_default_model(model_path, n_gpu_layers, cfg.ctx_size);
-        }
-    }
     if (!model_path) {
         int d_ngl = -1, d_ctx = 0;
         if (load_default_model(default_model, sizeof default_model, &d_ngl, &d_ctx)) {
@@ -4964,25 +5044,32 @@ int main(int argc, char **argv) {
         return 1;
     }
     if (!model_path) {
-        LaunchConfig cfg = pick_model();
-        if (!cfg.model_path) {
+        LaunchConfig cfg = pick_model(picker_remote_tab());
+        if (cfg.api_model) {                /* first run, and a hosted model chosen */
+            remote_api = (api_setup_remote(cfg.api_provider, cfg.api_model) == 1);
+            free(cfg.api_model);
+            if (!remote_api) return 1;      /* api_setup_remote said why */
+            model_path = enter_hosted_mode();
+            n_gpu_layers = 0;
+        } else if (!cfg.model_path) {
             fprintf(stderr, "No model selected.\n");
             return 1;
+        } else {
+            strncpy(picked_model, cfg.model_path, sizeof(picked_model) - 1);
+            picked_model[sizeof(picked_model) - 1] = '\0';  /* strncpy may not NUL-terminate */
+            free(cfg.model_path);
+            model_path = picked_model;
+            if (!ngl_set) n_gpu_layers = cfg.gpu_layers;
+            ctx_override = cfg.ctx_size;
+            temp_override = cfg.temperature;
+            picker_spec  = cfg.spec_draft_mtp;
+            picker_fa    = cfg.flash_attn;
+            picker_cpumoe = cfg.cpu_moe;
+            if (cfg.backend) backend_select(cfg.backend);
+            /* An explicit pick always (re)writes the default — including repairing a
+               stale file that pointed at a since-deleted model. */
+            save_default_model(model_path, n_gpu_layers, cfg.ctx_size);
         }
-        strncpy(picked_model, cfg.model_path, sizeof(picked_model) - 1);
-        picked_model[sizeof(picked_model) - 1] = '\0';  /* strncpy may not NUL-terminate */
-        free(cfg.model_path);
-        model_path = picked_model;
-        if (!ngl_set) n_gpu_layers = cfg.gpu_layers;
-        ctx_override = cfg.ctx_size;
-        temp_override = cfg.temperature;
-        picker_spec  = cfg.spec_draft_mtp;
-        picker_fa    = cfg.flash_attn;
-        picker_cpumoe = cfg.cpu_moe;
-        if (cfg.backend) backend_select(cfg.backend);
-        /* An explicit pick always (re)writes the default — including repairing a
-           stale file that pointed at a since-deleted model. */
-        save_default_model(model_path, n_gpu_layers, cfg.ctx_size);
     }
 
     /* Explicit CLI knobs win over picker / built-in defaults. */

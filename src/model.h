@@ -19,9 +19,27 @@ typedef struct {
      * hidden (fewer than two declared) or untouched. Borrowed from the backend
      * module's static list — not malloc'd, and outlives the caller. */
     const char *backend;
+    /* Set instead of model_path when the choice was made on the hosted tab:
+     * api_model is the id to send (malloc'd, caller frees) and api_provider is
+     * borrowed from the PickerRemote the picker was given. */
+    char       *api_model;
+    const char *api_provider;
 } LaunchConfig;
 
-LaunchConfig pick_model(void);
+/* The picker's hosted tab, beside LOCAL. main.c fills it because it owns the
+ * provider table and the key lookup; model.c only lists and draws. */
+typedef struct {
+    const char *label;          /* tab title, e.g. "FIREWORKS AI" */
+    const char *provider;       /* provider name, handed back in LaunchConfig */
+    const char *base_url;       /* OpenAI-compatible base the list comes from */
+    const char *api_key;        /* NULL/"" → the tab says which variable to export */
+    const char *key_env;        /* that variable, for the message */
+    const char *current_model;  /* hosted id in use now, or NULL. Non-NULL opens the
+                                   picker on this tab with it selected. */
+} PickerRemote;
+
+/* remote may be NULL: no hosted tab, the local-only picker. */
+LaunchConfig pick_model(const PickerRemote *remote);
 
 /* Predicted VRAM in MB for `model_path` at ngl/ctx — the same figure the picker's
  * MEMORY row shows (GGUF tensor walk + per-layer KV + overhead term). Returns <0 if

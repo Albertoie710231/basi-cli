@@ -5,6 +5,7 @@
 #include <stdbool.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <sys/ioctl.h>
 #include <dirent.h>
 #include <termios.h>
 #include <poll.h>
@@ -876,12 +877,125 @@ static HwInfo hw_probe_settled(void) {
     return prev;
 }
 
+/* ── The hosted tab ────────────────────────────────────────────────── */
+
+typedef struct {
+    const PickerRemote *src;
+    SrvRemoteModel *models;
+    int   count;
+    int   sel, top;          /* selection, and the first row of the visible window */
+    bool  fetched;           /* listed lazily: the LOCAL tab never waits on the network */
+    bool  failed;            /* the listing could not be read */
+    bool  current_unlisted;  /* models[0] is the in-use model, absent from the listing */
+} RemoteTab;
+
+/* (Re)fetch the list. The model in use now is kept even when the listing leaves
+ * it out — Fireworks' listing once omitted kimi-k3 while it served requests fine
+ * (2026-07-27) — so the picker never hides where the session already is. */
+static void remote_tab_fetch(RemoteTab *t) {
+    srvchat_free_models(t->models, t->count);
+    t->models = NULL; t->count = 0; t->sel = t->top = 0;
+    t->fetched = true; t->failed = false; t->current_unlisted = false;
+    const PickerRemote *r = t->src;
+    if (!r->api_key || !*r->api_key) return;
+
+    int n = srvchat_list_chat_models(r->base_url, r->api_key, &t->models);
+    if (n < 0) { t->failed = true; n = 0; }
+    t->count = n;
+
+    if (!r->current_model) return;
+    for (int i = 0; i < t->count; i++)
+        if (strcmp(t->models[i].id, r->current_model) == 0) { t->sel = i; return; }
+    char *id = strdup(r->current_model);
+    SrvRemoteModel *grown = id ? realloc(t->models, (size_t)(t->count + 1) * sizeof *grown) : NULL;
+    if (!grown) { free(id); return; }
+    memmove(grown + 1, grown, (size_t)t->count * sizeof *grown);
+    grown[0] = (SrvRemoteModel){ id, 0, -1, -1 };
+    t->models = grown;
+    t->count++;
+    t->current_unlisted = true;
+}
+
+static const char *remote_leaf(const char *id) {
+    const char *s = strrchr(id, '/');
+    return s ? s + 1 : id;
+}
+
+/* 1048576 → "1M", 262144 → "256K"; "?" when the provider did not say. */
+static void fmt_ctx(int ctx, char *out, size_t n) {
+    if (ctx <= 0)                     snprintf(out, n, "?");
+    else if (ctx % (1024 * 1024) == 0) snprintf(out, n, "%dM", ctx / (1024 * 1024));
+    else if (ctx >= 1024)             snprintf(out, n, "%dK", ctx / 1024);
+    else                              snprintf(out, n, "%d", ctx);
+}
+
+static int term_rows(void) {
+    struct winsize ws;
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_row > 0) return ws.ws_row;
+    return 24;
+}
+
+static void draw_tab_bar(bool remote_on, const char *label) {
+    printf("  %s LOCAL \033[0m  %s %s \033[0m   \033[90mTab switches\033[0m\n\n",
+           remote_on ? "\033[90m" : "\033[1;7;36m",
+           remote_on ? "\033[1;7;36m" : "\033[90m", label);
+}
+
+static void remote_tab_draw(RemoteTab *t) {
+    const PickerRemote *r = t->src;
+    if (!r->api_key || !*r->api_key) {
+        printf("  \033[33m%s is not set.\033[0m Export it (or BASI_API_KEY) and reopen /model.\n",
+               r->key_env);
+        printf("\n\033[90mTab local  q quit\033[0m\n");
+        return;
+    }
+    printf("\033[1;33m▸ MODEL\033[0m  \033[90m%d chat models · %s\033[0m\n", t->count, r->base_url);
+    if (t->failed)
+        printf("    \033[31mCould not read the model list (network down, or the key was "
+               "refused). r retries.\033[0m\n");
+
+    int width = 0;
+    for (int i = 0; i < t->count; i++) {
+        int l = (int) strlen(remote_leaf(t->models[i].id));
+        if (l > width) width = l;
+    }
+    if (width > 40) width = 40;
+
+    /* A window, not the whole list: a provider can list far more models than the
+       terminal has rows, and a cleared screen that scrolls loses its own header. */
+    int visible = term_rows() - 14;
+    if (visible < 5) visible = 5;
+    if (t->sel < t->top) t->top = t->sel;
+    if (t->sel >= t->top + visible) t->top = t->sel - visible + 1;
+
+    if (t->top > 0) printf("    \033[90m↑ %d more\033[0m\n", t->top);
+    for (int i = t->top; i < t->count && i < t->top + visible; i++) {
+        const SrvRemoteModel *m = &t->models[i];
+        char c[16]; fmt_ctx(m->ctx, c, sizeof c);
+        bool on = (i == t->sel);
+        printf("    %s%s %-*.*s\033[0m  \033[90m%5s ctx  %-5s  %-6s%s\033[0m",
+               on ? "\033[1;36m" : "\033[90m", on ? "●" : "○",
+               width, width, remote_leaf(m->id), c,
+               m->tools == 1 ? "tools" : "", m->vision == 1 ? "vision" : "",
+               strstr(m->id, "/routers/") ? "  router" : "");
+        if (r->current_model && strcmp(m->id, r->current_model) == 0)
+            printf("  \033[32mcurrent%s\033[0m",
+                   (i == 0 && t->current_unlisted) ? " (not in the listing)" : "");
+        printf("\n");
+    }
+    int below = t->count - (t->top + visible);
+    if (below > 0) printf("    \033[90m↓ %d more\033[0m\n", below);
+    if (t->count > 0) printf("\n    \033[90m%s\033[0m\n", t->models[t->sel].id);
+    printf("\n\033[90m↑/↓ navigate  Tab local  r refresh list  Enter launch  q quit\033[0m\n");
+}
+
 /*
  * Scan directories for .gguf files, show interactive menu with settings.
- * Returns filled LaunchConfig, or model_path=NULL on cancel.
+ * With `remote`, a second tab lists that provider's hosted models.
+ * Returns filled LaunchConfig, or model_path=NULL and api_model=NULL on cancel.
  */
-LaunchConfig pick_model(void) {
-    LaunchConfig cfg = { NULL, 99, CONTEXT_SIZE, 0.4f, 0, 0, 0, NULL };
+LaunchConfig pick_model(const PickerRemote *remote) {
+    LaunchConfig cfg = { NULL, 99, CONTEXT_SIZE, 0.4f, 0, 0, 0, NULL, NULL, NULL };
 
     /* Build search dirs */
     init_model_search_dirs();
@@ -894,7 +1008,8 @@ LaunchConfig pick_model(void) {
         scan_gguf_recursive(model_search_dirs[d], &models, &count, &cap);
     }
 
-    if (count == 0) {
+    /* No GGUFs is only the end of the road when there is no hosted tab to offer. */
+    if (count == 0 && !remote) {
         fprintf(stderr, "No .gguf models found in search directories.\n");
         free(models);
         return cfg;
@@ -950,11 +1065,58 @@ LaunchConfig pick_model(void) {
     int spec_on = 0, fa_on = 0;
     int spec_touched = 0, fa_touched = 0;
 
+    /* LOCAL | hosted. Opens on the one in use, so /model from a hosted session
+       lands on the list it came from. */
+    RemoteTab rt = { .src = remote };
+    bool on_remote = remote && (remote->current_model || count == 0);
+
     while (1) {
         printf("\033[2J\033[H");
         printf("\033[1;36m╔══════════════════════════════════════════════════════════════╗\033[0m\n");
         printf("\033[1;36m║           BASI-CLI — Model Configuration                    ║\033[0m\n");
         printf("\033[1;36m╚══════════════════════════════════════════════════════════════╝\033[0m\n\n");
+        if (remote) draw_tab_bar(on_remote, remote->label);
+
+        if (on_remote) {
+            if (!rt.fetched) {
+                printf("    \033[90mfetching the %s model list …\033[0m\n", remote->label);
+                fflush(stdout);
+                remote_tab_fetch(&rt);
+                continue;
+            }
+            remote_tab_draw(&rt);
+            fflush(stdout);
+
+            unsigned char ch;
+            if (read(STDIN_FILENO, &ch, 1) != 1) break;
+            if (ch == 'q' || ch == 'Q' || ch == 3) break;
+            if (ch == '\t') { on_remote = false; continue; }
+            if (ch == 'r' || ch == 'R') { remote_tab_fetch(&rt); continue; }
+            if ((ch == '\n' || ch == '\r') && rt.count > 0) {
+                cfg.api_model    = strdup(rt.models[rt.sel].id);
+                cfg.api_provider = remote->provider;
+                break;
+            }
+            if (ch == 27) {
+                unsigned char seq[2];
+                if (read(STDIN_FILENO, seq, 2) == 2 && seq[0] == '[') {
+                    if (seq[1] == 'A' && rt.sel > 0) rt.sel--;
+                    if (seq[1] == 'B' && rt.sel < rt.count - 1) rt.sel++;
+                }
+            }
+            continue;
+        }
+
+        if (count == 0) {           /* reachable only with a hosted tab to go back to */
+            printf("  No .gguf models found (searched ~/.cache/huggingface/hub, ~/models and .)\n");
+            printf("\n\033[90mTab %s  q quit\033[0m\n", remote->label);
+            fflush(stdout);
+            unsigned char ch;
+            if (read(STDIN_FILENO, &ch, 1) != 1) break;
+            if (ch == 'q' || ch == 'Q' || ch == 3) break;
+            if (ch == '\t') on_remote = true;
+            continue;
+        }
 
         /* Model selection */
         printf("%s MODEL %s\n",
@@ -1137,7 +1299,9 @@ LaunchConfig pick_model(void) {
             printf("    \033[90m[ LAUNCH ]\033[0m\n");
         }
 
-        printf("\n\033[90m↑/↓ navigate  ←/→ adjust  r refresh VRAM  Enter select/launch  q quit\033[0m\n");
+        printf("\n\033[90m↑/↓ navigate  ←/→ adjust  r refresh VRAM  Enter select/launch  ");
+        if (remote) printf("Tab %s  ", remote->label);
+        printf("q quit\033[0m\n");
         fflush(stdout);
 
         /* Read key */
@@ -1145,6 +1309,8 @@ LaunchConfig pick_model(void) {
         if (read(STDIN_FILENO, &ch, 1) != 1) break;
 
         if (ch == 'q' || ch == 'Q' || ch == 3) break;
+
+        if (ch == '\t' && remote) { on_remote = true; continue; }
 
         if (ch == 'r' || ch == 'R') {          /* re-probe live VRAM on demand */
             hw = hw_probe_settled();
@@ -1241,5 +1407,6 @@ LaunchConfig pick_model(void) {
     free(models);
     free(model_arch);
     free(model_size_mb);
+    srvchat_free_models(rt.models, rt.count);
     return cfg;
 }

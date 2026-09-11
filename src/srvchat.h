@@ -121,6 +121,25 @@ const char *srvchat_remote_base(void);
  * (guessing LOW silently compacts what the provider would have accepted whole). */
 int srvchat_remote_context_length(void);
 
+/* One chat model a hosted endpoint offers, from its GET <base>/models listing. */
+typedef struct {
+    char *id;       /* the id to send as "model" (malloc'd) */
+    int   ctx;      /* context window in tokens; 0 = not reported */
+    int   tools;    /* 1 = function calling, 0 = none, -1 = not reported */
+    int   vision;   /* 1 = accepts images, 0 = does not, -1 = not reported */
+} SrvRemoteModel;
+
+/* List the CHAT models at an OpenAI-compatible endpoint (GET <base_url>/models),
+ * sorted by the last path segment of the id so a router sits beside its model.
+ * Embedding and reranker entries are dropped: Fireworks lists them with
+ * supports_chat=true (measured 2026-09-11), and choosing one fails on the first
+ * turn. Needs no srvchat_set_remote — the /model picker lists what it could switch
+ * TO. The key reaches curl through the same 0600 config file as every other
+ * request. Returns the count (*out malloc'd; free with srvchat_free_models), or -1
+ * when the listing could not be read. */
+int  srvchat_list_chat_models(const char *base_url, const char *api_key, SrvRemoteModel **out);
+void srvchat_free_models(SrvRemoteModel *models, int n);
+
 /* 1 once a request has been refused because the model cannot take images, so a
  * caller can stop sending them and degrade instead of losing the turn. */
 int srvchat_vision_unsupported(void);
