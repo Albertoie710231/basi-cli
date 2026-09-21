@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdbool.h>
 
 #include "util.h"
 #include "tooldefs.h"
@@ -21,13 +22,13 @@ static const BasiToolDef TOOLS[] = {
               "`count` lines from line `start`, with a footer telling you how to read the next window.",
       OBJ(STR("file", "Path to the file") ","
           INT("start", "1-based line to start at (optional; default 1)") ","
-          INT("count", "number of lines to read (optional; default 400)"), "[\"file\"]") },
+          INT("count", "number of lines to read (optional; defaults to the largest window, which is also the maximum)"), "[\"file\"]") },
     { "head", "Read the first N lines of a file.",
       OBJ(STR("file", "Path to the file") "," INT("lines", "Number of lines (default 10)"), "[\"file\"]") },
     { "tail", "Read the last N lines of a file.",
       OBJ(STR("file", "Path to the file") "," INT("lines", "Number of lines (default 10)"), "[\"file\"]") },
-    { "grep", "Search a file for a pattern; returns matching lines with line numbers.",
-      OBJ(STR("pattern", "Text or regex to search for") "," STR("file", "Path to the file") ","
+    { "grep", "Search a file for a pattern; returns matching lines with line numbers. EXTENDED regex (grep -E), so alternation is a|b and groups are (a|b) — no backslashes needed.",
+      OBJ(STR("pattern", "Text or extended regex (grep -E) to search for, e.g. shellVolume|innerRadius") "," STR("file", "Path to the file") ","
           INT("context", "Lines of surrounding context to include (optional)"), "[\"pattern\",\"file\"]") },
     { "wc", "Count lines, words and characters in a file.",
       OBJ(STR("file", "Path to the file"), "[\"file\"]") },
@@ -42,9 +43,9 @@ static const BasiToolDef TOOLS[] = {
       OBJ(STR("file", "Path to the source file") "," STR("kind", "Optional filter: function, struct, macro, variable, ..."), "[\"file\"]") },
     { "code_context", "Return clangd's structural info (signature, type, doc) for a top-level C symbol. Authoritative for C — prefer it over grep when you need a symbol's signature, type or definition site. Requires the symbol NAME; use 'symbols' first to discover names.",
       OBJ(STR("file", "Path to the C file") "," STR("symbol", "Top-level identifier name"), "[\"file\",\"symbol\"]") },
-    { "web_search", "Search the web. Use for any current/latest/version/price/news question. Returns ranked results plus the full text of the top pages.",
-      OBJ(STR("query", "The search query") "," STR("recency", "Optional recency filter: day|week|month|year"), "[\"query\"]") },
-    { "web_fetch", "Fetch and extract the readable text of one web page.",
+    { "web_search", "Search the web. Use for any current/latest/version/price/news question. Returns ranked results plus the full text of the top pages. When a question spans distinct sub-areas, cover them ALL in one call by separating up to 4 sub-queries with ' | ' — results are merged and deduplicated. Searching one sub-area, getting good results and stopping is the most common way to miss the answer.",
+      OBJ(STR("query", "The search query. Up to 4 sub-queries separated by ' | ' to cover distinct sub-areas in a single call.") "," STR("recency", "Optional recency filter: day|week|month|year"), "[\"query\"]") },
+    { "web_fetch", "Fetch and extract the readable text of one web page or PDF. Long documents (papers, specs) are truncated in the reply and the FULL text is saved to a file whose path is given at the end — read or grep that file to reach the parts past the cut, such as a paper's method and equations. Never conclude from the abstract alone.",
       OBJ(STR("url", "The URL to fetch (http/https)"), "[\"url\"]") },
     { "readfile", "Read a local document (pdf/docx/odt/epub/text). Only when the user gave a concrete path.",
       OBJ(STR("path", "Path to the local document") "," STR("regex", "Optional regex to narrow output"), "[\"path\"]") },
@@ -68,10 +69,71 @@ static const BasiToolDef TOOLS[] = {
       OBJ(STR("slug", "Slug of the study to run"), "[\"slug\"]") },
     { "plan_verify", "Run the verify clause of every Implementation Plan row (active phase), or one row by id.",
       OBJ(STR("id", "Optional row id, e.g. 1.2"), "[]") },
+    { "view_image", "LOOK at an image file — you have vision. Use it whenever the question is about what something LOOKS like: a render, a screenshot, a plot, a photo, a diagram. Render to a file, then view_image it, and judge the picture instead of guessing from the code. png/jpg/webp/gif work directly; ppm/bmp/tga and any other format are converted first. Large images are downscaled, so a shot costs roughly 500 tokens — viewing one after every change is cheap and is the point.",
+      OBJ(STR("path", "Path to the image file") ","
+          STR("note", "Optional: what to look for, e.g. 'is the hair attached to the scalp?'"), "[\"path\"]") },
 };
 
+/* ── Extra (dynamically discovered) tools ───────────────────────────────
+ * MCP servers are declared by the user and enumerated at startup, so their
+ * tools cannot live in the static table above. They are appended here instead
+ * of at each call site: basi_tool_defs() is the single place every consumer
+ * asks for the tool set — including the save/restore dance that deepsearch, the
+ * compaction summary and study grounding each perform — so merging here means
+ * none of them needs to know that MCP exists. */
+#define TOOLS_N      ((int)(sizeof(TOOLS) / sizeof(TOOLS[0])))
+#define DISABLED_MAX 8
+
+static const BasiToolDef *extra      = NULL;   /* referenced, not owned */
+static int                extra_n    = 0;
+static const char        *disabled[DISABLED_MAX];
+static int                disabled_n = 0;
+
+static BasiToolDef *merged   = NULL;   /* (TOOLS ++ extras) − disabled */
+static int          merged_n = 0;
+
+static bool is_disabled(const char *name) {
+    for (int i = 0; i < disabled_n; i++)
+        if (strcmp(disabled[i], name) == 0) return true;
+    return false;
+}
+
+/* Compose the advertised set. Only materializes a table when there is something
+ * to change; an untouched run keeps handing out TOOLS itself, allocation-free. */
+static void rebuild(void) {
+    free(merged);
+    merged = NULL;
+    merged_n = 0;
+    if (extra_n <= 0 && disabled_n <= 0) return;
+
+    merged = malloc(sizeof(BasiToolDef) * (size_t)(TOOLS_N + extra_n));
+    if (!merged) return;                     /* OOM: fall back to the native set */
+    int k = 0;
+    for (int i = 0; i < TOOLS_N; i++)
+        if (!is_disabled(TOOLS[i].name)) merged[k++] = TOOLS[i];
+    for (int i = 0; i < extra_n; i++)
+        if (!is_disabled(extra[i].name)) merged[k++] = extra[i];
+    merged_n = k;
+}
+
+void basi_tooldefs_set_extra(const BasiToolDef *defs, int n) {
+    extra   = (defs && n > 0) ? defs : NULL;
+    extra_n = extra ? n : 0;
+    rebuild();
+}
+
+void basi_tooldefs_disable(const char *name) {
+    if (!name || !*name || disabled_n >= DISABLED_MAX || is_disabled(name)) return;
+    disabled[disabled_n++] = name;           /* caller-owned, must outlive the run */
+    rebuild();
+}
+
 const BasiToolDef *basi_tool_defs(int *n) {
-    if (n) *n = (int)(sizeof(TOOLS) / sizeof(TOOLS[0]));
+    if (merged) {
+        if (n) *n = merged_n;
+        return merged;
+    }
+    if (n) *n = TOOLS_N;
     return TOOLS;
 }
 

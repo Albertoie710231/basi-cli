@@ -595,6 +595,39 @@ static const char *jx_walk(const char *json, const char *path) {
     return p;
 }
 
+/* Four hex digits → value, or -1. Checked one at a time, so a string that
+   ends early stops at its NUL instead of reading past it. */
+static int jx_hex4(const char *s) {
+    int v = 0;
+    for (int i = 0; i < 4; i++) {
+        char c = s[i];
+        int d = (c >= '0' && c <= '9') ? c - '0'
+              : (c >= 'a' && c <= 'f') ? c - 'a' + 10
+              : (c >= 'A' && c <= 'F') ? c - 'A' + 10 : -1;
+        if (d < 0) return -1;
+        v = v * 16 + d;
+    }
+    return v;
+}
+
+static void jx_append_utf8(StringBuf *sb, unsigned cp) {
+    if (cp < 0x80) {
+        sb_append_char(sb, (char)cp);
+    } else if (cp < 0x800) {
+        sb_append_char(sb, (char)(0xC0 | (cp >> 6)));
+        sb_append_char(sb, (char)(0x80 | (cp & 0x3F)));
+    } else if (cp < 0x10000) {
+        sb_append_char(sb, (char)(0xE0 | (cp >> 12)));
+        sb_append_char(sb, (char)(0x80 | ((cp >> 6) & 0x3F)));
+        sb_append_char(sb, (char)(0x80 | (cp & 0x3F)));
+    } else {
+        sb_append_char(sb, (char)(0xF0 | (cp >> 18)));
+        sb_append_char(sb, (char)(0x80 | ((cp >> 12) & 0x3F)));
+        sb_append_char(sb, (char)(0x80 | ((cp >> 6) & 0x3F)));
+        sb_append_char(sb, (char)(0x80 | (cp & 0x3F)));
+    }
+}
+
 /* If p points at a JSON string value, decode it to a heap C string. */
 static char *jx_decode_string(const char *p) {
     p = jx_skip_ws(p);
@@ -611,7 +644,33 @@ static char *jx_decode_string(const char *p) {
                 case '\\': sb_append_char(&out, '\\'); p += 2; break;
                 case '"':  sb_append_char(&out, '"');  p += 2; break;
                 case '/':  sb_append_char(&out, '/');  p += 2; break;
-                case 'u':  sb_append_char(&out, '?');  p += 6; break;  /* skip unicode v1 */
+                case 'b':  sb_append_char(&out, '\b'); p += 2; break;
+                case 'f':  sb_append_char(&out, '\f'); p += 2; break;
+                /* Every non-ASCII character arrives this way from a producer
+                   that escapes (SearXNG does, for all of them). Writing '?'
+                   here turned "clínicos" into "cl?nicos" and whole Cyrillic
+                   titles into "??????" — and an edit tool's SEARCH text into
+                   something no file contains. */
+                case 'u': {
+                    int cp = jx_hex4(p + 2);
+                    if (cp < 0) { sb_append_char(&out, '?'); p += 2; break; }
+                    p += 6;
+                    if (cp >= 0xD800 && cp <= 0xDBFF) {          /* high surrogate */
+                        int lo = (p[0] == '\\' && p[1] == 'u') ? jx_hex4(p + 2) : -1;
+                        if (lo >= 0xDC00 && lo <= 0xDFFF) {
+                            cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                            p += 6;
+                        } else {
+                            cp = 0xFFFD;
+                        }
+                    } else if (cp >= 0xDC00 && cp <= 0xDFFF) {   /* lone low half */
+                        cp = 0xFFFD;
+                    } else if (cp == 0) {                        /* would end the C string */
+                        cp = 0xFFFD;
+                    }
+                    jx_append_utf8(&out, (unsigned)cp);
+                    break;
+                }
                 default:   sb_append_char(&out, p[1]); p += 2; break;
             }
         } else {

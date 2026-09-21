@@ -16,6 +16,7 @@
 #include "util.h"
 #include "globals.h"
 #include "web.h"
+#include "toolstat.h"
 
 /* ── Local document extraction (shared by readfile) ────────────────── */
 
@@ -88,8 +89,19 @@ static bool url_has_pdf_suffix(const char *url) {
                "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 #define WEB_MAX_REDIRECTS       5
 #define WEB_FETCH_MAX_CHARS  6000
+/* Ceiling on the text pulled out of one document before it is spilled to disk.
+   A SIGGRAPH paper runs ~50k characters, so 6000 shows the abstract and stops —
+   every method section sits past the cut. Extract the whole thing, hand back the
+   head, and leave the rest somewhere the read/grep tools can reach. */
+#define WEB_FETCH_FULL_CHARS 1500000
 #define WEB_SEARCH_MAX_RESULTS  8
-#define WEB_SEARCH_FETCH_COUNT  3     /* top-N results auto-fetched in parallel */
+#define WEB_SEARCH_FETCH_COUNT  3     /* pages auto-fetched for a single-query call */
+#define WEB_SEARCH_FETCH_MAX    8     /* hard ceiling once sub-queries raise the budget */
+#define WEB_SEARCH_MAX_QUERIES  4     /* sub-queries accepted in ONE call, ' | '-separated */
+/* Must hold EVERY sub-query's full result set: the collect loop stops once the
+   merged array is full, so a cap below MAX_QUERIES * MAX_RESULTS silently drops
+   the last sub-queries — the exact coverage gap the fan-out exists to close. */
+#define WEB_SEARCH_MERGED_MAX  (WEB_SEARCH_MAX_QUERIES * WEB_SEARCH_MAX_RESULTS)
 #define WEB_SEARCH_FETCH_CHARS  3000  /* per-page char cap for the bundled fetch */
 
 /* ── SSRF guard ─────────────────────────────────────────────────────── */
@@ -330,6 +342,7 @@ typedef struct {
     char  *snippet;
     char  *age;
     double score;
+    int    origin;   /* index of the sub-query that produced this result */
 } SearchResult;
 
 static void search_result_free(SearchResult *r) {
@@ -461,11 +474,9 @@ static const char *searxng_instance(void) {
    localhost:8888) isn't up and a local install is present (SEARXNG_HOME,
    default ~/Documentos/searxng), launch it in the background. Non-blocking:
    SearXNG boots while the model loads. Set BASI_NO_SEARXNG=1 to disable. */
-void web_ensure_searxng(void) {
-    if (getenv("BASI_NO_SEARXNG")) return;
-
+WebSearchStatus web_ensure_searxng(void) {
     const char *inst = searxng_instance();
-    if (strchr(inst, '\'')) return;   /* keep it shell-safe below */
+    if (strchr(inst, '\'')) return WEB_SEARCH_UNAVAILABLE;   /* not shell-safe below */
 
     /* Quick reachability probe — connection-refused returns instantly. */
     char check[512];
@@ -474,25 +485,46 @@ void web_ensure_searxng(void) {
     char *code = run_command(check, 32);
     bool up = code && atoi(code) > 0;
     free(code);
-    if (up) return;
+    if (up) return WEB_SEARCH_UP;
+
+    /* Probing happens even with auto-start off, so the caller still learns
+       whether search works — BASI_NO_SEARXNG turns off launching, not knowing. */
+    if (getenv("BASI_NO_SEARXNG")) return WEB_SEARCH_UNAVAILABLE;
 
     /* Only ever auto-launch a local instance — never a remote URL the user set. */
-    if (!strstr(inst, "localhost") && !strstr(inst, "127.0.0.1")) return;
+    if (!strstr(inst, "localhost") && !strstr(inst, "127.0.0.1"))
+        return WEB_SEARCH_UNAVAILABLE;
 
+    /* SEARXNG_HOME wins; otherwise probe the layouts an install actually uses.
+       The venv interpreter is the marker. Hard-coding one guess here meant a
+       checkout one directory over was never found, and web_search then failed
+       on EVERY call for the life of the session. */
     const char *home_env = getenv("SEARXNG_HOME");
-    char home[512];
+    char home[512], py[600];
+    bool found = false;
     if (home_env && home_env[0]) {
         snprintf(home, sizeof(home), "%s", home_env);
+        snprintf(py, sizeof(py), "%s/venv/bin/python", home);
+        found = (access(py, X_OK) == 0);
     } else {
         const char *h = getenv("HOME");
-        if (!h || !h[0]) return;                 /* no home dir — nowhere to look */
-        snprintf(home, sizeof(home), "%s/searxng", h);
+        if (!h || !h[0]) return WEB_SEARCH_UNAVAILABLE;   /* nowhere to look */
+        static const char *rel[] = { "searxng", "Documentos/searxng", "Documents/searxng" };
+        for (size_t i = 0; i < sizeof(rel) / sizeof(rel[0]) && !found; i++) {
+            snprintf(home, sizeof(home), "%s/%s", h, rel[i]);
+            snprintf(py, sizeof(py), "%s/venv/bin/python", home);
+            found = (access(py, X_OK) == 0);
+        }
     }
-    if (strchr(home, '\'')) return;
-
-    char py[600];
-    snprintf(py, sizeof(py), "%s/venv/bin/python", home);
-    if (access(py, X_OK) != 0) return;   /* no local install — nothing to start */
+    /* Say it once. Silence here reads to the user as "search works but the web
+       is empty", which is the most expensive way to be wrong. */
+    if (!found) {
+        fprintf(stderr, "\033[33m[web] nothing serving %s and no local SearXNG install "
+                        "found. Set SEARXNG_HOME or SEARXNG_INSTANCE, or set "
+                        "BRAVE_API_KEY for a hosted fallback.\033[0m\n", inst);
+        return WEB_SEARCH_UNAVAILABLE;
+    }
+    if (strchr(home, '\'')) return WEB_SEARCH_UNAVAILABLE;
 
     char launch[4096];
     snprintf(launch, sizeof(launch),
@@ -503,14 +535,31 @@ void web_ensure_searxng(void) {
     fflush(stdout);
     int rc = system(launch);
     (void)rc;
+    return WEB_SEARCH_STARTING;
 }
 
 /* Fetch + extract ONE url into cleaned text capped at max_chars. Returns
    malloc'd content (NULL if nothing could be fetched/extracted). If
    final_url_out != NULL it receives the post-redirect URL (malloc'd; caller
    frees). Shared by execute_web_fetch and the web_search auto-fetch. */
-static char *web_fetch_extract(const char *url, int max_chars, char **final_url_out) {
+/* djb2 over the URL: a stable name for the spill file, so re-fetching the same
+   document reuses it instead of littering /tmp with copies. */
+static unsigned long url_hash(const char *s) {
+    unsigned long h = 5381;
+    for (; *s; s++) h = ((h << 5) + h) + (unsigned char)*s;
+    return h;
+}
+
+/* spill_out/full_len_out are optional. When spill_out is non-NULL and the
+   document is longer than max_chars, the FULL text is written to a file and its
+   path returned there — the caller tells the model how to read the rest. Passing
+   NULL keeps the old behaviour, which is what the search auto-fetch wants: three
+   short page summaries, not three files on disk. */
+static char *web_fetch_extract(const char *url, int max_chars, char **final_url_out,
+                               char **spill_out, size_t *full_len_out) {
     if (final_url_out) *final_url_out = NULL;
+    if (spill_out) *spill_out = NULL;
+    if (full_len_out) *full_len_out = 0;
     if (!url || !url[0]) return NULL;
 
     char *norm;
@@ -537,17 +586,38 @@ static char *web_fetch_extract(const char *url, int max_chars, char **final_url_
 
     bool is_pdf = (ctype && strcasestr(ctype, "pdf")) || url_has_pdf_suffix(final_url);
 
+    int grab = spill_out ? WEB_FETCH_FULL_CHARS : max_chars;
     char cmd[2048];
     if (is_pdf) {
         snprintf(cmd, sizeof(cmd),
             "pdftotext -enc UTF-8 '%s' - 2>/dev/null | sed '/^[[:space:]]*$/d' | head -c %d",
-            body, max_chars);
+            body, grab);
     } else {
         snprintf(cmd, sizeof(cmd),
             "w3m -dump -T text/html -cols 120 '%s' 2>/dev/null | sed '/^[[:space:]]*$/d' | head -c %d",
-            body, max_chars);
+            body, grab);
     }
-    char *content = run_command(cmd, (size_t)max_chars + 256);
+    char *content = run_command(cmd, (size_t)grab + 256);
+
+    /* Longer than the caller wants to see: keep all of it on disk, return the
+       head. Truncate on a line boundary so the visible part does not end
+       mid-sentence. */
+    if (spill_out && content && strlen(content) > (size_t)max_chars) {
+        size_t full = strlen(content);
+        char path[128];
+        snprintf(path, sizeof(path), "/tmp/basi-fetch-%08lx.txt", url_hash(url));
+        FILE *f = fopen(path, "wb");
+        if (f) {
+            fwrite(content, 1, full, f);
+            fclose(f);
+            *spill_out = strdup(path);
+            if (full_len_out) *full_len_out = full;
+        }
+        size_t cut = (size_t)max_chars;
+        while (cut > 0 && content[cut] != '\n') cut--;
+        if (cut == 0) cut = (size_t)max_chars;
+        content[cut] = '\0';
+    }
 
     /* tier-2 thin fallback for HTML: <title> + og/meta description. */
     char *fallback = NULL;
@@ -592,9 +662,9 @@ static char *web_fetch_extract(const char *url, int max_chars, char **final_url_
    ~one fetch, not the sum. Per-page cap keeps each well under the pipe buffer,
    so the parent can drain pipes sequentially without deadlock. */
 static void web_fetch_parallel(char *const *urls, int n, int max_chars, char **out_content) {
-    if (n > WEB_SEARCH_FETCH_COUNT) n = WEB_SEARCH_FETCH_COUNT;
-    int pipes[WEB_SEARCH_FETCH_COUNT][2];
-    pid_t pids[WEB_SEARCH_FETCH_COUNT];
+    if (n > WEB_SEARCH_FETCH_MAX) n = WEB_SEARCH_FETCH_MAX;
+    int pipes[WEB_SEARCH_FETCH_MAX][2];
+    pid_t pids[WEB_SEARCH_FETCH_MAX];
 
     for (int i = 0; i < n; i++) {
         out_content[i] = NULL;
@@ -602,7 +672,7 @@ static void web_fetch_parallel(char *const *urls, int n, int max_chars, char **o
         pids[i] = fork();
         if (pids[i] == 0) {
             close(pipes[i][0]);
-            char *c = web_fetch_extract(urls[i], max_chars, NULL);
+            char *c = web_fetch_extract(urls[i], max_chars, NULL, NULL, NULL);
             if (c && c[0]) { ssize_t w = write(pipes[i][1], c, strlen(c)); (void)w; }
             close(pipes[i][1]);
             _exit(0);
@@ -629,25 +699,14 @@ static void web_fetch_parallel(char *const *urls, int n, int max_chars, char **o
     }
 }
 
-char *execute_web_search(const char *query, const char *time_filter) {
-    if (!query || !query[0]) return strdup("Error: web_search requires a query.");
-
-    const char *instance = searxng_instance();
-    if (strchr(instance, '\'')) return strdup("Error: invalid SEARXNG_INSTANCE (contains a quote).");
-
+/* Ask a SearXNG instance for ONE query. malloc'd JSON, or NULL if it did not
+   answer with any (curl failure, HTML error page, a captive portal…). */
+static char *searx_query_json(const char *instance, const char *query, const char *recency) {
     char *encoded = url_encode(query);
-    if (!encoded) return strdup("Error: out of memory.");
+    if (!encoded) return NULL;
 
-    /* Map day/week/month/year (or d/w/m/y) → SearXNG time_range. */
-    char tr[32] = "";
-    if (time_filter && time_filter[0]) {
-        const char *t = time_filter, *val = NULL;
-        if      (!strcasecmp(t, "day")   || !strcasecmp(t, "d")) val = "day";
-        else if (!strcasecmp(t, "week")  || !strcasecmp(t, "w")) val = "week";
-        else if (!strcasecmp(t, "month") || !strcasecmp(t, "m")) val = "month";
-        else if (!strcasecmp(t, "year")  || !strcasecmp(t, "y")) val = "year";
-        if (val) snprintf(tr, sizeof(tr), "&time_range=%s", val);
-    }
+    char tr[40] = "";
+    if (recency) snprintf(tr, sizeof(tr), "&time_range=%s", recency);
 
     char cmd[4096];
     snprintf(cmd, sizeof(cmd),
@@ -657,39 +716,206 @@ char *execute_web_search(const char *query, const char *time_filter) {
     free(encoded);
 
     char *json = run_command(cmd, 1024 * 1024);
-    if (!json || json[0] != '{') {       /* unreachable, or HTML/error, not JSON */
-        free(json);
-        char msg[600];
-        snprintf(msg, sizeof(msg),
-            "No search results: could not get JSON from a SearXNG instance at %s.\n"
-            "Run SearXNG with the JSON format enabled, or set SEARXNG_INSTANCE to one that is.",
-            instance);
-        return strdup(msg);
+    if (json && json[0] == '{') return json;
+    free(json);
+    return NULL;
+}
+
+/* Hosted fallback for a box with no SearXNG. Brave runs its own crawler rather
+   than reselling Bing or Google, which is the only reason it is the one wired
+   up here — self-hosted metasearch stays the default, this just keeps a machine
+   without it from being silently blind. Inert unless BRAVE_API_KEY is set. */
+static char *brave_query_json(const char *key, const char *query, const char *recency,
+                             char *err, size_t errlen) {
+    if (strchr(key, '\'')) return NULL;      /* keep the command line safe */
+    char *encoded = url_encode(query);
+    if (!encoded) return NULL;
+
+    /* Brave spells recency pd/pw/pm/py. */
+    char fresh[32] = "";
+    if (recency) {
+        const char *f = !strcmp(recency, "day")   ? "pd" :
+                        !strcmp(recency, "week")  ? "pw" :
+                        !strcmp(recency, "month") ? "pm" : "py";
+        snprintf(fresh, sizeof(fresh), "&freshness=%s", f);
     }
 
-    SearchResult results[WEB_SEARCH_MAX_RESULTS];
-    memset(results, 0, sizeof(results));
-    int n = 0;
-    for (int i = 0; i < WEB_SEARCH_MAX_RESULTS; i++) {
-        char path[40];
-        snprintf(path, sizeof(path), "results.%d.url", i);
+    char cmd[4096];
+    snprintf(cmd, sizeof(cmd),
+        "curl -sS --compressed -m 15 -H 'Accept: application/json' "
+        "-H 'X-Subscription-Token: %s' "
+        "'https://api.search.brave.com/res/v1/web/search?q=%s&count=%d%s' 2>/dev/null",
+        key, encoded, WEB_SEARCH_MAX_RESULTS, fresh);
+    free(encoded);
+
+    char *json = run_command(cmd, 1024 * 1024);
+    if (!json || json[0] != '{') { free(json); return NULL; }
+
+    /* Brave reports an invalid key or an exhausted quota as a perfectly
+       well-formed JSON body. Parsed naively that is a search which "worked" and
+       happened to find nothing — precisely the conflation this path exists to
+       prevent — so reject it explicitly and keep the reason for the report. */
+    if (strstr(json, "\"type\":\"ErrorResponse\"") || strstr(json, "\"error\":{")) {
+        char *detail = jx_get_string(json, "error.detail");
+        if (err) snprintf(err, errlen, "%s", detail ? detail : "the Brave API returned an error");
+        free(detail);
+        free(json);
+        return NULL;
+    }
+    return json;
+}
+
+/* SearXNG names the engines that failed this query. Zero results because every
+   engine is captcha'd or rate-limited is a DEGRADED search, not an empty web —
+   and it arrives as a perfectly valid JSON body, so nothing else catches it.
+   Copies the bracketed list (already "engine, reason" pairs) into `out`. */
+static bool searx_unresponsive(const char *json, char *out, size_t outlen) {
+    const char *p = strstr(json, "\"unresponsive_engines\"");
+    if (!p) return false;
+    p = strchr(p, '[');
+    if (!p) return false;
+
+    const char *q = p + 1;
+    while (*q == ' ' || *q == '\n' || *q == '\t') q++;
+    if (*q == ']') return false;              /* empty list — every engine answered */
+
+    size_t k = 0;
+    int depth = 0;
+    for (const char *c = p; *c && k + 1 < outlen; c++) {
+        if (*c == '[') depth++;
+        else if (*c == ']') { depth--; if (depth == 0) break; }
+        if (*c != '[' && *c != ']' && *c != '"') out[k++] = *c;
+    }
+    out[k] = '\0';
+    return k > 0;
+}
+
+/* Append this backend's results to `out`, skipping URLs already there. With
+   several sub-queries in flight the overlap between them is expected, so dedup
+   happens on the way in. Returns the new total. */
+static int collect_results(const char *json, const char *arr, const char *snip_key,
+                           SearchResult *out, int have, int max, int origin) {
+    for (int i = 0; i < WEB_SEARCH_MAX_RESULTS && have < max; i++) {
+        char path[64];
+        snprintf(path, sizeof(path), "%s.%d.url", arr, i);
         char *url = jx_get_string(json, path);
         if (!url) break;                 /* past the end of the results array */
         if (!url[0]) { free(url); break; }
 
-        snprintf(path, sizeof(path), "results.%d.title", i);
+        bool dup = false;
+        for (int j = 0; j < have && !dup; j++)
+            if (out[j].url && strcmp(out[j].url, url) == 0) dup = true;
+        if (dup) { free(url); continue; }
+
+        snprintf(path, sizeof(path), "%s.%d.title", arr, i);
         char *title = jx_get_string(json, path);
-        snprintf(path, sizeof(path), "results.%d.content", i);
+        snprintf(path, sizeof(path), "%s.%d.%s", arr, i, snip_key);
         char *snippet = jx_get_string(json, path);
 
-        results[n].url     = url;
-        results[n].title   = title ? title : strdup("");
-        results[n].snippet = snippet;    /* may be NULL */
-        results[n].age     = NULL;
-        results[n].score   = 0.0;
-        n++;
+        out[have].url     = url;
+        out[have].title   = title ? title : strdup("");
+        out[have].snippet = snippet;    /* may be NULL */
+        out[have].age     = NULL;
+        out[have].score   = 0.0;
+        out[have].origin  = origin;
+        have++;
     }
-    free(json);
+    return have;
+}
+
+char *execute_web_search(const char *query, const char *time_filter) {
+    if (!query || !query[0]) return strdup("Error: web_search requires a query.");
+
+    const char *instance = searxng_instance();
+    if (strchr(instance, '\'')) return strdup("Error: invalid SEARXNG_INSTANCE (contains a quote).");
+
+    /* Map day/week/month/year (or d/w/m/y) to a canonical name that each backend
+       then spells in its own way. */
+    const char *recency = NULL;
+    if (time_filter && time_filter[0]) {
+        const char *t = time_filter;
+        if      (!strcasecmp(t, "day")   || !strcasecmp(t, "d")) recency = "day";
+        else if (!strcasecmp(t, "week")  || !strcasecmp(t, "w")) recency = "week";
+        else if (!strcasecmp(t, "month") || !strcasecmp(t, "m")) recency = "month";
+        else if (!strcasecmp(t, "year")  || !strcasecmp(t, "y")) recency = "year";
+    }
+
+    /* Split on ' | ' into sub-queries. A question with distinct sub-areas needs
+       one query per area, and the expensive failure is not asking four times —
+       it is asking once, getting traction on the first area, and never coming
+       back for the rest. Covering them in one call is what makes breadth the
+       cheap option instead of four more turns. */
+    char *qbuf = strdup(query);
+    if (!qbuf) return strdup("Error: out of memory.");
+    const char *qs[WEB_SEARCH_MAX_QUERIES];
+    int nq = 0;
+    for (char *p = qbuf; p && nq < WEB_SEARCH_MAX_QUERIES; ) {
+        char *sep = strstr(p, " | ");
+        if (sep) *sep = '\0';
+        while (*p == ' ') p++;
+        if (*p) qs[nq++] = p;
+        p = sep ? sep + 3 : NULL;
+    }
+    if (nq == 0) { free(qbuf); return strdup("Error: web_search requires a query."); }
+
+    SearchResult results[WEB_SEARCH_MERGED_MAX];
+    memset(results, 0, sizeof(results));
+    int n = 0, answered = 0;
+    const char *brave_key = getenv("BRAVE_API_KEY");
+    bool have_brave = brave_key && brave_key[0];
+    char brave_err[256] = "";
+    char unresp[224] = "";
+
+    for (int qi = 0; qi < nq && n < WEB_SEARCH_MERGED_MAX; qi++) {
+        char *json = searx_query_json(instance, qs[qi], recency);
+        if (json) {
+            if (!unresp[0]) searx_unresponsive(json, unresp, sizeof(unresp));
+            n = collect_results(json, "results", "content", results, n, WEB_SEARCH_MERGED_MAX, qi);
+            free(json);
+            answered++;
+            continue;
+        }
+        if (have_brave) {
+            json = brave_query_json(brave_key, qs[qi], recency, brave_err, sizeof(brave_err));
+            if (json) {
+                n = collect_results(json, "web.results", "description", results, n,
+                                    WEB_SEARCH_MERGED_MAX, qi);
+                free(json);
+                answered++;
+            }
+        }
+    }
+    free(qbuf);
+
+    /* Nothing answered. This is NOT "the web has nothing on this", and must not
+       be returned as though it were — that conflation is the whole reason
+       toolstat.h exists. */
+    if (answered == 0) {
+        char why[512];
+        if (have_brave)
+            snprintf(why, sizeof(why),
+                "no search backend answered — SearXNG at %s is unreachable and the Brave "
+                "fallback failed (%s). Web search is UNAVAILABLE this run; say so rather "
+                "than concluding the web has nothing on the topic.",
+                instance, brave_err[0] ? brave_err : "no response");
+        else
+            snprintf(why, sizeof(why),
+                "no SearXNG instance answered at %s. Web search is UNAVAILABLE this run "
+                "— say so rather than concluding the web has nothing on the topic. Fix: "
+                "run SearXNG with the JSON format enabled, set SEARXNG_INSTANCE, or set "
+                "BRAVE_API_KEY for a hosted fallback.", instance);
+        return basi_toolstat_failed("web_search", why);
+    }
+    /* Answered, but with nothing — and every engine behind it was blocked. Saying
+       "no results" here would again dress a broken search as a settled fact. */
+    if (n == 0 && unresp[0]) {
+        char why[512];
+        snprintf(why, sizeof(why),
+            "the search backend answered but every engine failed (%s) — results are "
+            "DEGRADED, not empty. Treat this as search being unavailable, not as the "
+            "topic having no coverage; retry in a few minutes.", unresp);
+        return basi_toolstat_failed("web_search", why);
+    }
     if (n == 0) return strdup("No search results found.");
 
     rank_results(query, results, n);
@@ -697,20 +923,54 @@ char *execute_web_search(const char *query, const char *time_filter) {
     /* Auto-fetch the top results in parallel so the model gets real page text,
        not just snippets — snippets routinely omit or mis-state specific facts
        (e.g. a "latest version" number lives on the page, not in the blurb). */
-    int nfetch = n < WEB_SEARCH_FETCH_COUNT ? n : WEB_SEARCH_FETCH_COUNT;
-    char *fetched[WEB_SEARCH_FETCH_COUNT] = {0};
-    char *fetch_urls[WEB_SEARCH_FETCH_COUNT];
-    for (int i = 0; i < nfetch; i++) fetch_urls[i] = results[i].url;
+    /* Budget: the single-query depth, plus a slot per extra sub-query. Without
+       this a 4-way call returned 16 links but the same 3 pages — and since the
+       merged list is ranked globally, all 3 came from whichever sub-area scored
+       highest. That is the over-concentration this feature exists to prevent,
+       so the budget grows with the fan-out and is spent across it. */
+    int budget = (nq > 1) ? nq + 2 : WEB_SEARCH_FETCH_COUNT;
+    if (budget > WEB_SEARCH_FETCH_MAX) budget = WEB_SEARCH_FETCH_MAX;
+    if (budget > n) budget = n;
+
+    int order[WEB_SEARCH_FETCH_MAX];
+    int nfetch = 0;
+    /* Pass 1: the best result from each sub-query, so every sub-area is
+       represented by real page text and not just a snippet. */
+    for (int qi = 0; qi < nq && nfetch < budget; qi++)
+        for (int i = 0; i < n; i++)
+            if (results[i].origin == qi) { order[nfetch++] = i; break; }
+    /* Pass 2: fill what is left by global rank, skipping what pass 1 took. */
+    for (int i = 0; i < n && nfetch < budget; i++) {
+        bool taken = false;
+        for (int j = 0; j < nfetch && !taken; j++) if (order[j] == i) taken = true;
+        if (!taken) order[nfetch++] = i;
+    }
+
+    char *fetched[WEB_SEARCH_FETCH_MAX] = {0};
+    char *fetch_urls[WEB_SEARCH_FETCH_MAX];
+    for (int i = 0; i < nfetch; i++) fetch_urls[i] = results[order[i]].url;
     web_fetch_parallel(fetch_urls, nfetch, WEB_SEARCH_FETCH_CHARS, fetched);
 
     StringBuf out;
     sb_init(&out);
-    char hdr[512];
-    snprintf(hdr, sizeof(hdr),
-        "WEB SEARCH: %s\n%d results; the top %d pages are fetched below — prefer that "
-        "page content over the snippets, and over your own prior knowledge.\n\n",
-        query, n, nfetch);
+    char hdr[640];
+    if (nq > 1)
+        snprintf(hdr, sizeof(hdr),
+            "WEB SEARCH (%d sub-queries): %s\n%d merged results; the top %d pages are "
+            "fetched below — prefer that page content over the snippets, and over your "
+            "own prior knowledge.\n\n",
+            nq, query, n, nfetch);
+    else
+        snprintf(hdr, sizeof(hdr),
+            "WEB SEARCH: %s\n%d results; the top %d pages are fetched below — prefer that "
+            "page content over the snippets, and over your own prior knowledge.\n\n",
+            query, n, nfetch);
     sb_append_str(&out, hdr);
+    if (unresp[0]) {
+        sb_append_str(&out, "NOTE: some search engines failed this query (");
+        sb_append_str(&out, unresp);
+        sb_append_str(&out, ") — these results are PARTIAL.\n\n");
+    }
 
     /* Ranked sources list (all results, snippet preview). */
     for (int i = 0; i < n; i++) {
@@ -738,7 +998,7 @@ char *execute_web_search(const char *query, const char *time_filter) {
         if (!fetched[i] || !fetched[i][0]) continue;
         any = true;
         char lbl[96];
-        snprintf(lbl, sizeof(lbl), "\n[CONTENT %d] %s\n", i + 1, results[i].url);
+        snprintf(lbl, sizeof(lbl), "\n[CONTENT %d] %s\n", order[i] + 1, results[order[i]].url);
         sb_append_str(&out, lbl);
         sb_append_str(&out, fetched[i]);
         sb_append_char(&out, '\n');
@@ -756,8 +1016,9 @@ char *execute_web_search(const char *query, const char *time_filter) {
 char *execute_web_fetch(const char *url) {
     if (!url || !url[0]) return strdup("Error: web_fetch requires a URL.");
 
-    char *final_url = NULL;
-    char *content = web_fetch_extract(url, WEB_FETCH_MAX_CHARS, &final_url);
+    char *final_url = NULL, *spill = NULL;
+    size_t full_len = 0;
+    char *content = web_fetch_extract(url, WEB_FETCH_MAX_CHARS, &final_url, &spill, &full_len);
 
     StringBuf out;
     sb_init(&out);
@@ -772,6 +1033,22 @@ char *execute_web_fetch(const char *url) {
             "blocked, a private/internal address, or require JavaScript.)");
     }
 
+    /* Say plainly that this is the head of a longer document and how to get the
+       rest, in terms of tools the model already has. Silence here reads as "that
+       is the whole paper", which is how a method section gets missed. */
+    if (spill) {
+        char note[512];
+        snprintf(note, sizeof(note),
+            "\n\n[TRUNCATED] This is the first %d of %zu characters. The FULL text is saved at "
+            "%s — page through it with `read %s start=<line>` (each window says where the next "
+            "one starts), or `grep` it for a "
+            "section heading. For a paper, the method and equations are well past this point; "
+            "do not conclude from the abstract alone.\n",
+            WEB_FETCH_MAX_CHARS, full_len, spill, spill);
+        sb_append_str(&out, note);
+    }
+
+    free(spill);
     free(content);
     free(final_url);
     return sb_to_str(&out);

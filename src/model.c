@@ -5,6 +5,7 @@
 #include <stdbool.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <sys/ioctl.h>
 #include <dirent.h>
 #include <termios.h>
 #include <poll.h>
@@ -23,6 +24,8 @@
 #include "srvgen.h"
 #include "srvchat.h"
 #include "bestof.h"
+#include "backend.h"   /* the BACKEND row's candidates */
+#include "vramobs.h"   /* measured VRAM, when this model has launched before */
 
 
 /* ── Spinner frames ────────────────────────────────────────────────── */
@@ -144,9 +147,14 @@ static void chat_on_content(const char *chunk, void *ud) {
  * JSON, streams /v1/chat/completions, and returns the answer text plus STRUCTURED
  * tool calls in tc_out/n_tc_out (caller frees via basi_free_tool_calls).
  * res.prompt_tokens carries the server's exact prompt count for ctx accounting. */
+/* The reasoning text of the most recent generate_chat, or NULL. Valid until the
+ * next call; the caller does not own it. See the note at the assignment. */
+static char *g_last_reasoning = NULL;
+const char *basi_last_reasoning(void) { return g_last_reasoning; }
+
 GenerateResult generate_chat(const BasiMsg *messages, size_t msg_count,
                              BasiToolCall **tc_out, int *n_tc_out) {
-    GenerateResult res = { NULL, 0, 0, 0, 0.0, 0.0, 0.0 };
+    GenerateResult res = { NULL, 0, 0, 0, 0.0, 0.0, 0.0, 0, 0 };
     if (tc_out) *tc_out = NULL;
     if (n_tc_out) *n_tc_out = 0;
 
@@ -271,9 +279,23 @@ single_sample:
     }
     if (!generate_quiet) { printf("\033[0m\n"); fflush(stdout); }
 
+    /* Keep the reasoning where the journal can reach it. A reasoning model doing
+       tool calls returns EMPTY content every round — all the deciding happens in
+       the reasoning stream — so a journal that records only `text` records
+       nothing at all for exactly the runs worth investigating: measured on a
+       12-call agentic run, journal_say wrote zero entries.
+       A static, refreshed per call, rather than a field on GenerateResult: the
+       struct's `text` is freed at eight different exit points across three files,
+       and a second owned pointer would leak at most of them. */
+    free(g_last_reasoning);
+    g_last_reasoning = (r->reasoning && r->reasoning[0] && !answer_in_reasoning)
+                       ? strdup(r->reasoning) : NULL;
+
     res.text          = strdup(answer);
-    res.prompt_tokens = (size_t) r->prompt_tokens;
-    res.gen_tokens    = (size_t) r->completion_tokens;
+    res.prompt_tokens    = (size_t) r->prompt_tokens;
+    res.gen_tokens       = (size_t) r->completion_tokens;
+    res.cached_tokens    = (size_t) r->cached_tokens;
+    res.reasoning_tokens = (size_t) r->reasoning_tokens;
     res.gen_time_s    = (r->tps > 0) ? r->completion_tokens / r->tps : (time_now() - t0);
     /* Prefill time comes straight from the server's own clock. The old form,
        prompt_tokens/prompt_tps, divided the whole prompt by a rate measured over
@@ -818,6 +840,24 @@ static bool arch_prefers_cpu_moe(GGUFArch arch) {
     return arch.n_experts > 0 && arch.layer_expert_mb != NULL;
 }
 
+double basi_predict_vram_mb(const char *model_path, int ngl, int ctx) {
+    if (!model_path || !*model_path) return -1.0;
+    GGUFArch a = read_gguf_arch(model_path);
+    double result = -1.0;
+    if (a.n_layers > 0) {
+        /* ngl<0 (or the conventional 99) means every layer; estimate_memory clamps. */
+        int eff = ngl < 0 ? a.n_layers : ngl;
+        MemorySplit ms = estimate_memory(file_size_mb(model_path), a, eff, ctx,
+                                         arch_prefers_cpu_moe(a));
+        result = ms.vram_mb;
+    }
+    free(a.layer_weight_mb);
+    free(a.layer_expert_mb);
+    free(a.head_kv_per_layer);
+    free(a.is_swa_per_layer);
+    return result;
+}
+
 /* VRAM freed by a just-exited model (e.g. after a /model re-exec) can lag in the
  * driver's live budget for a few hundred ms. Sample the probe until the free
  * figure stops climbing (or a short timeout), so the picker's VRAM math reflects
@@ -837,12 +877,125 @@ static HwInfo hw_probe_settled(void) {
     return prev;
 }
 
+/* ── The hosted tab ────────────────────────────────────────────────── */
+
+typedef struct {
+    const PickerRemote *src;
+    SrvRemoteModel *models;
+    int   count;
+    int   sel, top;          /* selection, and the first row of the visible window */
+    bool  fetched;           /* listed lazily: the LOCAL tab never waits on the network */
+    bool  failed;            /* the listing could not be read */
+    bool  current_unlisted;  /* models[0] is the in-use model, absent from the listing */
+} RemoteTab;
+
+/* (Re)fetch the list. The model in use now is kept even when the listing leaves
+ * it out — Fireworks' listing once omitted kimi-k3 while it served requests fine
+ * (2026-07-27) — so the picker never hides where the session already is. */
+static void remote_tab_fetch(RemoteTab *t) {
+    srvchat_free_models(t->models, t->count);
+    t->models = NULL; t->count = 0; t->sel = t->top = 0;
+    t->fetched = true; t->failed = false; t->current_unlisted = false;
+    const PickerRemote *r = t->src;
+    if (!r->api_key || !*r->api_key) return;
+
+    int n = srvchat_list_chat_models(r->base_url, r->api_key, &t->models);
+    if (n < 0) { t->failed = true; n = 0; }
+    t->count = n;
+
+    if (!r->current_model) return;
+    for (int i = 0; i < t->count; i++)
+        if (strcmp(t->models[i].id, r->current_model) == 0) { t->sel = i; return; }
+    char *id = strdup(r->current_model);
+    SrvRemoteModel *grown = id ? realloc(t->models, (size_t)(t->count + 1) * sizeof *grown) : NULL;
+    if (!grown) { free(id); return; }
+    memmove(grown + 1, grown, (size_t)t->count * sizeof *grown);
+    grown[0] = (SrvRemoteModel){ id, 0, -1, -1 };
+    t->models = grown;
+    t->count++;
+    t->current_unlisted = true;
+}
+
+static const char *remote_leaf(const char *id) {
+    const char *s = strrchr(id, '/');
+    return s ? s + 1 : id;
+}
+
+/* 1048576 → "1M", 262144 → "256K"; "?" when the provider did not say. */
+static void fmt_ctx(int ctx, char *out, size_t n) {
+    if (ctx <= 0)                     snprintf(out, n, "?");
+    else if (ctx % (1024 * 1024) == 0) snprintf(out, n, "%dM", ctx / (1024 * 1024));
+    else if (ctx >= 1024)             snprintf(out, n, "%dK", ctx / 1024);
+    else                              snprintf(out, n, "%d", ctx);
+}
+
+static int term_rows(void) {
+    struct winsize ws;
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_row > 0) return ws.ws_row;
+    return 24;
+}
+
+static void draw_tab_bar(bool remote_on, const char *label) {
+    printf("  %s LOCAL \033[0m  %s %s \033[0m   \033[90mTab switches\033[0m\n\n",
+           remote_on ? "\033[90m" : "\033[1;7;36m",
+           remote_on ? "\033[1;7;36m" : "\033[90m", label);
+}
+
+static void remote_tab_draw(RemoteTab *t) {
+    const PickerRemote *r = t->src;
+    if (!r->api_key || !*r->api_key) {
+        printf("  \033[33m%s is not set.\033[0m Export it (or BASI_API_KEY) and reopen /model.\n",
+               r->key_env);
+        printf("\n\033[90mTab local  q quit\033[0m\n");
+        return;
+    }
+    printf("\033[1;33m▸ MODEL\033[0m  \033[90m%d chat models · %s\033[0m\n", t->count, r->base_url);
+    if (t->failed)
+        printf("    \033[31mCould not read the model list (network down, or the key was "
+               "refused). r retries.\033[0m\n");
+
+    int width = 0;
+    for (int i = 0; i < t->count; i++) {
+        int l = (int) strlen(remote_leaf(t->models[i].id));
+        if (l > width) width = l;
+    }
+    if (width > 40) width = 40;
+
+    /* A window, not the whole list: a provider can list far more models than the
+       terminal has rows, and a cleared screen that scrolls loses its own header. */
+    int visible = term_rows() - 14;
+    if (visible < 5) visible = 5;
+    if (t->sel < t->top) t->top = t->sel;
+    if (t->sel >= t->top + visible) t->top = t->sel - visible + 1;
+
+    if (t->top > 0) printf("    \033[90m↑ %d more\033[0m\n", t->top);
+    for (int i = t->top; i < t->count && i < t->top + visible; i++) {
+        const SrvRemoteModel *m = &t->models[i];
+        char c[16]; fmt_ctx(m->ctx, c, sizeof c);
+        bool on = (i == t->sel);
+        printf("    %s%s %-*.*s\033[0m  \033[90m%5s ctx  %-5s  %-6s%s\033[0m",
+               on ? "\033[1;36m" : "\033[90m", on ? "●" : "○",
+               width, width, remote_leaf(m->id), c,
+               m->tools == 1 ? "tools" : "", m->vision == 1 ? "vision" : "",
+               strstr(m->id, "/routers/") ? "  router" : "");
+        if (r->current_model && strcmp(m->id, r->current_model) == 0)
+            printf("  \033[32mcurrent%s\033[0m",
+                   (i == 0 && t->current_unlisted) ? " (not in the listing)" : "");
+        printf("\n");
+    }
+    int below = t->count - (t->top + visible);
+    if (below > 0) printf("    \033[90m↓ %d more\033[0m\n", below);
+    if (t->count > 0) printf("\n    \033[90m%s\033[0m\n", t->models[t->sel].id);
+    printf("\n\033[90m↑/↓ navigate  Tab local  r refresh list  Enter launch  q quit\033[0m\n");
+}
+
 /*
  * Scan directories for .gguf files, show interactive menu with settings.
- * Returns filled LaunchConfig, or model_path=NULL on cancel.
+ * With `remote`, a second tab lists that provider's hosted models.
+ * Returns filled LaunchConfig, or model_path=NULL and api_model=NULL on cancel.
  */
-LaunchConfig pick_model(void) {
-    LaunchConfig cfg = { NULL, 99, CONTEXT_SIZE, 0.4f, 0, 0, 0 };
+LaunchConfig pick_model(const PickerRemote *remote) {
+    LaunchConfig cfg = { NULL, 99, CONTEXT_SIZE, 0.4f, 0, 0, 0, NULL, NULL, NULL };
 
     /* Build search dirs */
     init_model_search_dirs();
@@ -855,7 +1008,8 @@ LaunchConfig pick_model(void) {
         scan_gguf_recursive(model_search_dirs[d], &models, &count, &cap);
     }
 
-    if (count == 0) {
+    /* No GGUFs is only the end of the road when there is no hosted tab to offer. */
+    if (count == 0 && !remote) {
         fprintf(stderr, "No .gguf models found in search directories.\n");
         free(models);
         return cfg;
@@ -887,8 +1041,19 @@ LaunchConfig pick_model(void) {
 
     /* Menu state */
     enum { SECTION_MODEL, SECTION_GPU, SECTION_CTX, SECTION_TEMP,
-           SECTION_SPEC, SECTION_FA, SECTION_LAUNCH, SECTION_COUNT };
+           SECTION_SPEC, SECTION_FA, SECTION_BACKEND, SECTION_LAUNCH, SECTION_COUNT };
     int section = SECTION_MODEL;
+
+    /* Which llama-server binary to run — the one field of the composed command line
+     * this menu never used to offer. Candidates are declared by the user; with fewer
+     * than two there is nothing to choose, so the row is hidden entirely. Start on
+     * whatever is currently in effect (saved choice, else the Vulkan default). */
+    int n_backends = 0;
+    const Backend *backends = backend_list(&n_backends);
+    int backend_sel = 0;
+    for (int i = 0; i < n_backends; i++)
+        if (strcmp(backends[i].name, backend_active()->name) == 0) { backend_sel = i; break; }
+    const bool show_backend = (n_backends > 1);
     int model_sel = 0;
     int gpu_setting = GPU_LAYER_AUTO;  /* -1 = auto, else absolute layer count */
     int ctx_val = CTX_DEFAULT;     /* free slider value */
@@ -900,11 +1065,58 @@ LaunchConfig pick_model(void) {
     int spec_on = 0, fa_on = 0;
     int spec_touched = 0, fa_touched = 0;
 
+    /* LOCAL | hosted. Opens on the one in use, so /model from a hosted session
+       lands on the list it came from. */
+    RemoteTab rt = { .src = remote };
+    bool on_remote = remote && (remote->current_model || count == 0);
+
     while (1) {
         printf("\033[2J\033[H");
         printf("\033[1;36m╔══════════════════════════════════════════════════════════════╗\033[0m\n");
         printf("\033[1;36m║           BASI-CLI — Model Configuration                    ║\033[0m\n");
         printf("\033[1;36m╚══════════════════════════════════════════════════════════════╝\033[0m\n\n");
+        if (remote) draw_tab_bar(on_remote, remote->label);
+
+        if (on_remote) {
+            if (!rt.fetched) {
+                printf("    \033[90mfetching the %s model list …\033[0m\n", remote->label);
+                fflush(stdout);
+                remote_tab_fetch(&rt);
+                continue;
+            }
+            remote_tab_draw(&rt);
+            fflush(stdout);
+
+            unsigned char ch;
+            if (read(STDIN_FILENO, &ch, 1) != 1) break;
+            if (ch == 'q' || ch == 'Q' || ch == 3) break;
+            if (ch == '\t') { on_remote = false; continue; }
+            if (ch == 'r' || ch == 'R') { remote_tab_fetch(&rt); continue; }
+            if ((ch == '\n' || ch == '\r') && rt.count > 0) {
+                cfg.api_model    = strdup(rt.models[rt.sel].id);
+                cfg.api_provider = remote->provider;
+                break;
+            }
+            if (ch == 27) {
+                unsigned char seq[2];
+                if (read(STDIN_FILENO, seq, 2) == 2 && seq[0] == '[') {
+                    if (seq[1] == 'A' && rt.sel > 0) rt.sel--;
+                    if (seq[1] == 'B' && rt.sel < rt.count - 1) rt.sel++;
+                }
+            }
+            continue;
+        }
+
+        if (count == 0) {           /* reachable only with a hosted tab to go back to */
+            printf("  No .gguf models found (searched ~/.cache/huggingface/hub, ~/models and .)\n");
+            printf("\n\033[90mTab %s  q quit\033[0m\n", remote->label);
+            fflush(stdout);
+            unsigned char ch;
+            if (read(STDIN_FILENO, &ch, 1) != 1) break;
+            if (ch == 'q' || ch == 'Q' || ch == 3) break;
+            if (ch == '\t') on_remote = true;
+            continue;
+        }
 
         /* Model selection */
         printf("%s MODEL %s\n",
@@ -1000,6 +1212,15 @@ LaunchConfig pick_model(void) {
             MemorySplit ms = estimate_memory(model_size_mb[model_sel],
                                              model_arch[model_sel],
                                              gpu_effective, ctx_val, cpu_moe);
+            /* Prefer what this model ACTUALLY used last time it launched at this
+               config. Display only — auto_fit_layers deliberately keeps budgeting
+               against the raw estimate, because the estimate errs high and that
+               slack absorbs allocations it doesn't model (a bigger ubatch costs
+               hundreds of MiB of compute buffer). Fitting to a measured-tight
+               number could start OOMing. */
+            int vram_measured = 0;
+            ms.vram_mb = vramobs_correct(models[model_sel], gpu_effective, ctx_val,
+                                         ms.vram_mb, &vram_measured);
             bool fits_gpu = hw.has_gpu && ms.vram_mb <= vram_usable_mb;
             bool spilling = ms.ram_mb > 0.5;  /* anything not on GPU */
 
@@ -1011,9 +1232,10 @@ LaunchConfig pick_model(void) {
 
             printf("    \033[90mMEMORY        \033[0m");
             if (hw.has_gpu) {
-                printf("%s[%s %.1f / %.1f GB]\033[0m  ",
+                printf("%s[%s %.1f / %.1f GB]\033[0m%s  ",
                        gpu_color, hw_vendor_label(hw.vendor_id),
-                       ms.vram_mb / 1024.0, vram_usable_mb / 1024.0);
+                       ms.vram_mb / 1024.0, vram_usable_mb / 1024.0,
+                       vram_measured ? " \033[32mmeasured\033[0m" : "");
             } else {
                 printf("\033[90m[no GPU detected]\033[0m  ");
             }
@@ -1055,6 +1277,19 @@ LaunchConfig pick_model(void) {
         if (section == SECTION_FA) printf("  \033[90m← →\033[0m");
         printf("\033[0m\n");
 
+        /* BACKEND: which llama-server binary the generated script execs. The extra
+           flags come from the backend config, so show them — they are part of the
+           command this menu is composing. */
+        if (show_backend) {
+            printf("%s BACKEND       \033[1m%s\033[0m",
+                   section == SECTION_BACKEND ? "\033[1;33m▸" : "  \033[90m",
+                   backends[backend_sel].name);
+            if (backends[backend_sel].extra_flags[0])
+                printf("  \033[36m%s\033[0m", backends[backend_sel].extra_flags);
+            if (section == SECTION_BACKEND) printf("  \033[90m← →\033[0m");
+            printf("\033[0m\n");
+        }
+
         printf("\n");
 
         /* Launch button */
@@ -1064,7 +1299,9 @@ LaunchConfig pick_model(void) {
             printf("    \033[90m[ LAUNCH ]\033[0m\n");
         }
 
-        printf("\n\033[90m↑/↓ navigate  ←/→ adjust  r refresh VRAM  Enter select/launch  q quit\033[0m\n");
+        printf("\n\033[90m↑/↓ navigate  ←/→ adjust  r refresh VRAM  Enter select/launch  ");
+        if (remote) printf("Tab %s  ", remote->label);
+        printf("q quit\033[0m\n");
         fflush(stdout);
 
         /* Read key */
@@ -1072,6 +1309,8 @@ LaunchConfig pick_model(void) {
         if (read(STDIN_FILENO, &ch, 1) != 1) break;
 
         if (ch == 'q' || ch == 'Q' || ch == 3) break;
+
+        if (ch == '\t' && remote) { on_remote = true; continue; }
 
         if (ch == 'r' || ch == 'R') {          /* re-probe live VRAM on demand */
             hw = hw_probe_settled();
@@ -1092,10 +1331,12 @@ LaunchConfig pick_model(void) {
                 cfg.temperature = temp_opts[temp_idx];
                 cfg.spec_draft_mtp = spec_on;
                 cfg.flash_attn = fa_on;
+                cfg.backend = show_backend ? backends[backend_sel].name : NULL;
                 break;
             } else {
                 /* Enter on setting goes to next section */
                 section++;
+                if (section == SECTION_BACKEND && !show_backend) section = SECTION_LAUNCH;
             }
             continue;
         }
@@ -1106,11 +1347,18 @@ LaunchConfig pick_model(void) {
                 switch (seq[1]) {
                 case 'A': /* Up */
                     if (section == SECTION_MODEL && model_sel > 0) model_sel--;
-                    else if (section > SECTION_MODEL) section--;
+                    else if (section > SECTION_MODEL) {
+                        section--;
+                        /* Never land on the hidden BACKEND row. */
+                        if (section == SECTION_BACKEND && !show_backend) section--;
+                    }
                     break;
                 case 'B': /* Down */
                     if (section == SECTION_MODEL && model_sel < count - 1) model_sel++;
-                    else if (section < SECTION_LAUNCH) section++;
+                    else if (section < SECTION_LAUNCH) {
+                        section++;
+                        if (section == SECTION_BACKEND && !show_backend) section++;
+                    }
                     break;
                 case 'C': /* Right */
                     if (section == SECTION_GPU) {
@@ -1127,6 +1375,7 @@ LaunchConfig pick_model(void) {
                     if (section == SECTION_TEMP && temp_idx < N_TEMP_OPTS - 1) temp_idx++;
                     if (section == SECTION_SPEC && cur_mtp) { spec_on = 1; spec_touched = 1; }
                     if (section == SECTION_FA) { fa_on = 1; fa_touched = 1; }
+                    if (section == SECTION_BACKEND && backend_sel < n_backends - 1) backend_sel++;
                     break;
                 case 'D': /* Left */
                     if (section == SECTION_GPU && gpu_setting > GPU_LAYER_AUTO) gpu_setting--;
@@ -1137,6 +1386,7 @@ LaunchConfig pick_model(void) {
                     if (section == SECTION_TEMP && temp_idx > 0) temp_idx--;
                     if (section == SECTION_SPEC) { spec_on = 0; spec_touched = 1; }
                     if (section == SECTION_FA) { fa_on = 0; fa_touched = 1; }
+                    if (section == SECTION_BACKEND && backend_sel > 0) backend_sel--;
                     break;
                 }
             }
@@ -1150,11 +1400,13 @@ LaunchConfig pick_model(void) {
     for (int i = 0; i < count; i++) {
         free(models[i]);
         free(model_arch[i].layer_weight_mb);
+        free(model_arch[i].layer_expert_mb);   /* allocated beside layer_weight_mb */
         free(model_arch[i].head_kv_per_layer);
         free(model_arch[i].is_swa_per_layer);
     }
     free(models);
     free(model_arch);
     free(model_size_mb);
+    srvchat_free_models(rt.models, rt.count);
     return cfg;
 }

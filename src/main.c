@@ -20,6 +20,7 @@
 #include <fcntl.h>
 #include <stdarg.h>
 #include <limits.h>
+#include <math.h>
 #include <sys/utsname.h>
 #include <sys/ioctl.h>
 
@@ -43,10 +44,17 @@
 #include "deepsearch.h"
 #include "chat_tmpl.h"
 #include "tooldefs.h"
+#include "toolstat.h"
+#include "mcp.h"
 #include "cookbook.h"
 #include "slashmenu.h"
 #include "srvgen.h"
+#include "sampling.h"
 #include "srvchat.h"
+#include "backend.h"
+#include "helpparse.h"
+#include "hwinfo.h"    /* hw_probe — live VRAM, to check the estimate against reality */
+#include "vramobs.h"
 
 /* MAX_TOKENS, CONTEXT_SIZE → globals.h */
 #define MAX_FILE_TOKENS     2000
@@ -590,6 +598,10 @@ bool debug_mode = false;
 bool bash_always_allowed = false;
 bool apply_patch_always_allowed = false;
 bool scaffold_always_allowed = false;
+/* Per-session "always" for MCP tool calls, set by answering `a` at the prompt.
+ * Deliberately NOT shared with bash_always_allowed: approving a local build
+ * command is not approving a third-party server to act on your behalf. */
+static bool mcp_always_allowed = false;
 
 PermissionMode permission_mode = PERM_DEFAULT;
 
@@ -699,9 +711,15 @@ int request_approval(const char *tool_label, const char *cmd) {
 
 /* ── Execute tool command ──────────────────────────────────────────── */
 
-#define READ_WHOLE_MAX_BYTES   24000   /* <= this AND no window: return the file whole (~6k tokens) */
-#define READ_WINDOW_LINES        400   /* default lines per window for a larger file */
-#define READ_WINDOW_MAX_BYTES  24000   /* hard byte cap on one window */
+/* A read has to fit the tool-result cap whole. It used to allow 24 KB windows,
+ * three times what truncate_tool_result lets through, so the cut took the MIDDLE
+ * of every larger window, and the footer's "continue at line N" skipped what had
+ * gone. Measured on a 17 KB paper read whole: the 9.3 KB that went missing was its
+ * entire method section. A window now survives the cut (the header and footer are
+ * each under 512 bytes), and a file that does not fit is paged instead. */
+#define READ_WINDOW_LINES      (TOOL_RESULT_HEAD_LINES + TOOL_RESULT_TAIL_LINES - 10)
+#define READ_WINDOW_MAX_BYTES  (TOOL_RESULT_MAX_BYTES - 1024)
+#define READ_WHOLE_MAX_BYTES   READ_WINDOW_MAX_BYTES  /* and <= READ_WINDOW_LINES: returned whole */
 
 /* Read a WINDOW of a file's lines. 1-based `start`, `count` lines (<=0 => defaults).
  * A file that fits whole (<= READ_WHOLE_MAX_BYTES) and was requested without an
@@ -728,19 +746,21 @@ static char *read_file_window(const char *filepath, long start, long count) {
     buf[n] = '\0';
     fclose(f);
 
+    long total = 0;
+    for (size_t i = 0; i < n; i++) if (buf[i] == '\n') total++;
+    if (n > 0 && buf[n-1] != '\n') total++;
+    if (total == 0) total = 1;
+
     bool explicit_window = (start > 0 || count > 0);
-    if (!explicit_window && n <= READ_WHOLE_MAX_BYTES) {
+    if (!explicit_window && n <= READ_WHOLE_MAX_BYTES && total <= READ_WINDOW_LINES) {
         read_tracker_mark(filepath);
         return buf;                          /* small file: whole, unchanged */
     }
 
     if (start < 1) start = 1;
-    if (count <= 0) count = READ_WINDOW_LINES;
-
-    long total = 0;
-    for (size_t i = 0; i < n; i++) if (buf[i] == '\n') total++;
-    if (n > 0 && buf[n-1] != '\n') total++;
-    if (total == 0) total = 1;
+    /* A bigger count would only be cut again downstream. Clamping it here keeps the
+       footer's next start honest. */
+    if (count <= 0 || count > READ_WINDOW_LINES) count = READ_WINDOW_LINES;
 
     /* byte offset of the first byte of line `start` */
     long line = 1; size_t off = 0;
@@ -780,6 +800,58 @@ static char *read_file_window(const char *filepath, long start, long count) {
 /* djb2 hash of a tool result, for the re-read dedup: a tool call that returns bytes
    IDENTICAL to a prior result gave the model no new information, so it is a flail (a
    phase measured re-reading .basi/findings.md 8 times without ever acting). */
+/* ── Re-read overlap detection ──────────────────────────────────────────
+ * The byte-identical dedup below cannot see the shape this actually takes. A
+ * model pages a large file at shifting offsets, so every result differs by a few
+ * lines while carrying the same content again and again, and none of them ever
+ * hash alike. Measured on one hair-simulation run: 56 reads, 55 of them
+ * byte-distinct, 510 KB — 88% of everything the model was fed. That drove the
+ * context into an elision which threw away the very file it was reading, and the
+ * turn collapsed into repetition. So track LINES, not whole results.
+ *
+ * Short lines are ignored: braces, blanks and single keywords recur in every
+ * source file and would make any two of them look like the same text. */
+#define LINESEEN_SLOTS 32768u
+#define LINESEEN_MINLEN 24       /* a line long enough to identify content */
+static unsigned long g_line_seen[LINESEEN_SLOTS];
+
+static void line_seen_reset(void) { memset(g_line_seen, 0, sizeof(g_line_seen)); }
+
+/* Open-addressed set. Returns whether `h` was already present; inserts if not.
+ * A crowded neighbourhood reports "new" rather than risking a false duplicate —
+ * wrongly withholding a result the model has not seen is the worse error. */
+static bool line_seen_hit(unsigned long h) {
+    if (!h) h = 1;
+    unsigned base = (unsigned)(h % LINESEEN_SLOTS);
+    for (unsigned probe = 0; probe < 64; probe++) {
+        unsigned i = (base + probe) % LINESEEN_SLOTS;
+        if (g_line_seen[i] == h) return true;
+        if (g_line_seen[i] == 0) { g_line_seen[i] = h; return false; }
+    }
+    return false;
+}
+
+/* Fraction of this result's substantial lines the model has already been given,
+ * recording them as it goes. *n_counted receives how many such lines there were,
+ * so a caller can require a big page before acting on the ratio. */
+static double lines_already_seen(const char *s, int *n_counted) {
+    int total = 0, dup = 0;
+    for (const char *p = s; *p; ) {
+        const char *e = strchr(p, '\n');
+        size_t len = e ? (size_t)(e - p) : strlen(p);
+        if (len >= LINESEEN_MINLEN) {
+            unsigned long h = 5381;
+            for (size_t i = 0; i < len; i++) h = ((h << 5) + h) + (unsigned char)p[i];
+            total++;
+            if (line_seen_hit(h)) dup++;
+        }
+        if (!e) break;
+        p = e + 1;
+    }
+    if (n_counted) *n_counted = total;
+    return total ? (double)dup / (double)total : 0.0;
+}
+
 static unsigned long tool_result_hash(const char *s) {
     unsigned long h = 5381; int c;
     while ((c = (unsigned char)*s++)) h = ((h << 5) + h) + (unsigned long)c;
@@ -792,6 +864,15 @@ static unsigned long tool_result_hash(const char *s) {
  * server derives the tool grammar from the registered set, so an unlisted tool can't
  * even be emitted). Returns a malloc'd array of the matched defs and sets *out_n;
  * the process keeps it alive. Unknown names are ignored. */
+/* The --tools scope in force for this session, NULL when unscoped. Kept so the
+ * tool set can be rebuilt later (an MCP server reconnect changes what exists)
+ * without widening a phase that was deliberately narrowed. */
+static const char *active_tool_subset = NULL;
+
+/* MCP was never contacted this run (--no-mcp, or a --tools scope that named no
+ * MCP tool). Distinguishes "off" from "nothing configured" in /mcp. */
+static bool mcp_skipped_this_run = false;
+
 static BasiToolDef *filter_tool_defs(const char *csv, int *out_n) {
     int n; const BasiToolDef *all = basi_tool_defs(&n);
     BasiToolDef *sub = malloc(sizeof(BasiToolDef) * (size_t)n);
@@ -814,6 +895,22 @@ static BasiToolDef *filter_tool_defs(const char *csv, int *out_n) {
     }
     *out_n = m;
     return sub;
+}
+
+/* Advertise the current tool table to the model, honouring the session's
+ * --tools scope. Called at startup and again whenever the table changes. */
+static void reregister_tools(void) {
+    static BasiToolDef *scoped = NULL;      /* freed on the next call, not leaked per reconnect */
+    int n = 0;
+    const BasiToolDef *defs = basi_tool_defs(&n);
+    BasiToolDef *fresh = NULL;
+    if (active_tool_subset && *active_tool_subset) {
+        fresh = filter_tool_defs(active_tool_subset, &n);
+        defs = fresh;
+    }
+    basi_set_tools(defs, n);                /* copies, so the array need not survive */
+    free(scoped);
+    scoped = fresh;
 }
 
 /* Truncate an oversized tool result keeping the HEAD and the TAIL — the middle
@@ -909,10 +1006,120 @@ static void sh_append_arg(StringBuf *sb, const char *arg) {
     }
 }
 
+/* ── "you just rendered something — go and look at it" ──────────────────────
+ * A capability the model never reads about is a capability it never uses.
+ * Measured on this codebase: 79% of all tool calls are bash, code_context got
+ * 0 calls out of 312, and the fix that worked was putting the capability where
+ * the model was ALREADY reading — ctags in the bash description took discovery
+ * from 36% to 100%.
+ *
+ * view_image has the same problem in a sharper form. A run given the literal
+ * command line to render three azimuths and told "then call view_image and
+ * JUDGE THE PICTURE" rendered them and never once looked: 16 tool calls, zero
+ * looks. So the reminder goes in the RESULT of the call that produced the
+ * image, which the model cannot skip reading.
+ *
+ * Deterministic, not a guess: only literal paths that appear in the command
+ * itself, that exist, and whose mtime falls inside this command's own run. A
+ * path built from a shell variable simply is not named — better silent than
+ * wrong. */
+static bool path_is_image(const char *p) {
+    const char *d = strrchr(p, '.');
+    if (!d) return false;
+    static const char *EXT[] = { ".png", ".jpg", ".jpeg", ".webp", ".gif",
+                                 ".ppm", ".pgm", ".pnm", ".bmp", ".tga", NULL };
+    for (int i = 0; EXT[i]; i++) if (strcasecmp(d, EXT[i]) == 0) return true;
+    return false;
+}
+
+/* Collect an image path if it is real, non-empty, and was written by THIS
+ * command. Returns 1 if it was added. */
+static int img_consider(const char *cand, time_t started,
+                        const char **found, int *n_found, int cap) {
+    if (*n_found >= cap || !cand || !*cand) return 0;
+    if (!path_is_image(cand) || strchr(cand, '$') || strchr(cand, '*')) return 0;
+    struct stat st;
+    if (stat(cand, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size == 0) return 0;
+    if (st.st_mtime + 2 < started) return 0;          /* predates the command */
+    for (int i = 0; i < *n_found; i++)
+        if (strcmp(found[i], cand) == 0) return 0;
+    found[(*n_found)++] = strdup(cand);
+    return 1;
+}
+
+/* Pull whitespace/shell-punctuation-separated tokens out of `text` and test each. */
+static void img_scan_text(const char *text, time_t started,
+                          const char **found, int *n_found, int cap) {
+    if (!text) return;
+    char tok[PATH_MAX];
+    for (const char *p = text; *p && *n_found < cap; ) {
+        while (*p && (isspace((unsigned char)*p) || strchr("'\"><|;,()[]{}=", *p))) p++;
+        size_t k = 0;
+        while (*p && !isspace((unsigned char)*p) && !strchr("'\"><|;,()[]{}=", *p)
+               && k + 1 < sizeof tok)
+            tok[k++] = *p++;
+        tok[k] = '\0';
+        if (k) img_consider(tok, started, found, n_found, cap);
+    }
+}
+
+/* Append the note to `result` (which it takes ownership of) and return the new
+ * buffer, or `result` unchanged when the command wrote no image. */
+static char *bash_note_images(char *result, const char *cmd, time_t started) {
+    if (!result) return result;
+    const char *found[3]; int n_found = 0;
+
+    /* Three places a written image can be named, cheapest first. The command is
+     * not enough on its own: the very first test of this ran `./render.sh`, and
+     * the path it wrote lived inside the script, so nothing was detected. What
+     * a command WRITES is not generally visible in how it was invoked. */
+    img_scan_text(cmd, started, found, &n_found, 3);
+    img_scan_text(result, started, found, &n_found, 3);   /* "render complete: chart.png" */
+    if (n_found < 3) {                                     /* freshly written into cwd */
+        DIR *d = opendir(".");
+        if (d) {
+            struct dirent *e;
+            while ((e = readdir(d)) != NULL && n_found < 3)
+                if (e->d_name[0] != '.') img_consider(e->d_name, started, found, &n_found, 3);
+            closedir(d);
+        }
+    }
+    if (!n_found) return result;
+
+    StringBuf m; sb_init(&m);
+    sb_append_str(&m, result);
+    sb_append_str(&m, "\n\n[this command wrote ");
+    for (int i = 0; i < n_found; i++) {
+        if (i) sb_append_str(&m, i + 1 == n_found ? " and " : ", ");
+        sb_append_str(&m, found[i]);
+    }
+    sb_append_str(&m, " — you have VISION: call view_image on ");
+    sb_append_str(&m, found[0]);
+    sb_append_str(&m, " and judge the picture. Do not reason about what it probably "
+                      "looks like from the code; a look costs ~500 tokens.]");
+    for (int i = 0; i < n_found; i++) free((void *) found[i]);
+    free(result);
+    return sb_to_str(&m);
+}
+
+static bool toolstat_nested;   /* defined with execute_tool_native, below */
+
 static char *execute_tool(const char *command) {
     /* trim whitespace */
     while (*command == ' ' || *command == '\t' || *command == '\n') command++;
     if (!*command) return strdup("Error: Empty command");
+
+    /* Count the dispatch by tool name. This is the denominator the end-of-run
+     * report needs: "1 of 9 calls failed" is a hiccup, "9 of 9" means the answer
+     * was written without a capability the model believed it had. */
+    {
+        char nm[64];
+        size_t i = 0;
+        while (i + 1 < sizeof(nm) && command[i] && command[i] != ' ' &&
+               command[i] != '\t' && command[i] != '\n') { nm[i] = command[i]; i++; }
+        nm[i] = '\0';
+        if (nm[0] && !toolstat_nested) basi_toolstat_call(nm);
+    }
 
     /* Phase gate (Decision #5): single check covers bash/edit/scaffold
      * blocking during drafting/spike/premortem AND plan_write availability. */
@@ -1090,6 +1297,7 @@ static char *execute_tool(const char *command) {
             if (tenv) { int v = atoi(tenv); if (v > 0) bash_tmo = v; }
             if (bash_tmo > 2400) bash_tmo = 2400;   /* 40 min: an experiment phase may build */
             int timed_out = 0;
+            time_t bash_started = time(NULL);
             char *result = run_command_timeout(sb_to_str(&wrapped), 512 * 1024,
                                                bash_tmo, &timed_out);
             sb_free(&wrapped);
@@ -1109,7 +1317,7 @@ static char *execute_tool(const char *command) {
                 sb_append_str(&m, note);
                 return sb_to_str(&m);
             }
-            return result;
+            return bash_note_images(result, shell_cmd, bash_started);
         }
     }
 
@@ -1262,9 +1470,265 @@ static char *tool_result_envelope(const char *name, const char *content) {
  * space) survives intact instead of being silently re-split (CODE_REVIEW_PLAN
  * Task 3). Returns a malloc'd result string, or NULL if `name` is not a known
  * tool (the caller then reports the unknown-tool error). */
+/* An MCP tool is code BASI did not write, running wherever its server runs, so
+ * it goes through the same y/n/a gate as bash — and the prompt shows the actual
+ * arguments, because the spec's own guidance is that the user should see a tool's
+ * inputs before the call leaves the machine (that is the moment an exfiltration
+ * attempt is visible). readOnlyHint is only a LABEL: it is self-reported by the
+ * server being gated, so trusting it to skip the prompt would be circular. */
+static char *execute_mcp_tool(const char *name, const char *args_json) {
+    bool auto_approve = (permission_mode == PERM_BYPASS) || mcp_always_allowed;
+    if (!auto_approve) {
+        const char *srv = mcp_tool_server(name);
+        int ro = mcp_tool_readonly(name);
+        char label[128];
+        snprintf(label, sizeof(label), "mcp:%s%s", srv ? srv : "?",
+                 ro == 1 ? " (server says read-only)" : "");
+
+        /* Show the call the way the model made it, truncated — a schema-shaped
+           argument blob can be arbitrarily large and this is a terminal prompt. */
+        char shown[1024];
+        snprintf(shown, sizeof(shown), "%s %.700s%s", name,
+                 args_json, strlen(args_json) > 700 ? " …" : "");
+
+        int decision = request_approval(label, shown);
+        if (decision == 0) return strdup("User denied execution.");
+        if (decision == 2) mcp_always_allowed = true;
+    }
+    return mcp_call_tool(name, args_json);
+}
+
+/* ── Vision: put a picture in front of the model ─────────────────────────────
+ * An OpenAI-compatible endpoint carries images only inside a user message's
+ * content array — there is no way to return one from a role:"tool" result. So
+ * view_image does two things: it answers the tool call with ordinary text, and
+ * it parks the image here for the agent loop to append as the next message.
+ *
+ * The file is normalized to a downscaled PNG first. A 4K screenshot tells the
+ * model nothing a 1024px one doesn't and costs several thousand more tokens;
+ * at this size a look is ~500 tokens, which is what makes "render, then look"
+ * affordable after every single change. */
+static char *g_pending_image = NULL;   /* {"path":...,"text":...}, or NULL */
+
+/* Single-quote for /bin/sh: wrap in '...', and close/escape/reopen each '. */
+static void sh_quote_into(StringBuf *sb, const char *s) {
+    sb_append_char(sb, '\'');
+    for (const char *p = s; *p; p++) {
+        if (*p == '\'') sb_append_str(sb, "'\\''");
+        else            sb_append_char(sb, *p);
+    }
+    sb_append_char(sb, '\'');
+}
+
+/* Per-process scratch dir for converted frames. They must OUTLIVE the call: the
+ * serializer re-reads the file on every turn, so an image deleted after the
+ * call would silently vanish from the conversation one round later. */
+static const char *image_scratch_dir(void) {
+    static char dir[256];
+    static bool tried = false;
+    if (!tried) {
+        tried = true;
+        snprintf(dir, sizeof dir, "/tmp/basi-img-%d", (int) getpid());
+        if (mkdir_p(dir) != 0) dir[0] = '\0';
+    }
+    return dir[0] ? dir : NULL;
+}
+
+/* Width/height straight out of the PNG IHDR (bytes 16..23, big-endian). Reading
+ * the header beats shelling out to `identify` for a number we can just look at,
+ * and it means the size reported to the model is measured, not assumed. */
+static bool png_dimensions(const char *path, unsigned *w, unsigned *h) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return false;
+    unsigned char hdr[24];
+    bool ok = fread(hdr, 1, sizeof hdr, f) == sizeof hdr &&
+              memcmp(hdr, "\x89PNG\r\n\x1a\n", 8) == 0 &&
+              memcmp(hdr + 12, "IHDR", 4) == 0;
+    fclose(f);
+    if (!ok) return false;
+    *w = ((unsigned)hdr[16] << 24) | ((unsigned)hdr[17] << 16) | ((unsigned)hdr[18] << 8) | hdr[19];
+    *h = ((unsigned)hdr[20] << 24) | ((unsigned)hdr[21] << 16) | ((unsigned)hdr[22] << 8) | hdr[23];
+    return *w > 0 && *h > 0;
+}
+
+static bool have_binary(const char *name) {
+    StringBuf c; sb_init(&c);
+    sb_append_str(&c, "command -v ");
+    sh_quote_into(&c, name);
+    sb_append_str(&c, " >/dev/null 2>&1");
+    char *cmd = sb_to_str(&c);
+    int rc = system(cmd);
+    free(cmd);
+    return rc == 0;
+}
+
+/* Normalize `in` to a downscaled PNG at `out`. Returns true on success. */
+static bool image_normalize(const char *in, const char *out) {
+    static const char *IM[] = { "magick", "convert", NULL };
+    for (int i = 0; IM[i]; i++) {
+        if (!have_binary(IM[i])) continue;
+        StringBuf c; sb_init(&c);
+        sb_append_str(&c, IM[i]);
+        sb_append_char(&c, ' ');
+        sh_quote_into(&c, in);
+        /* '>' inside the geometry means "only shrink" — never upscale a small
+         * plot into a blurry big one. Quoted so the shell cannot redirect on it. */
+        sb_append_str(&c, " -background black -alpha remove -alpha off -resize '1024x1024>' -strip ");
+        sh_quote_into(&c, out);
+        sb_append_str(&c, " >/dev/null 2>&1");
+        char *cmd = sb_to_str(&c);
+        int rc = system(cmd);
+        free(cmd);
+        if (rc == 0 && access(out, R_OK) == 0) return true;
+    }
+    if (have_binary("ffmpeg")) {
+        StringBuf c; sb_init(&c);
+        sb_append_str(&c, "ffmpeg -y -i ");
+        sh_quote_into(&c, in);
+        sb_append_str(&c, " -vf \"scale='min(1024,iw)':-2\" ");
+        sh_quote_into(&c, out);
+        sb_append_str(&c, " >/dev/null 2>&1");
+        char *cmd = sb_to_str(&c);
+        int rc = system(cmd);
+        free(cmd);
+        if (rc == 0 && access(out, R_OK) == 0) return true;
+    }
+    return false;
+}
+
+static bool ext_is_api_native(const char *path) {
+    const char *d = strrchr(path, '.');
+    if (!d) return false;
+    return strcasecmp(d, ".png")  == 0 || strcasecmp(d, ".jpg") == 0 ||
+           strcasecmp(d, ".jpeg") == 0 || strcasecmp(d, ".webp") == 0 ||
+           strcasecmp(d, ".gif")  == 0;
+}
+
+static char *execute_view_image(const char *path, const char *note) {
+    if (!path || !*path) return strdup("Error: view_image requires a path");
+    if (srvchat_vision_unsupported())
+        return strdup("Error: this model cannot accept images — a previous attempt was "
+                      "refused by the backend. Do NOT call view_image again this session. "
+                      "Judge from what the program PRINTS instead: measured numbers, "
+                      "pixel counts, extents, assertions.");
+
+    struct stat st;
+    if (stat(path, &st) != 0 || !S_ISREG(st.st_mode)) {
+        size_t n = strlen(path) + 160;
+        char *m = malloc(n);
+        snprintf(m, n, "Error: no image file at '%s'. Render or save it first, "
+                       "then call view_image on the path it wrote.", path);
+        return m;
+    }
+    if (st.st_size == 0) {
+        size_t n = strlen(path) + 128;
+        char *m = malloc(n);
+        snprintf(m, n, "Error: '%s' is empty (0 bytes) — the render wrote nothing.", path);
+        return m;
+    }
+
+    const char *dir = image_scratch_dir();
+    char outbuf[320];
+    const char *shown = NULL;              /* the file the API will actually read */
+    if (dir) {
+        static int seq = 0;
+        snprintf(outbuf, sizeof outbuf, "%s/%03d.png", dir, ++seq);
+        if (image_normalize(path, outbuf)) shown = outbuf;
+    }
+    if (!shown) {
+        /* No converter available. A format the API already understands can still
+         * be sent as-is; anything else genuinely cannot be shown. */
+        if (!ext_is_api_native(path)) {
+            size_t n = strlen(path) + 320;
+            char *m = malloc(n);
+            snprintf(m, n,
+                "Error: cannot convert '%s' — no ImageMagick (`magick`/`convert`) or "
+                "`ffmpeg` on PATH. Either install one, or have the program write "
+                "png/jpg directly.", path);
+            return m;
+        }
+        shown = path;
+    }
+
+    unsigned w = 0, h = 0;
+    bool have_dim = png_dimensions(shown, &w, &h);
+
+    /* Park the image for the loop to append as the next message. */
+    free(g_pending_image);
+    StringBuf env; sb_init(&env);
+    /* json_escape_into writes its OWN surrounding quotes — do not add a second
+       pair, or the envelope is malformed and the serializer silently drops the
+       image (it parses under a catch-all, so a bad envelope reads exactly like
+       a deleted file). */
+    sb_append_str(&env, "{\"path\":");
+    json_escape_into(&env, shown);
+    sb_append_str(&env, ",\"text\":");
+    {
+        StringBuf cap; sb_init(&cap);
+        sb_append_str(&cap, "Image: ");
+        sb_append_str(&cap, path);
+        if (note && *note) { sb_append_str(&cap, "\nLooking for: "); sb_append_str(&cap, note); }
+        char *capstr = sb_to_str(&cap);
+        json_escape_into(&env, capstr);
+        free(capstr);
+    }
+    sb_append_str(&env, "}");
+    g_pending_image = sb_to_str(&env);
+
+    StringBuf r; sb_init(&r);
+    sb_append_str(&r, "Image attached below — look at it and describe what you actually see.\n  source: ");
+    sb_append_str(&r, path);
+    if (have_dim) {
+        char d[96];
+        snprintf(d, sizeof d, "\n  shown at: %ux%u px", w, h);
+        sb_append_str(&r, d);
+    }
+    if (shown == outbuf) sb_append_str(&r, " (downscaled copy)");
+    return sb_to_str(&r);
+}
+
+/* An image message the backend refused cannot stay in the array: every later
+ * request would carry it and fail the same way. Rewrite it in place as ordinary
+ * text — `role` is a borrowed literal and `content` is owned, so this is a free
+ * and a strdup, no array surgery, and the tool_call/tool_result ordering the
+ * elision stubs depend on is untouched. Returns how many were rewritten. */
+static int demote_image_messages(BasiMsg *msgs, size_t n) {
+    int changed = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (!msgs[i].role || strcmp(msgs[i].role, "image") != 0) continue;
+        free((void *) msgs[i].content);
+        msgs[i].role    = "user";
+        msgs[i].content = strdup("[an image was going to be attached here, but this model "
+                                 "cannot accept images. It was removed. Judge from what the "
+                                 "program prints, not from a picture you cannot see.]");
+        changed++;
+    }
+    return changed;
+}
+
+/* Set while the native dispatcher is delegating to execute_tool, so the call is
+ * counted once by whichever dispatcher the model actually entered through. */
+static bool toolstat_nested = false;
+
 static char *execute_tool_native(const char *name, const char *args_json) {
     if (!name) return NULL;
     if (!args_json) args_json = "{}";
+
+    /* Native calls that run a tool DIRECTLY never reach execute_tool, so count
+     * here — web_search is one of them, which is exactly how the first version
+     * of this report managed to say "1 of 0 calls failed". */
+    basi_toolstat_call(name);
+
+    /* MCP tools first: they carry arbitrary server-defined schemas, so they must
+     * never reach basi_build_command's flattening into a command string. The
+     * phase gate still applies — a plan's drafting phase is read-only, and a tool
+     * from a third-party server is exactly the kind of side effect it blocks. */
+    if (mcp_is_tool(name)) {
+        if (!plan_tool_allowed(plan_phase, "bash"))
+            return plan_block_msg(plan_phase, name);
+        if (plan_phase == PHASE_SPIKE) spike_calls++;
+        return execute_mcp_tool(name, args_json);
+    }
 
     /* Tools dispatched directly here (parsed args → handler / escaped shell
      * command). Every other tool falls through to basi_build_command +
@@ -1275,12 +1739,14 @@ static char *execute_tool_native(const char *name, const char *args_json) {
                   strcmp(name, "tail") == 0  || strcmp(name, "grep") == 0 ||
                   strcmp(name, "wc")   == 0  || strcmp(name, "web_search") == 0 ||
                   strcmp(name, "web_fetch") == 0 || strcmp(name, "readfile") == 0 ||
-                  strcmp(name, "symbols") == 0;
+                  strcmp(name, "symbols") == 0 || strcmp(name, "view_image") == 0;
 
     if (!direct) {
         char *cmd = basi_build_command(name, args_json);
         if (!cmd) return NULL;                 /* unknown tool */
+        toolstat_nested = true;                 /* already counted just above */
         char *r = execute_tool(cmd);            /* gate + accounting happen here */
+        toolstat_nested = false;
         free(cmd);
         return r;
     }
@@ -1305,6 +1771,13 @@ static char *execute_tool_native(const char *name, const char *args_json) {
         long count = jx_get_int(args_json, "count");   /* 0 if absent */
         char *r = read_file_window(file, start, count);
         free(file);
+        return r;
+    }
+    if (strcmp(name, "view_image") == 0) {
+        char *ipath = jx_get_string(args_json, "path");
+        char *inote = jx_get_string(args_json, "note");     /* may be NULL */
+        char *r = execute_view_image(ipath, inote);
+        free(ipath); free(inote);
         return r;
     }
     if (strcmp(name, "symbols") == 0) {
@@ -1352,7 +1825,16 @@ static char *execute_tool_native(const char *name, const char *args_json) {
     StringBuf sh;
     sb_init(&sh);
     if (strcmp(name, "grep") == 0) {
-        sb_append_str(&sh, "grep -n");
+        /* -E, not plain grep. A model writes alternation as `a|b` without a
+           second thought, and in BASIC regex `|` is a literal — so
+           `grep shellVolume|innerRadius` searched for that exact 25-character
+           string and returned NOTHING on a file containing four matches. Silent,
+           and worse than silent: an empty result reads as "this symbol does not
+           exist here", which is a wrong answer rather than a missing one. Caught
+           twice in two runs of the same investigation, each time costing a round
+           to notice and re-issue through bash. Extended regex is what the model
+           already believes it is writing. */
+        sb_append_str(&sh, "grep -nE");
         long ctx = jx_get_int(args_json, "context");
         if (ctx > 0) { char b[32]; snprintf(b, sizeof(b), " -C %ld", ctx); sb_append_str(&sh, b); }
         char *pattern = jx_get_string(args_json, "pattern");
@@ -1408,12 +1890,24 @@ static void save_default_model(const char *path, int ngl, int ctx) {
     fprintf(f, "%s\n", path);
     if (ngl >= 0) fprintf(f, "ngl=%d\n", ngl);
     if (ctx >  0) fprintf(f, "ctx=%d\n", ctx);
+    /* The selected llama-server binary. This line is the whole reason backend
+       selection is a feature rather than a script edit: a hand-edited launch script
+       is honored, but /model regenerates it and the edit is lost. Only an EXPLICIT
+       choice is written, so an implicit default or a one-off $BASI_SERVER_BIN never
+       becomes sticky. */
+    const char *bsel = backend_selected_name();
+    if (bsel && *bsel) fprintf(f, "backend=%s\n", bsel);
     fclose(f);
 }
 
 /* Load the saved default into path_out (+ optional ngl/ctx). Returns true only
  * if a model was recorded AND still exists on disk (a deleted model falls
- * through to the next resolution step rather than failing the launch). */
+ * through to the next resolution step rather than failing the launch).
+ * Side effect: applies a saved `backend=` via backend_select() regardless of the
+ * return value — the backend choice is independent of whether that particular
+ * model still exists, so a deleted model must not silently reset it to Vulkan.
+ * An unknown name is ignored by backend_select, so a stale line can't break a
+ * launch. */
 static bool load_default_model(char *path_out, size_t n, int *ngl, int *ctx) {
     char dir[512]; default_model_dir(dir, sizeof dir);
     char file[600]; snprintf(file, sizeof file, "%s/default-model", dir);
@@ -1427,6 +1921,7 @@ static bool load_default_model(char *path_out, size_t n, int *ngl, int *ctx) {
         if (!line[0]) continue;
         if (strncmp(line, "ngl=", 4) == 0)      { if (ngl) *ngl = atoi(line + 4); }
         else if (strncmp(line, "ctx=", 4) == 0) { if (ctx) *ctx = atoi(line + 4); }
+        else if (strncmp(line, "backend=", 8) == 0) backend_select(line + 8);
         else if (!path_out[0])                   snprintf(path_out, n, "%s", line);
     }
     fclose(f);
@@ -1441,6 +1936,212 @@ static bool default_model_file_exists(void) {
     char dir[512]; default_model_dir(dir, sizeof dir);
     char file[600]; snprintf(file, sizeof file, "%s/default-model", dir);
     return access(file, F_OK) == 0;
+}
+
+/* ── Persisted default BACKEND ──────────────────────────────────────────
+ * The saved default-model file answers "which GGUF", which silently assumes the
+ * answer to a prior question: local at all? Once --api exists, a bare `basi` that
+ * always lands on the last local GGUF is wrong for anyone whose everyday model is
+ * hosted — you either retype --api/--api-model on every launch or get dropped into
+ * whatever small model happened to be picked once. So the backend choice persists
+ * the same way the model does, and takes precedence: a saved API default means no
+ * GGUF is resolved, no VRAM is fitted and no llama-server is spawned.
+ * `--local` ignores it for one run; `basi-cli api clear` forgets it. */
+static bool api_ignore_saved = false;                  /* --local */
+
+static void save_default_api(const char *provider, const char *model) {
+    if (!provider || !*provider || !model || !*model) return;
+    char dir[512]; default_model_dir(dir, sizeof dir);
+    if (mkdir(dir, 0755) != 0 && errno == ENOENT) {
+        char *slash = strrchr(dir, '/');
+        if (slash) { *slash = '\0'; mkdir(dir, 0755); *slash = '/'; mkdir(dir, 0755); }
+    }
+    char file[600]; snprintf(file, sizeof file, "%s/default-api", dir);
+    FILE *f = fopen(file, "w");
+    if (!f) return;
+    /* The KEY is never written here — it stays in the environment, where a config
+       file that gets copied, backed up or committed cannot leak it. */
+    fprintf(f, "provider=%s\nmodel=%s\n", provider, model);
+    fclose(f);
+}
+
+/* Bounded copy, not snprintf("%s"): the source is a whole config line and the
+ * destinations are small fixed fields, which -Wformat-truncation rightly flags. */
+static void copy_bounded(char *dst, size_t n, const char *src) {
+    if (!n) return;
+    size_t l = strlen(src);
+    if (l >= n) l = n - 1;
+    memcpy(dst, src, l);
+    dst[l] = '\0';
+}
+
+static bool load_default_api(char *prov, size_t np, char *model, size_t nm) {
+    char dir[512]; default_model_dir(dir, sizeof dir);
+    char file[600]; snprintf(file, sizeof file, "%s/default-api", dir);
+    FILE *f = fopen(file, "r");
+    if (!f) return false;
+    prov[0] = '\0'; model[0] = '\0';
+    char line[1100];
+    while (fgets(line, sizeof line, f)) {
+        size_t l = strlen(line);
+        while (l && (line[l-1] == '\n' || line[l-1] == '\r')) line[--l] = '\0';
+        if (strncmp(line, "provider=", 9) == 0)   copy_bounded(prov,  np, line + 9);
+        else if (strncmp(line, "model=", 6) == 0) copy_bounded(model, nm, line + 6);
+    }
+    fclose(f);
+    return prov[0] && model[0];
+}
+
+static bool clear_default_api(void) {
+    char dir[512]; default_model_dir(dir, sizeof dir);
+    char file[600]; snprintf(file, sizeof file, "%s/default-api", dir);
+    return unlink(file) == 0;
+}
+
+/* ── Hosted (remote) OpenAI-compatible endpoints ─────────────────────────────
+ * BASI already talks to llama-server over /v1/chat/completions, so pointing it at
+ * a hosted provider is a URL + a bearer token + an explicit model id. This table
+ * is a convenience only: `--api https://host/v1` works for anything not listed.
+ * No model defaults — a wrong model id fails as an opaque provider 404, so the id
+ * is always the caller's to state. */
+typedef struct {
+    const char *name;
+    const char *base_url;
+    const char *key_env;      /* provider's conventional key variable */
+    const char *model_hint;   /* shown when no model id was given */
+} ApiProvider;
+
+static const ApiProvider API_PROVIDERS[] = {
+    { "fireworks",  "https://api.fireworks.ai/inference/v1", "FIREWORKS_API_KEY",
+      "accounts/fireworks/models/kimi-k3" },
+    { "openai",     "https://api.openai.com/v1",             "OPENAI_API_KEY",     "gpt-4.1" },
+    { "openrouter", "https://openrouter.ai/api/v1",          "OPENROUTER_API_KEY", "openai/gpt-4.1" },
+    { "together",   "https://api.together.xyz/v1",           "TOGETHER_API_KEY",
+      "moonshotai/Kimi-K2-Instruct" },
+    { "groq",       "https://api.groq.com/openai/v1",        "GROQ_API_KEY",       "llama-3.3-70b-versatile" },
+    { "deepseek",   "https://api.deepseek.com/v1",           "DEEPSEEK_API_KEY",   "deepseek-chat" },
+    { "mistral",    "https://api.mistral.ai/v1",             "MISTRAL_API_KEY",    "mistral-large-latest" },
+    { "cerebras",   "https://api.cerebras.ai/v1",            "CEREBRAS_API_KEY",   "llama-3.3-70b" },
+};
+static const int N_API_PROVIDERS = (int) (sizeof API_PROVIDERS / sizeof API_PROVIDERS[0]);
+
+static const ApiProvider *api_provider_by_name(const char *n) {
+    if (!n) return NULL;
+    for (int i = 0; i < N_API_PROVIDERS; i++)
+        if (strcasecmp(n, API_PROVIDERS[i].name) == 0) return &API_PROVIDERS[i];
+    return NULL;
+}
+
+/* BASI_API_KEY is the generic override; otherwise the provider's own conventional
+ * variable, which is what its docs tell you to export. NULL when neither is set. */
+static const char *api_key_for(const ApiProvider *pv) {
+    const char *key = getenv("BASI_API_KEY");
+    if ((!key || !*key) && pv) key = getenv(pv->key_env);
+    return (key && *key) ? key : NULL;
+}
+
+static void api_list_providers(FILE *f) {
+    fprintf(f, "  known providers:");
+    for (int i = 0; i < N_API_PROVIDERS; i++) fprintf(f, " %s", API_PROVIDERS[i].name);
+    fprintf(f, "\n  (or pass a full base URL, e.g. --api https://my-host/v1)\n");
+}
+
+/* Configure srvchat's remote endpoint from --api/--api-model plus the environment.
+ * Precedence, highest first: CLI flag, BASI_API_* , the provider's own key var.
+ *
+ * Returns 1 when a remote is now active, 0 when none was requested, -1 on a
+ * request that could not be satisfied (already reported to stderr). */
+/* Nonzero once the active remote came from the saved default rather than this
+ * command line — so the banner can say so instead of looking like magic. */
+static bool api_from_saved_default = false;
+
+static int api_setup_remote(const char *cli_api, const char *cli_api_model) {
+    static char saved_prov[128], saved_model[512];
+    bool have_saved = !api_ignore_saved &&
+                      load_default_api(saved_prov, sizeof saved_prov,
+                                       saved_model, sizeof saved_model);
+
+    const char *sel = cli_api;
+    if (!sel || !*sel) sel = getenv("BASI_API");
+    const char *base_env = getenv("BASI_API_BASE");
+    if ((!sel || !*sel) && base_env && *base_env) sel = base_env;
+    if ((!sel || !*sel) && have_saved) {                /* the persisted choice */
+        sel = saved_prov;
+        api_from_saved_default = true;
+    }
+    if (!sel || !*sel) return 0;                       /* no remote requested */
+
+    const ApiProvider *pv = api_provider_by_name(sel);
+    const char *base = NULL;
+    if (pv)                                       base = pv->base_url;
+    else if (strncmp(sel, "http://", 7) == 0 ||
+             strncmp(sel, "https://", 8) == 0)    base = sel;
+    else {
+        fprintf(stderr, "\033[1;31mError: unknown API provider '%s'.\033[0m\n", sel);
+        api_list_providers(stderr);
+        return -1;
+    }
+    if (base_env && *base_env) base = base_env;        /* explicit base always wins */
+
+    const char *model = cli_api_model;
+    if (!model || !*model) model = getenv("BASI_API_MODEL");
+    /* A saved model only applies to the provider it was saved for — reusing one
+       provider's model id against another endpoint would 404 at the first turn. */
+    if ((!model || !*model) && have_saved && strcmp(sel, saved_prov) == 0)
+        model = saved_model;
+    if (!model || !*model) {
+        fprintf(stderr, "\033[1;31mError: --api %s needs a model id.\033[0m\n", sel);
+        fprintf(stderr, "  Pass --api-model <id> or set BASI_API_MODEL.\n");
+        if (pv && pv->model_hint)
+            fprintf(stderr, "  For %s that looks like: --api-model %s\n", pv->name, pv->model_hint);
+        return -1;
+    }
+
+    const char *key = api_key_for(pv);
+    if (!key) {
+        fprintf(stderr, "\033[1;31mError: no API key in the environment.\033[0m\n");
+        if (pv) fprintf(stderr, "  export %s=...   (or BASI_API_KEY=...)\n", pv->key_env);
+        else    fprintf(stderr, "  export BASI_API_KEY=...\n");
+        return -1;
+    }
+
+    if (srvchat_set_remote(base, key, model) != 0) {
+        fprintf(stderr, "\033[1;31mError: could not configure the API endpoint (base='%s').\033[0m\n", base);
+        return -1;
+    }
+    /* An explicit --api on the command line is a deliberate choice, so remember
+       it — the same rule the model picker follows. Env vars and the saved default
+       itself are NOT persisted: BASI_API is for scoping one shell, and rewriting
+       the file from itself would just churn it. */
+    if (cli_api && *cli_api) save_default_api(sel, model);
+    return 1;
+}
+
+/* The /model picker's hosted tab. Fireworks only: it is the provider this box
+ * runs, and its GET /models reports context length and tool/vision support per
+ * model. Base URL and key resolve exactly as `--api fireworks` would, so the tab
+ * lists what a pick will actually call. The in-use model — env first, then the
+ * saved default, the order api_setup_remote reads them — opens the tab on it. */
+static const PickerRemote *picker_remote_tab(void) {
+    static PickerRemote tab;
+    static char cur[512];
+    const ApiProvider *pv = api_provider_by_name("fireworks");
+    const char *base = getenv("BASI_API_BASE");
+    const char *env_api = getenv("BASI_API"), *env_model = getenv("BASI_API_MODEL");
+    char prov[128];
+
+    cur[0] = '\0';
+    if (env_api && *env_api) {
+        if (strcasecmp(env_api, pv->name) == 0 && env_model && *env_model)
+            copy_bounded(cur, sizeof cur, env_model);
+    } else if (!api_ignore_saved && load_default_api(prov, sizeof prov, cur, sizeof cur)) {
+        if (strcasecmp(prov, pv->name) != 0) cur[0] = '\0';
+    } else {
+        cur[0] = '\0';
+    }
+    tab = (PickerRemote){ "FIREWORKS AI", pv->name, (base && *base) ? base : pv->base_url,
+                          api_key_for(pv), pv->key_env, cur[0] ? cur : NULL };
+    return &tab;
 }
 
 /* ── CLI argument parsing ──────────────────────────────────────────── */
@@ -1462,6 +2163,10 @@ typedef struct {
     const char *resume_path;        /* --resume: reload this session file, skip picker */
     const char *tool_subset;        /* --tools a,b,c: hard-scope the active tool set (factory phase) */
     bool        pick;               /* --pick: force the model picker (used by /model) */
+    const char *api;                /* --api <provider|base-url>: hosted endpoint, no local server */
+    const char *api_model;          /* --api-model <id>: the model id to send to that endpoint */
+    const char *mcp_config;         /* --mcp-config <file>: extra MCP server config, applied last */
+    bool        no_mcp;             /* --no-mcp: skip MCP entirely for this run */
     bool        want_exit;          /* -h/--help: caller should return exit_code */
     int         exit_code;
 } Cli;
@@ -1473,7 +2178,9 @@ static Cli parse_args(int argc, char **argv) {
         .system_override = NULL, .cli_ctx = 0, .cli_temp = -1.0f,
         .cli_top_k = 0, .cli_top_p = 1.0f,
         .cli_seed = BASI_DEFAULT_SEED, .bypass = false, .resume_path = NULL,
-        .pick = false, .want_exit = false, .exit_code = 0,
+        .pick = false, .api = NULL, .api_model = NULL,
+        .mcp_config = NULL, .no_mcp = false,
+        .want_exit = false, .exit_code = 0,
     };
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-m") == 0 && i + 1 < argc) {
@@ -1509,10 +2216,34 @@ static Cli parse_args(int argc, char **argv) {
             c.bypass = true;
         } else if (strcmp(argv[i], "--resume") == 0 && i + 1 < argc) {
             c.resume_path = argv[++i];
-        } else if (strcmp(argv[i], "--tools") == 0 && i + 1 < argc) {
+        } else if (strcmp(argv[i], "--tools") == 0) {
+            /* --tools TAKES A LIST, and used to consume the next argv whatever it
+               was. `basi --tools --yolo -p '...'` therefore scoped the session to a
+               tool named "--yolo" — which matches nothing — and swallowed --yolo on
+               the way: a fully autonomous agent with zero tools, announced in the
+               same colour as every other startup line. It cost a whole run before
+               anyone noticed. A flag is never a tool name. */
+            if (i + 1 >= argc || argv[i + 1][0] == '-') {
+                fprintf(stderr, "basi: --tools takes a comma-separated tool list "
+                                "(e.g. --tools read,edit,bash)");
+                if (i + 1 < argc) fprintf(stderr, ", not the flag %s", argv[i + 1]);
+                fprintf(stderr, "\n");
+                c.want_exit = true; c.exit_code = 2;
+                return c;
+            }
             c.tool_subset = argv[++i];   /* factory: hard-scope this phase's tools */
         } else if (strcmp(argv[i], "--pick") == 0) {
             c.pick = true;
+        } else if (strcmp(argv[i], "--api") == 0 && i + 1 < argc) {
+            c.api = argv[++i];         /* provider name, or a full base URL */
+        } else if (strcmp(argv[i], "--api-model") == 0 && i + 1 < argc) {
+            c.api_model = argv[++i];
+        } else if (strcmp(argv[i], "--mcp-config") == 0 && i + 1 < argc) {
+            c.mcp_config = argv[++i];
+        } else if (strcmp(argv[i], "--no-mcp") == 0) {
+            c.no_mcp = true;
+        } else if (strcmp(argv[i], "--local") == 0) {
+            api_ignore_saved = true;    /* ignore a saved API default this run */
         } else if ((strcmp(argv[i], "-s") == 0 || strcmp(argv[i], "--system") == 0)
                    && i + 1 < argc) {
             c.system_override = argv[++i];
@@ -1530,6 +2261,10 @@ static Cli parse_args(int argc, char **argv) {
                    "  -t, --temp      Sampling temperature (default: 0.4; 0 = greedy)\n"
                    "  -k, --top-k     Top-k sampling (default: 0 = disabled). Also BASI_TOP_K.\n"
                    "  --top-p         Top-p / nucleus sampling (default: 1.0 = disabled). Also BASI_TOP_P.\n"
+                   "                  BASI_MIN_P sets min-p (default 0.05); BASI_REPEAT_PENALTY the\n"
+                   "                  repetition penalty (1.0 = off). Check your model card: Qwen3.8\n"
+                   "                  thinking mode asks for temp 1.0, top_p 0.95, top_k 20, min_p 0,\n"
+                   "                  repetition_penalty 1.0 — BASI's defaults match none of those.\n"
                    "  --seed          RNG seed for sampling (default: random). Fix it for\n"
                    "                  reproducible output.\n"
                    "  -p, --prompt    Run a single prompt non-interactively (with tools), then exit\n"
@@ -1543,14 +2278,67 @@ static Cli parse_args(int argc, char **argv) {
                    "                  code/dirs you trust.\n"
                    "  --deepsearch    Run multi-round deep research (web + KB) non-interactively, then exit\n"
                    "  --resume <file> Reload a session file and skip the picker (used by /model)\n"
+                   "  --api <who>     Use a hosted OpenAI-compatible API instead of a local\n"
+                   "                  llama-server. <who> is a provider name or a full base URL.\n"
+                   "                  Needs --api-model; reads the key from the environment.\n"
+                   "  --api-model <id>  Model id to send to that endpoint.\n"
+                   "                  An explicit --api is REMEMBERED: later launches use it with\n"
+                   "                  no flags. `--local` ignores it for one run; `basi-cli api clear`\n"
+                   "                  forgets it; `basi-cli api` shows it.\n"
+                   "  --local         Ignore the saved API default and use a local GGUF this run\n"
+                   "  --mcp-config <f>  Extra MCP server config file, applied after the standard\n"
+                   "                  ones (~/.config/basi-cli/mcp.json, ./.basi/mcp.json, ./.mcp.json)\n"
+                   "  --no-mcp        Do not connect to any MCP server this run\n"
                    "  -d              Debug mode (verbose tool output)\n"
                    "  -h              Show this help\n\n"
                    "Model selection:\n"
                    "  With no -m, BASI uses the saved default (set by the first-run picker or\n"
                    "  the in-chat /model command), then $BASI_MODEL, then the picker. So after\n"
-                   "  you pick once, later launches go straight to chat; /model switches later.\n\n"
+                   "  you pick once, later launches go straight to chat; /model switches later.\n"
+                   "  In the picker, Tab switches between local GGUFs and Fireworks' hosted\n"
+                   "  models (listed live; needs FIREWORKS_API_KEY). Either choice is remembered.\n\n"
+                   "Hosted APIs (--api):\n"
+                   "  No GGUF, no VRAM fit, no spawned server — BASI is a plain HTTP client.\n"
+                   "  Providers: fireworks openai openrouter together groq deepseek mistral cerebras\n"
+                   "  Example:\n"
+                   "    export FIREWORKS_API_KEY=...\n"
+                   "    basi --api fireworks --api-model accounts/fireworks/models/kimi-k3\n"
+                   "  Only the CHAT model moves; embeddings (RAG/compaction) stay local.\n\n"
+                   "MCP (Model Context Protocol):\n"
+                   "  Servers declared in mcp.json are connected at startup and their tools are\n"
+                   "  advertised to the model as mcp__<server>__<tool>, gated by the same y/n/a\n"
+                   "  approval prompt as bash. `/mcp` shows status; `/mcp tools` lists them.\n"
+                   "  Both transports are supported: stdio (\"command\"/\"args\") and Streamable\n"
+                   "  HTTP (\"url\"/\"headers\"). ${VAR} in any value expands from the environment.\n\n"
                    "Environment:\n"
                    "  BASI_MODEL             Fallback model path if -m and no saved default\n"
+                   "  BASI_API               Same as --api (provider name or base URL)\n"
+                   "  BASI_API_MODEL         Same as --api-model\n"
+                   "  BASI_API_BASE          Override the base URL for the selected provider\n"
+                   "  BASI_API_KEY           Bearer token; else the provider's own var\n"
+                   "                         (FIREWORKS_API_KEY, OPENAI_API_KEY, …)\n"
+                   "  BASI_API_CTX           Context budget for --api (default 131072).\n"
+                   "                         Set it to the model's real window, e.g. 1000000.\n"
+                   "  BASI_API_EXTRA_JSON    JSON object merged into every request body, for\n"
+                   "                         provider-specific knobs, e.g. '{\"top_k\":40}'\n"
+                   "  BASI_API_PRICE_IN      USD per 1M prompt tokens   \\  from your provider's\n"
+                   "  BASI_API_PRICE_OUT     USD per 1M output tokens    | pricing page; enables\n"
+                   "  BASI_API_PRICE_CACHED  USD per 1M cached prompt    /  cost in /cost and\n"
+                   "                         tokens (default: same as _IN)  the per-turn line\n"
+                   "  SEARXNG_INSTANCE       SearXNG base URL web_search queries\n"
+                   "                         (default http://localhost:8888)\n"
+                   "  SEARXNG_HOME           Local SearXNG checkout to auto-start; otherwise\n"
+                   "                         ~/searxng, ~/Documentos/searxng, ~/Documents/searxng\n"
+                   "  BASI_NO_SEARXNG=1      Never auto-start SearXNG (probing still happens, so\n"
+                   "                         a dead backend is still reported rather than silent)\n"
+                   "  BRAVE_API_KEY          Hosted search fallback when no SearXNG answers.\n"
+                   "                         With neither, web_search is withdrawn from the tool\n"
+                   "                         set for the run and the model is told it has none.\n"
+                   "  BASI_MCP=0             Disable MCP (same as --no-mcp)\n"
+                   "  BASI_MCP_CONFIG        Extra MCP config file (same as --mcp-config)\n"
+                   "  BASI_MCP_PROBE_MS      Era-probe/handshake timeout per server (default 5000)\n"
+                   "  BASI_MCP_TIMEOUT_MS    Per-request timeout for MCP calls (default 60000)\n"
+                   "  BASI_MCP_DEBUG=1       Keep each stdio server's stderr in /tmp/basi-mcp-<name>.log\n"
                    "  BASI_DEEPSEARCH_ROUNDS Max deep-research rounds (default 5)\n"
                    "  BASI_DEEPSEARCH_CTX    Deep-research context size (default 32768; lower for\n"
                    "                         interactive /deepsearch on a single GPU)\n\n");
@@ -1677,6 +2465,94 @@ static int basi_srv_ctx_total = 0;
 
 static int context_used_tokens(void) {
     return basi_srv_ctx_used;
+}
+
+/* ── Spend accounting (hosted APIs) ──────────────────────────────────────────
+ * Cost = token counts × a price the USER declares. There is deliberately NO
+ * built-in price table: provider prices change, vary per model, and differ by
+ * region and tier — a stale hardcoded number would report a confident WRONG
+ * figure, which is worse than reporting none. With no prices set, /cost shows
+ * tokens and says how to turn them into money.
+ *
+ * Prices are USD per 1M tokens:
+ *   BASI_API_PRICE_IN      prompt tokens that missed the provider's cache
+ *   BASI_API_PRICE_OUT     completion tokens (reasoning tokens are inside these)
+ *   BASI_API_PRICE_CACHED  prompt tokens served from that cache; defaults to
+ *                          PRICE_IN, so an undeclared discount never UNDERSTATES
+ *
+ * Summing every turn's prompt_tokens is not double counting: a hosted API is
+ * stateless, so each turn really does resend — and pay for — the whole
+ * conversation. That is why cost grows quadratically over a long session, and
+ * why the per-turn figure is worth seeing. */
+static double price_in = 0, price_out = 0, price_cached = 0;
+static bool   pricing_known = false;
+
+static size_t session_cached_tokens = 0, session_reasoning_tokens = 0;
+static double session_cost_usd = 0.0, last_turn_cost_usd = 0.0;
+
+static void pricing_init(void) {
+    const char *i = getenv("BASI_API_PRICE_IN");
+    const char *o = getenv("BASI_API_PRICE_OUT");
+    const char *c = getenv("BASI_API_PRICE_CACHED");
+    bool have_in = (i && *i), have_out = (o && *o);
+    if (have_in)  price_in  = atof(i);
+    if (have_out) price_out = atof(o);
+    price_cached = (c && *c) ? atof(c) : price_in;   /* no declared discount → full price */
+    pricing_known = (have_in || have_out);
+}
+
+/* Enter hosted mode — from --api, the saved default, or the picker's hosted tab.
+ * The rest of main treats model_path as "which model is this session running"
+ * (display, session tag, system prompt), so it gets the remote id: /cost, the
+ * banner and session files then name the model actually answering rather than a
+ * stale local default. Returns that label; the caller assigns it to model_path. */
+static const char *enter_hosted_mode(void) {
+    static char api_label[256];
+    snprintf(api_label, sizeof api_label, "%s", srvchat_remote_model());
+    pricing_init();                         /* tokens → money, if prices declared */
+    return api_label;
+}
+
+/* Bill one turn. prompt_tokens INCLUDES cached, so the two are priced apart
+ * rather than summed. Returns this turn's cost (0 when no prices are declared). */
+static double cost_add_turn(size_t prompt_tokens, size_t cached, size_t gen) {
+    session_cached_tokens += cached;
+    if (!pricing_known) return 0.0;
+    if (cached > prompt_tokens) cached = prompt_tokens;   /* defensive: never negative fresh */
+    size_t fresh = prompt_tokens - cached;
+    double c = (fresh  / 1e6) * price_in
+             + (cached / 1e6) * price_cached
+             + (gen    / 1e6) * price_out;
+    session_cost_usd  += c;
+    last_turn_cost_usd = c;
+    return c;
+}
+
+/* Money, at a readable precision for figures that are often sub-cent. */
+static void fmt_usd(char *buf, size_t n, double usd) {
+    if (usd >= 1.0)        snprintf(buf, n, "$%.2f", usd);
+    else if (usd >= 0.01)  snprintf(buf, n, "$%.3f", usd);
+    else                   snprintf(buf, n, "$%.5f", usd);
+}
+
+/* End-of-run accounting. Goes to stderr so --no-tools keeps stdout to the
+ * completion alone (its contract for scripting), and is skipped entirely on a
+ * local server, where none of this costs anything. */
+static void print_session_spend(size_t prompt_tokens, size_t gen_tokens) {
+    if (!srvchat_remote_active() || (!prompt_tokens && !gen_tokens)) return;
+    fprintf(stderr, "\033[90m[usage] %zu in", prompt_tokens);
+    if (session_cached_tokens)    fprintf(stderr, " (%zu cached)", session_cached_tokens);
+    fprintf(stderr, " + %zu out", gen_tokens);
+    if (session_reasoning_tokens) fprintf(stderr, " (%zu reasoning)", session_reasoning_tokens);
+    fprintf(stderr, " = %zu tokens", prompt_tokens + gen_tokens);
+    if (pricing_known) {
+        char s[24]; fmt_usd(s, sizeof s, session_cost_usd);
+        fprintf(stderr, "  \033[0m\033[1m%s\033[0m", s);
+    } else {
+        fprintf(stderr, "  \033[0m\033[90m(set BASI_API_PRICE_IN / BASI_API_PRICE_OUT "
+                        "for cost)");
+    }
+    fprintf(stderr, "\033[0m\n");
 }
 
 /* Compact human token count: "830", "12.3k", "131k". */
@@ -2309,7 +3185,20 @@ static void try_model_switch(const char *arg, char **argv, int argc,
             free(new_path); fflush(stdout);
             return;
         }
+        /* From a hosted session nothing local was ever resolved: the ngl it
+           carries is 0 (nothing is offloaded to a remote), and the saved
+           `backend=` line was never read, so the rewrite below would drop it.
+           Measured: the switch requested -ngl 0 and saved ngl=0 — a CPU-only
+           default. Use the -m default (every layer) and re-read the backend. */
+        if (srvchat_remote_active()) {
+            char prev[1024];
+            new_ngl = 99;
+            load_default_model(prev, sizeof prev, NULL, NULL);   /* applies backend= */
+        }
         save_default_model(new_path, new_ngl, 0);    /* persist as new default */
+        /* A named switch is always to a local GGUF, and a saved hosted default
+           outranks default-model — left in place, the next launch goes hosted. */
+        clear_default_api();
     }
 
     /* Hand off via re-exec. Replacing this process image releases the current
@@ -2320,18 +3209,26 @@ static void try_model_switch(const char *arg, char **argv, int argc,
     disable_raw_mode();
     printf("\033[?25h");                /* show cursor for the clean re-launch */
 
-    char **nv = calloc((size_t)argc + 8, sizeof(char *));
+    char **nv = calloc((size_t)argc + 10, sizeof(char *));
     int k = 0;
     nv[k++] = argv[0];
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
-        if (!strcmp(a, "--pick")) continue;                 /* valueless; may re-add */
+        if (!strcmp(a, "--pick") || !strcmp(a, "--local")) continue;   /* valueless; may re-add */
         if (!strcmp(a,"-m") || !strcmp(a,"-ngl") || !strcmp(a,"--ngl") ||
             !strcmp(a,"-c") || !strcmp(a,"--ctx") || !strcmp(a,"--resume") ||
             !strcmp(a,"-p") || !strcmp(a,"--prompt") || !strcmp(a,"--print") ||
-            !strcmp(a,"--deepsearch") || !strcmp(a,"-ds")) { i++; continue; }  /* + value */
+            !strcmp(a,"--deepsearch") || !strcmp(a,"-ds") ||
+            !strcmp(a,"--api") || !strcmp(a,"--api-model")) { i++; continue; }  /* + value */
         nv[k++] = (char *)a;
     }
+    /* Local vs hosted is re-stated, never carried: a launch-time --api would
+       override whatever the picker chooses, and a launch-time --local would hide
+       a hosted model chosen since. Going local (a named GGUF, or the picker opened
+       from a local session) passes --local, so a saved hosted default cannot take
+       over — nor claim a cancelled picker. A hosted session passes nothing: the
+       saved default, which the --api or pick that started it wrote, brings it back. */
+    if (!use_picker || !srvchat_remote_active()) nv[k++] = "--local";
     char nglbuf[16];
     if (use_picker) {
         nv[k++] = "--pick";
@@ -2637,8 +3534,10 @@ static void handle_slash_command(char *user_input,
                     "                        them, reports verdicts computed from the numbers (not argued).\n"
                     "                        Explores N DIFFERENT theories (default 3), each told what the\n"
                     "                        others covered; findings ranked by measured effect\n"
-                    "  /model [name]         switch model (no arg: picker; name: match; keeps your chat)\n"
+                    "  /model [name]         switch model (no arg: picker, Tab for Fireworks; name: local match; keeps your chat)\n"
                     "  /cookbook [sub]       download & manage models (list | search | get <repo> | rm)\n"
+                    "  /mcp [tools|reconnect [server]]\n"
+                    "                        MCP servers: status, the tools they expose, or restart one\n"
                     "\n"
                     "Subcommands (run before model load):\n"
                     "  basi-cli docs add <file.md> [--shelf=notes|pinned|docs]\n"
@@ -2649,7 +3548,8 @@ static void handle_slash_command(char *user_input,
                     "  docs_toc, docs_get, docs_search, docs_recent_notes,\n"
                     "  docs_vector_search,\n"
                     "  plan_write (drafting/premortem), assumptions (drafting),\n"
-                    "  spike_write (spike), plan_verify (active).\n\n");
+                    "  spike_write (spike), plan_verify (active),\n"
+                    "  plus every tool your MCP servers expose (see /mcp).\n\n");
                 fflush(stdout);
                 free(user_input);
                 return;
@@ -2668,12 +3568,65 @@ static void handle_slash_command(char *user_input,
                 printf("\033[90m[Session: %zu prompt tokens, %zu generated tokens, %zu total]\033[0m\n",
                        session_prompt_tokens, session_gen_tokens,
                        session_prompt_tokens + session_gen_tokens);
+                if (session_cached_tokens || session_reasoning_tokens)
+                    printf("\033[90m[         of which %zu prompt tokens cached, "
+                           "%zu generated tokens were reasoning]\033[0m\n",
+                           session_cached_tokens, session_reasoning_tokens);
                 int used  = context_used_tokens();
                 int total = basi_srv_ctx_total;
                 int pct   = total > 0 ? (int)((100.0 * used) / total) : 0;
                 printf("\033[90m[Context: %d/%d tokens in window (%d%%), %d free]\033[0m\n",
                        used, total, pct, total - used);
+                /* Spend. Only meaningful against a paid endpoint, so the hint that
+                   explains how to get it is only shown there. */
+                if (pricing_known) {
+                    char s[24]; fmt_usd(s, sizeof s, session_cost_usd);
+                    printf("\033[90m[Spend:   %s  (in $%.2f", s, price_in);
+                    if (price_cached != price_in) printf(", cached $%.2f", price_cached);
+                    printf(", out $%.2f per 1M tokens)]\033[0m\n", price_out);
+                } else if (srvchat_remote_active()) {
+                    printf("\033[90m[Spend:   no prices set — export BASI_API_PRICE_IN "
+                           "and BASI_API_PRICE_OUT\n"
+                           "          (USD per 1M tokens, from your provider's pricing "
+                           "page) to see cost here]\033[0m\n");
+                }
                 fflush(stdout);
+                free(user_input);
+                return;
+            }
+            if (strncmp(user_input, "/mcp", 4) == 0 &&
+                (user_input[4] == '\0' || user_input[4] == ' ')) {
+                const char *arg = user_input + 4;
+                while (*arg == ' ') arg++;
+                char *out = NULL;
+                if (mcp_skipped_this_run) {
+                    printf("\n\033[90m[MCP was not started this run "
+                           "(--no-mcp, or a --tools scope naming no MCP tool)]\033[0m\n\n");
+                    fflush(stdout);
+                    free(user_input);
+                    return;
+                }
+                if (strncmp(arg, "reconnect", 9) == 0) {
+                    const char *who = arg + 9;
+                    while (*who == ' ') who++;
+                    out = mcp_reconnect(*who ? who : NULL);
+                } else if (strncmp(arg, "tools", 5) == 0) {
+                    const char *who = arg + 5;
+                    while (*who == ' ') who++;
+                    out = mcp_status_report(1, *who ? who : NULL);
+                } else {
+                    out = mcp_status_report(0, *arg ? arg : NULL);
+                }
+                /* A reconnect can add or drop tools; what the model is shown next
+                   turn has to match, still inside this session's --tools scope. */
+                reregister_tools();
+                printf("\n%s", out ? out : "");
+                if (mcp_configured())
+                    printf("\033[90m/mcp tools [server]   list the tools\n"
+                           "/mcp reconnect [server]   restart and re-list\033[0m\n");
+                printf("\n");
+                fflush(stdout);
+                free(out);
                 free(user_input);
                 return;
             }
@@ -3110,21 +4063,98 @@ static void journal_append(const char *tag, const char *full_result) {
     fclose(f);
 }
 
+/* Append what the model SAID between calls. The journal recorded every tool
+ * result and nothing else, so a post-mortem could see 16 calls — six reads, six
+ * greps, zero of the tool the prompt named — and still not see why. Actions
+ * without reasoning is half an instrument.
+ *
+ * Deliberately does NOT touch g_journal_seq: elide_old_tool_results builds its
+ * stubs on the invariant that the k-th tool_result message is journal entry k,
+ * so an extra NUMBERED entry would silently shift every stub's grep pointer by
+ * one. Hence a "###" sub-heading rather than a "## [n]" one. */
+static void journal_write_said(const char *label, const char *text) {
+    if (!text || !*text) return;
+    while (*text == ' ' || *text == '\n' || *text == '\t') text++;
+    if (!*text) return;
+    FILE *f = fopen(journal_path(), "a");
+    if (!f) return;
+    fprintf(f, "\n### %s before [%d]\n\n", label, g_journal_seq + 1);
+    fwrite(text, 1, strlen(text), f);
+    fputc('\n', f);
+    fclose(f);
+}
+
+/* Both halves of a turn's output. On a reasoning model mid-tool-loop `text` is
+ * empty every single round — the model emits a tool call and nothing else, and
+ * every reason it had lives in the reasoning stream. Journaling only `text`
+ * therefore recorded NOTHING across a whole 12-call run, which is precisely the
+ * kind of run a journal exists for. model.c keeps the reasoning borrowed until
+ * the next generation, which is long enough to write it here. */
+static void journal_say(const char *text) {
+    journal_write_said("thought", basi_last_reasoning());
+    journal_write_said("said", text);
+}
+
 /* Replace the content of tool_result messages older than the most recent `keep`
  * with a stub. Returns how many were elided. The journal holds the full text, so
  * this loses nothing the model cannot grep back. This is the compaction reclaim
  * cannot do inside a single agentic turn. */
+/* Results reach the model enveloped as {"name":"<tool>","content":...}, so the
+ * tool that produced one can be recovered from the message itself. */
+static bool envelope_tool_name(const char *c, char *out, size_t outlen) {
+    static const char *pfx = "{\"name\":\"";
+    if (!c || strncmp(c, pfx, strlen(pfx)) != 0) return false;
+    const char *p = c + strlen(pfx);
+    size_t k = 0;
+    while (*p && *p != '"' && k + 1 < outlen) {
+        if (*p == '\\' && p[1]) p++;          /* keep an escaped char, drop the slash */
+        out[k++] = *p++;
+    }
+    out[k] = '\0';
+    return k > 0;
+}
+
+/* Replace the content of tool_result messages older than the most recent `keep`
+ * with a stub. Returns how many were elided. The journal holds the full text, so
+ * this loses nothing the model cannot grep back. This is the compaction reclaim
+ * cannot do inside a single agentic turn.
+ *
+ * The stub NAMES what it replaced. A constant one cost more than it saved: eliding
+ * 77 results put 77 byte-identical sentences into the context — a block of exactly
+ * repeated text, which is its own reason for a model to start repeating itself —
+ * and stripped the model of any idea what it used to know. Told only that
+ * "something" was elided it cannot target the grep the message recommends, so it
+ * re-reads the file from scratch, refills the context, and forces the next
+ * elision. Naming the entry breaks that cycle and keeps the stubs distinct. */
 static int elide_old_tool_results(BasiMsg *messages, size_t mc, int keep) {
-    int seen = 0, elided = 0;
+    /* Journal entries are numbered in the order results were produced, so the
+     * k-th tool_result message is journal entry k. Count forwards, elide
+     * backwards, and a stub can name the exact entry to grep for. */
+    int total = 0;
+    for (size_t i = 0; i < mc; i++)
+        if (messages[i].role && strcmp(messages[i].role, "tool_result") == 0) total++;
+
+    int seen = 0, elided = 0, seq = total;
     for (size_t i = mc; i-- > 0; ) {
         const char *role = messages[i].role, *c = messages[i].content;
         if (!role || strcmp(role, "tool_result") != 0) continue;
+        int my_seq = seq--;
         if (c && strncmp(c, ELIDE_STUB_PREFIX, strlen(ELIDE_STUB_PREFIX)) == 0) continue;
         if (++seen <= keep) continue;
-        char stub[256];
-        snprintf(stub, sizeof(stub),
-            "%s — full output is in %s (grep it to recall this).]",
-            ELIDE_STUB_PREFIX, journal_path());
+
+        char name[48], stub[400];
+        size_t bytes = c ? strlen(c) : 0;
+        if (envelope_tool_name(c, name, sizeof(name)))
+            snprintf(stub, sizeof(stub),
+                "%s: entry #%d was `%s`, %zu bytes. You HAVE already seen it — do not "
+                "redo the call. To recall it: bash grep -A40 '## \\[%d\\] %s' %s]",
+                ELIDE_STUB_PREFIX, my_seq, name, bytes, my_seq, name, journal_path());
+        else
+            snprintf(stub, sizeof(stub),
+                "%s: entry #%d, %zu bytes. You HAVE already seen it — do not redo the "
+                "call. To recall it: bash grep -A40 '## \\[%d\\]' %s]",
+                ELIDE_STUB_PREFIX, my_seq, bytes, my_seq, journal_path());
+
         free((void *)messages[i].content);
         messages[i].content = strdup(stub);
         elided++;
@@ -3234,6 +4264,54 @@ static void run_agentic_turn(char *user_input,
            (a phase was measured re-reading .basi/findings.md 8x without ever editing). */
         unsigned long seen_results[256];
         int n_seen_results = 0;
+        line_seen_reset();          /* line-level view of the same, per turn */
+
+        /* Repeat detector. The re-read dedup above is keyed on the RESULT and only
+           fires above 200 bytes, so a SHORT command that keeps failing identically
+           slips straight past it: measured 2026-08-01, an agent issued the same
+           `export LD_LIBRARY_PATH=… && llama-bench` 30+ times against the same
+           6-line error and burned its whole turn budget without ever changing
+           approach. This keys on the CALL (name+arguments) instead, and escalates:
+           warn on the 2nd identical call, stop the turn on the 5th. Repeating a
+           call that already failed cannot produce new information. */
+        unsigned long seen_calls[128];
+        unsigned long seen_calls_res[128];   /* last result hash seen for that call */
+        int           seen_calls_n[128];
+        int           n_seen_calls    = 0;
+        const int     repeat_warn     = 2;
+        const int     repeat_give_up  = 5;
+
+        /* Named-tool gate. A run was handed the literal command line to render
+           three views and told "then call view_image and JUDGE THE PICTURE". It
+           rendered nothing and looked nothing: 16 tool calls, six reads, six
+           greps, zero looks. Nothing in the loop noticed, because the loop has
+           no opinion about what the request asked for.
+           This is the exact, non-guessing half of noticing: if the prompt names
+           an actual tool and that tool has still not been called after a patient
+           number of rounds, say so ONCE. Only names containing '_' qualify —
+           "read"/"edit"/"grep"/"head" are ordinary English and would fire on
+           almost every prompt, while "view_image" in a prompt can only mean one
+           thing. Once, never repeatedly: a nudge re-sent every round is itself
+           repeated text in the context, which is the failure mode the elision
+           work exists to prevent. */
+        const char *asked_tools[4]; int n_asked = 0;
+        char        called_tools[24][40]; int n_called = 0;
+        bool        gate_fired = false;
+        int         gate_after = 8;          /* tool calls of patience */
+        { const char *g = getenv("BASI_GATE_AFTER");
+          if (g) { int v = atoi(g); if (v > 0 && v <= 100) gate_after = v; } }
+        {
+            int ntd = 0;
+            const BasiToolDef *td = basi_tool_defs(&ntd);
+            for (int i = 0; i < ntd && n_asked < 4; i++) {
+                if (!td[i].name || !strchr(td[i].name, '_')) continue;
+                /* Never nudge toward a tool this session scoped away with --tools:
+                   the model would be told to call something it cannot see. */
+                if (active_tool_subset && *active_tool_subset &&
+                    !strstr(active_tool_subset, td[i].name)) continue;
+                if (strstr(user_input, td[i].name)) asked_tools[n_asked++] = td[i].name;
+            }
+        }
         {
             const char *mi = getenv("BASI_MAX_TOOL_ITERS");
             if (mi) { int v = atoi(mi); if (v > 0 && v <= 200) max_tool_iterations = v; }
@@ -3289,10 +4367,14 @@ static void run_agentic_turn(char *user_input,
             generation_interrupted = 0;
             setup_sigint_handler();
             GenerateResult result = generate_chat(messages, msg_count, &ncalls, &n_ncalls);
+            journal_say(result.text);   /* what it said, beside what it did */
             basi_srv_ctx_used = (int) result.prompt_tokens;   /* honest ctx meter from usage */
             reset_sigint_handler();
             session_prompt_tokens += result.prompt_tokens;
             session_gen_tokens    += result.gen_tokens;
+            session_reasoning_tokens += result.reasoning_tokens;
+            double turn_usd = cost_add_turn(result.prompt_tokens,
+                                            result.cached_tokens, result.gen_tokens);
 
             /* Performance metrics */
             /* The server's own prefill rate (over the tokens it actually evaluated).
@@ -3304,8 +4386,18 @@ static void run_agentic_turn(char *user_input,
                 ? result.gen_tokens / result.gen_time_s : 0;
             char meter[80];
             format_context_meter(meter, sizeof meter);
-            printf("\033[90m[ Prompt: %.1f t/s | Generation: %.1f t/s | %s ]\033[0m\n",
-                   prompt_tps, gen_tps, meter);
+            /* Cost per turn AND running total: on a stateless API the per-turn
+               figure climbs as the history grows, and only seeing both makes that
+               visible while the session is still short enough to act on. */
+            char cost_note[64] = "";
+            if (pricing_known) {
+                char t[24], s[24];
+                fmt_usd(t, sizeof t, turn_usd);
+                fmt_usd(s, sizeof s, session_cost_usd);
+                snprintf(cost_note, sizeof cost_note, " | %s turn, %s total", t, s);
+            }
+            printf("\033[90m[ Prompt: %.1f t/s | Generation: %.1f t/s | %s%s ]\033[0m\n",
+                   prompt_tps, gen_tps, meter, cost_note);
             fflush(stdout);
             statusbar_draw();   /* refresh the pinned ctx meter after this turn */
 
@@ -3319,6 +4411,7 @@ static void run_agentic_turn(char *user_input,
             char *call_env = NULL;         /* native: structured assistant tool-call envelope */
             char *call_name = NULL;        /* native: tool name, for the result envelope */
             bool have_call = false;
+            unsigned long call_sig = 0;    /* name+args hash, for the repeat detector */
 
             /* Structured tool calls come straight from the server (one per turn). */
             if (n_ncalls > 0) {
@@ -3334,6 +4427,9 @@ static void run_agentic_turn(char *user_input,
                 if (!tool_result) unknown_tool = strdup(nm);
                 call_name = strdup(nm);
                 call_env  = tool_call_envelope(ncalls[0].name, ncalls[0].arguments);
+                /* Signature captured here: ncalls is freed before the check below. */
+                call_sig  = tool_result_hash(nm) * 31u +
+                            tool_result_hash(ncalls[0].arguments ? ncalls[0].arguments : "");
                 have_call = true;
             }
 
@@ -3357,34 +4453,155 @@ static void run_agentic_turn(char *user_input,
                    elided. The model can grep it to recall anything. */
                 journal_append(call_name, tool_result);
 
+                /* Remember which tools this turn has actually used (named-tool gate). */
+                if (call_name && n_called < 24) {
+                    bool known = false;
+                    for (int i = 0; i < n_called; i++)
+                        if (strcmp(called_tools[i], call_name) == 0) { known = true; break; }
+                    if (!known) {
+                        snprintf(called_tools[n_called], sizeof(called_tools[0]), "%s", call_name);
+                        n_called++;
+                    }
+                }
+
+                /* Repeat detector (see seen_calls above). Keyed on the call, not the
+                   result, and with no size floor — the failure mode it exists for is a
+                   short error repeated forever. The result is kept and the warning
+                   appended, never substituted: the model still needs to see the error
+                   in order to change course. */
+                if (call_sig) {
+                    /* Re-issuing the SAME command is only a flail if it also returns the
+                       SAME answer. Repeating a benchmark or a stochastic simulation to
+                       build a sample is correct science, and an earlier version of this
+                       check killed a physics run at iteration 23/150 for doing exactly
+                       that. So escalate only when call AND result are both unchanged;
+                       a differing result means the call is still producing information,
+                       and the counter restarts. */
+                    unsigned long res_h = tool_result_hash(tool_result ? tool_result : "");
+                    int idx = -1;
+                    for (int i = 0; i < n_seen_calls; i++)
+                        if (seen_calls[i] == call_sig) { idx = i; break; }
+                    if (idx < 0) {
+                        if (n_seen_calls < (int)(sizeof(seen_calls)/sizeof(seen_calls[0]))) {
+                            seen_calls[n_seen_calls]     = call_sig;
+                            seen_calls_res[n_seen_calls] = res_h;
+                            seen_calls_n[n_seen_calls]   = 1;
+                            n_seen_calls++;
+                        }
+                    } else if (seen_calls_res[idx] != res_h) {
+                        seen_calls_res[idx] = res_h;   /* new information — not stuck */
+                        seen_calls_n[idx]   = 1;
+                    } else if (++seen_calls_n[idx] >= repeat_warn) {
+                        int c = seen_calls_n[idx];
+                        const char *body = tool_result ? tool_result : "";
+                        size_t n = strlen(body) + 400;
+                        char *w = malloc(n);
+                        if (w) {
+                            snprintf(w, n,
+                                "%s\n\n[REPEAT: you have issued this exact call %d times and "
+                                "received the SAME result each time. It will not change. Do NOT "
+                                "issue it again — change the approach, or say plainly that you "
+                                "are blocked and why.]", body, c);
+                            free(tool_result);
+                            tool_result = w;
+                        }
+                        if (c >= repeat_give_up) {
+                            printf("\033[1;31m[repeat: same call %d× — ending the turn, "
+                                   "the loop is not progressing]\033[0m\n", c);
+                            /* Exhaust the budget rather than break: the rest of this
+                               iteration still frees call_name/call_env normally. */
+                            tool_iterations = max_tool_iterations;
+                        } else {
+                            printf("\033[33m[repeat: same call %d× — nudging]\033[0m\n", c);
+                        }
+                        fflush(stdout);
+                    }
+                }
+
+                /* Truncate tool result if too large — line-aware, head+tail.
+                   The dim "└ <summary>" sub-line (printed below) reports the outcome
+                   (and any trim) directly under the activity header. */
+                size_t dropped = truncate_tool_result(tool_result,
+                        TOOL_RESULT_HEAD_LINES, TOOL_RESULT_TAIL_LINES,
+                        TOOL_RESULT_MAX_BYTES);
+
                 /* Re-read dedup: if this substantial result is byte-identical to one the
                    model already received this turn, re-reading it added nothing — replace
                    its context copy with a nudge to act, so a phase cannot burn its budget
-                   re-reading one file. Journaled above first, so the log stays lossless. */
+                   re-reading one file. Journaled above first, so the log stays lossless.
+                   It runs AFTER the truncation, on what the model actually receives.
+                   Run before it, every line of the cut middle was recorded as seen, so
+                   the one read that could recover it was refused as "NEARLY ALL of this
+                   was in an earlier result". Measured on a paper whose method section
+                   had been cut: the model asked for exactly those lines and was told it
+                   already had them. */
                 if (tool_result && strlen(tool_result) > 200) {
                     unsigned long h = tool_result_hash(tool_result);
-                    bool dup = false;
+                    bool exact = false;
                     for (int i = 0; i < n_seen_results; i++)
-                        if (seen_results[i] == h) { dup = true; break; }
-                    if (dup) {
+                        if (seen_results[i] == h) { exact = true; break; }
+
+                    /* Byte-identical is the easy case and the rare one. The costly
+                       case is a re-page: the same file at a shifted offset, mostly
+                       familiar, byte-distinct every time. Require a big page before
+                       judging on the ratio, so a short verification read around an
+                       edit still comes back in full — that one is legitimate. */
+                    int nlines = 0;
+                    double seen_frac = lines_already_seen(tool_result, &nlines);
+                    bool repage = (nlines >= 40 && seen_frac >= 0.85);
+
+                    if (exact || repage) {
+                        char nudge[480];
+                        snprintf(nudge, sizeof(nudge),
+                            "[%s — you already have this content. Reading it again spends context "
+                            "without adding anything, and a full context is what forces the elision "
+                            "that takes your earlier reads away. Do NOT read it again: act on what "
+                            "you know (make the edit, run the build), read a DIFFERENT file, or "
+                            "grep %s for one specific detail.]",
+                            exact ? "IDENTICAL to a result you already have"
+                                  : "NEARLY ALL of this was in an earlier result",
+                            journal_path());
                         free(tool_result);
-                        tool_result = strdup(
-                            "[IDENTICAL to a result you already have — re-reading it gives you "
-                            "nothing new. Do NOT read it again. Act on what you know: make the "
-                            "edit / run the command, or read a DIFFERENT file.]");
-                        printf("\033[33m[dedup: identical re-read — nudging toward action]\033[0m\n");
+                        tool_result = strdup(nudge);
+                        dropped = 0;               /* the nudge itself is not trimmed */
+                        printf("\033[33m[dedup: %s re-read — nudging toward action]\033[0m\n",
+                               exact ? "identical" : "overlapping");
                         fflush(stdout);
                     } else if (n_seen_results < (int)(sizeof(seen_results)/sizeof(seen_results[0]))) {
                         seen_results[n_seen_results++] = h;
                     }
                 }
 
-                /* Truncate tool result if too large — line-aware, head+tail.
-                   The dim "└ <summary>" sub-line reports the outcome (and any
-                   trim) directly under the activity header. */
-                size_t dropped = truncate_tool_result(tool_result,
-                        TOOL_RESULT_HEAD_LINES, TOOL_RESULT_TAIL_LINES,
-                        TOOL_RESULT_MAX_BYTES);
+                /* Named-tool gate: the request named a tool by name and, this
+                   many rounds in, it has still never been called. Say it once,
+                   attached to the result the model is already reading. */
+                if (!gate_fired && n_asked > 0 && tool_iterations >= gate_after && tool_result) {
+                    const char *missing = NULL;
+                    for (int a = 0; a < n_asked && !missing; a++) {
+                        bool used = false;
+                        for (int i = 0; i < n_called; i++)
+                            if (strcmp(called_tools[i], asked_tools[a]) == 0) { used = true; break; }
+                        if (!used) missing = asked_tools[a];
+                    }
+                    if (missing) {
+                        gate_fired = true;
+                        StringBuf g; sb_init(&g);
+                        sb_append_str(&g, tool_result);
+                        char note[400];
+                        snprintf(note, sizeof note,
+                            "\n\n[GATE: the request asks you to use `%s`, and %d tool calls in "
+                            "you have not called it once. It is available to you right now. "
+                            "Call it, or say plainly why you cannot — do not keep investigating "
+                            "around it.]", missing, tool_iterations);
+                        sb_append_str(&g, note);
+                        free(tool_result);
+                        tool_result = sb_to_str(&g);
+                        printf("\033[33m[gate: `%s` requested but never called after %d rounds "
+                               "— nudging once]\033[0m\n", missing, tool_iterations);
+                        fflush(stdout);
+                    }
+                }
+
                 print_tool_result_line(tool_result, dropped);
 
                 /* context_used_tokens() reads the server's tracked prompt count in
@@ -3403,15 +4620,35 @@ static void run_agentic_turn(char *user_input,
                     StringBuf tr;
                     sb_init(&tr);
                     sb_append_str(&tr, tool_result);
-                    char budget[256];
+                    /* Restate the original request, exactly as the legacy path below
+                       already does. Without it a long native-mode turn loses its goal:
+                       elision rewrites old tool results into "grep the journal" stubs,
+                       so after enough rounds the model sees one distant user message
+                       and a wall of stubs. Measured 2026-08-02 — two calls after
+                       eliding 35 results, a 35B local model answered "you haven't
+                       asked a specific question yet. What would you like me to do?"
+                       and ended a study it was halfway through. The user message is
+                       never elided (elide_old_tool_results only touches tool_result),
+                       so this is drift, not loss, and an echo is enough to fix it. */
+                    char budget[512];
                     snprintf(budget, sizeof(budget),
-                        "\n[Context: %d/%d tokens used, %d remaining. Answer now if remaining < 8000.]",
-                        used, basi_srv_ctx_total, remaining);
+                        "\n[Context: %d/%d tokens used, %d remaining. Answer now if "
+                        "remaining < 8000. Original request: \"%.180s\"]",
+                        used, basi_srv_ctx_total, remaining, user_input);
                     sb_append_str(&tr, budget);
                     char *res_env = tool_result_envelope(call_name, sb_to_str(&tr));
                     sb_free(&tr);
                     ADD_MESSAGE("tool_call", call_env);     /* assistant: the call */
                     ADD_MESSAGE("tool_result", res_env);    /* tool: the result   */
+                    /* view_image parked pixels for us. They have to ride in a
+                       user message — the tool result above can only carry text —
+                       and it must come AFTER that result so the call/result pair
+                       stays adjacent, which the API requires. */
+                    if (g_pending_image) {
+                        ADD_MESSAGE("image", g_pending_image);
+                        free(g_pending_image);
+                        g_pending_image = NULL;
+                    }
                     free(res_env);
                     free(result.text);
                 } else {
@@ -3448,6 +4685,25 @@ static void run_agentic_turn(char *user_input,
                    attempt, don't end the turn — nudge the model to re-emit a valid call
                    and keep looping. Bounded by a small consecutive-failure cap so a
                    persistently-degenerate model still terminates. */
+                /* The request came back with nothing at all because the provider
+                   refused the image. Ending the turn here throws away everything
+                   the run has done — measured once at 11 calls, a build and three
+                   renders. Strip the image, say why, and keep going. */
+                if (srvchat_vision_unsupported() &&
+                    demote_image_messages(messages, msg_count) > 0 &&
+                    tool_iterations < max_tool_iterations) {
+                    printf("\033[33m[vision: this model cannot accept images — image "
+                           "dropped, continuing without it]\033[0m\n");
+                    fflush(stdout);
+                    ADD_MESSAGE("user",
+                        "That image could not be sent: this model has no vision. Do not call "
+                        "view_image again. Continue the task using what the program PRINTS — "
+                        "measured numbers, extents, pixel counts, assertions — and say plainly "
+                        "in your write-up that the visual check could not be performed.");
+                    free(result.text);
+                    continue;
+                }
+
                 int looks_like_call = native_tools && result.text &&
                     (strstr(result.text, "<tool_call>") ||
                      strstr(result.text, "<function=") ||
@@ -3507,12 +4763,22 @@ static void run_agentic_turn(char *user_input,
             reset_sigint_handler();
             session_prompt_tokens += final_result.prompt_tokens;
             session_gen_tokens    += final_result.gen_tokens;
+            session_reasoning_tokens += final_result.reasoning_tokens;
+            double final_usd = cost_add_turn(final_result.prompt_tokens,
+                                             final_result.cached_tokens, final_result.gen_tokens);
 
             double gen_tps = final_result.gen_time_s > 0
                 ? final_result.gen_tokens / final_result.gen_time_s : 0;
             char meter[80];
             format_context_meter(meter, sizeof meter);
-            printf("\033[90m[ Generation: %.1f t/s | %s ]\033[0m\n", gen_tps, meter);
+            char fcost[64] = "";
+            if (pricing_known) {
+                char t[24], s[24];
+                fmt_usd(t, sizeof t, final_usd);
+                fmt_usd(s, sizeof s, session_cost_usd);
+                snprintf(fcost, sizeof fcost, " | %s turn, %s total", t, s);
+            }
+            printf("\033[90m[ Generation: %.1f t/s | %s%s ]\033[0m\n", gen_tps, meter, fcost);
             fflush(stdout);
             statusbar_draw();   /* refresh the pinned ctx meter after this turn */
 
@@ -3532,6 +4798,45 @@ static void run_agentic_turn(char *user_input,
 }
 
 int main(int argc, char **argv) {
+    /* --local has to be seen before the subcommands below, which configure the
+       remote endpoint on their own (they dispatch ahead of parse_args). */
+    for (int i = 1; i < argc; i++)
+        if (strcmp(argv[i], "--local") == 0) api_ignore_saved = true;
+
+    /* `basi-cli api ...`: show, set or forget the default backend. */
+    if (argc >= 2 && strcmp(argv[1], "api") == 0) {
+        const char *sub = argc >= 3 ? argv[2] : "show";
+        char prov[128], model[512];
+        if (strcmp(sub, "show") == 0) {
+            if (load_default_api(prov, sizeof prov, model, sizeof model))
+                printf("Default backend: %s  model %s\n"
+                       "  (a bare `basi` uses this; `--local` or `basi-cli api clear` "
+                       "goes back to a local GGUF)\n", prov, model);
+            else
+                printf("No default backend saved — a bare `basi` loads the default local model.\n"
+                       "  Set one with: basi-cli api set <provider> <model-id>\n");
+            return 0;
+        }
+        if (strcmp(sub, "clear") == 0) {
+            printf(clear_default_api() ? "Default backend cleared; back to local models.\n"
+                                       : "No default backend was saved.\n");
+            return 0;
+        }
+        if (strcmp(sub, "set") == 0 && argc >= 5) {
+            /* Configure it for real before saving: a typo'd provider or a missing
+               key should fail HERE, not on the next launch. */
+            if (api_setup_remote(argv[3], argv[4]) != 1) return 1;
+            printf("Default backend: %s  model %s\n", argv[3], argv[4]);
+            return 0;
+        }
+        fprintf(stderr,
+            "Usage:\n"
+            "  basi-cli api                          show the saved default backend\n"
+            "  basi-cli api set <provider> <model>   use it for every later launch\n"
+            "  basi-cli api clear                    forget it (back to local GGUF)\n");
+        return 2;
+    }
+
     /* `basi-cli docs ...` subcommand: handle and exit before model load. */
     if (argc >= 2 && strcmp(argv[1], "docs") == 0) {
         if (argc >= 3 && strcmp(argv[2], "add") == 0) {
@@ -3543,8 +4848,65 @@ int main(int argc, char **argv) {
         return 2;
     }
 
+    /* `basi-cli mcp ...`: inspect and exercise MCP servers with NO model loaded.
+     * Connecting, listing and calling are pure protocol, so a server can be
+     * debugged — is it reachable, which era does it speak, what does this tool
+     * actually return — without spending a single token on the question. */
+    if (argc >= 2 && strcmp(argv[1], "mcp") == 0) {
+        const char *sub = argc >= 3 ? argv[2] : "list";
+        const char *cfg = NULL;
+        for (int i = 2; i + 1 < argc; i++)
+            if (strcmp(argv[i], "--mcp-config") == 0) cfg = argv[i + 1];
+
+        if (strcmp(sub, "call") == 0) {
+            if (argc < 4) {
+                fprintf(stderr, "Usage: basi-cli mcp call <mcp__server__tool> ['{\"json\":\"args\"}']\n");
+                return 2;
+            }
+            mcp_init(cfg, /*verbose=*/1, NULL);
+            const char *name = argv[3];
+            const char *args = argc >= 5 ? argv[4] : "{}";
+            if (!mcp_is_tool(name)) {
+                fprintf(stderr, "No such MCP tool: %s (see `basi-cli mcp tools`)\n", name);
+                mcp_shutdown();
+                return 2;
+            }
+            char *out = mcp_call_tool(name, args);
+            printf("%s\n", out ? out : "(null)");
+            free(out);
+            mcp_shutdown();
+            return 0;
+        }
+
+        if (strcmp(sub, "list") == 0 || strcmp(sub, "tools") == 0) {
+            mcp_init(cfg, /*verbose=*/1, NULL);
+            char *rep = mcp_status_report(strcmp(sub, "tools") == 0 ? 1 : 0,
+                                          argc >= 4 && argv[3][0] != '-' ? argv[3] : NULL);
+            printf("\n%s", rep ? rep : "");
+            free(rep);
+            mcp_shutdown();
+            return 0;
+        }
+
+        fprintf(stderr,
+            "Usage:\n"
+            "  basi-cli mcp list [server]                    connect and report status\n"
+            "  basi-cli mcp tools [server]                   also list every tool\n"
+            "  basi-cli mcp call <tool> ['<json args>']      invoke one tool\n"
+            "  (any of the above accept --mcp-config <file>)\n");
+        return 2;
+    }
+
     /* `basi-cli study ...`: the discovery loop runs without loading a model —
      * executing an experiment and applying its decision rule is deterministic. */
+    if (argc >= 2 && (strcmp(argv[1], "study") == 0 ||
+                      strcmp(argv[1], "factory") == 0)) {
+        /* These dispatch ahead of parse_args, so --api/--api-model never reach
+         * them. Honour BASI_API/BASI_API_MODEL from the environment instead so
+         * the theory/propose step can run against a hosted endpoint; without
+         * this they are hard-wired to a local llama-server. */
+        if (api_setup_remote(NULL, NULL) < 0) return 2;
+    }
     if (argc >= 2 && strcmp(argv[1], "study") == 0) {
         return cmd_study(argc - 2, argv + 2);
     }
@@ -3572,6 +4934,74 @@ int main(int argc, char **argv) {
     { const char *e = getenv("BASI_TOP_K"); if (e && cli.cli_top_k == 0) top_k = atoi(e); }
     { const char *e = getenv("BASI_TOP_P"); if (e && cli.cli_top_p == 1.0f) top_p = (float)atof(e); }
     const char *resume_path          = cli.resume_path;
+
+    bool oneshot = (oneshot_deepsearch_q != NULL) || (oneshot_prompt != NULL);
+
+    /* Model resolution order (interactive): -m (this invocation) > saved
+       default (set by the picker / /model) > $BASI_MODEL > first-run picker.
+       The saved default is what drops later launches straight into chat and
+       what lets a /model choice persist. */
+    static char picked_model[1024];
+    static char default_model[1024];
+    int ctx_override = 0;
+    float temp_override = -1;
+    int picker_spec = -1, picker_fa = -1, picker_cpumoe = -1;   /* server launch flags from the picker (-1 = not set) */
+    bool loaded_from_default = false;   /* model came from the saved-default file */
+
+    /* --pick (from /model): the picker runs FIRST — before the hosted endpoint is
+       resolved, because the picker is where local vs hosted gets decided. The
+       other way round, a saved API default claimed model_path and the picker never
+       opened: /model in a hosted session re-exec'd straight back into the same
+       model. It also runs before any model is loaded, so its VRAM probe / auto-fit
+       see the whole GPU free (the previous model was released when /model
+       re-exec'd into this fresh process). A cancel falls through to the saved
+       defaults below — i.e. reloads whatever was running. */
+    enum { PICKED_NONE, PICKED_LOCAL, PICKED_HOSTED } picked = PICKED_NONE;
+    if (cli.pick && !oneshot && !model_path) {
+        LaunchConfig cfg = pick_model(picker_remote_tab());
+        if (cfg.api_model) {
+            /* Through the same setup as --api, so it is validated and saved alike. */
+            if (api_setup_remote(cfg.api_provider, cfg.api_model) == 1) picked = PICKED_HOSTED;
+            free(cfg.api_model);
+        } else if (cfg.model_path) {
+            picked = PICKED_LOCAL;
+            strncpy(picked_model, cfg.model_path, sizeof(picked_model) - 1);
+            picked_model[sizeof(picked_model) - 1] = '\0';
+            free(cfg.model_path);
+            model_path = picked_model;
+            if (!ngl_set) n_gpu_layers = cfg.gpu_layers;
+            ctx_override  = cfg.ctx_size;
+            temp_override = cfg.temperature;
+            picker_spec   = cfg.spec_draft_mtp;
+            picker_fa     = cfg.flash_attn;
+            picker_cpumoe = cfg.cpu_moe;
+            /* Before the save: save_default_model persists whatever is selected. */
+            if (cfg.backend) backend_select(cfg.backend);
+            save_default_model(model_path, n_gpu_layers, cfg.ctx_size);
+            /* Choosing a local model is choosing local: a saved hosted default
+               outranks default-model and would take over again at the next launch. */
+            if (clear_default_api())
+                printf("\033[90m[saved hosted default cleared — later launches stay local]\033[0m\n");
+        }
+    }
+
+    /* --api <provider|url>: drive a hosted OpenAI-compatible endpoint instead of a
+       local llama-server. Resolved BEFORE the local model resolution, because in
+       this mode there is no GGUF to pick, no VRAM to fit and nothing to spawn — the
+       whole local-server path below is skipped. A choice just made in the picker
+       stands for this run: it is not re-litigated against the env or saved file. */
+    bool remote_api = (picked == PICKED_HOSTED);
+    if (picked == PICKED_NONE) {
+        remote_api = (api_setup_remote(cli.api, cli.api_model) == 1);
+        if (!remote_api && (cli.api || cli.api_model || getenv("BASI_API"))) {
+            /* api_setup_remote already explained why; only a hard request is fatal. */
+            if (cli.api || getenv("BASI_API") || getenv("BASI_API_BASE")) return 1;
+        }
+    }
+    if (remote_api) {
+        model_path = enter_hosted_mode();
+        n_gpu_layers = 0;                       /* nothing is offloaded here */
+    }
 
     /* --yolo/--bypass: auto-approve every tool action. Without it, a
      * non-interactive -p run that triggers an approval prompt reads EOF on
@@ -3604,8 +5034,6 @@ int main(int argc, char **argv) {
         compact_mode = COMPACT_SUMMARY;
     }
 
-    bool oneshot = (oneshot_deepsearch_q != NULL) || (oneshot_prompt != NULL);
-
     /* --no-tools is a modifier on -p: it only makes sense for the one-shot
      * prompt path. Reject it standalone rather than silently ignoring it. */
     if (no_tools && !oneshot_prompt) {
@@ -3615,36 +5043,6 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    /* Model resolution order (interactive): -m (this invocation) > saved
-       default (set by the picker / /model) > $BASI_MODEL > first-run picker.
-       The saved default is what drops later launches straight into chat and
-       what lets a /model choice persist. */
-    static char picked_model[1024];
-    static char default_model[1024];
-    int ctx_override = 0;
-    float temp_override = -1;
-    int picker_spec = -1, picker_fa = -1, picker_cpumoe = -1;   /* server launch flags from the picker (-1 = not set) */
-    bool loaded_from_default = false;   /* model came from the saved-default file */
-    /* --pick (from /model): force the picker BEFORE any model is loaded, so its
-       VRAM probe / auto-fit see the whole GPU free (the previous model was
-       released when /model re-execed into this fresh process). A cancel falls
-       through to the saved default below — i.e. reloads the same model. */
-    if (cli.pick && !oneshot && !model_path) {
-        LaunchConfig cfg = pick_model();
-        if (cfg.model_path) {
-            strncpy(picked_model, cfg.model_path, sizeof(picked_model) - 1);
-            picked_model[sizeof(picked_model) - 1] = '\0';
-            free(cfg.model_path);
-            model_path = picked_model;
-            if (!ngl_set) n_gpu_layers = cfg.gpu_layers;
-            ctx_override  = cfg.ctx_size;
-            temp_override = cfg.temperature;
-            picker_spec   = cfg.spec_draft_mtp;
-            picker_fa     = cfg.flash_attn;
-            picker_cpumoe = cfg.cpu_moe;
-            save_default_model(model_path, n_gpu_layers, cfg.ctx_size);
-        }
-    }
     if (!model_path) {
         int d_ngl = -1, d_ctx = 0;
         if (load_default_model(default_model, sizeof default_model, &d_ngl, &d_ctx)) {
@@ -3662,24 +5060,32 @@ int main(int argc, char **argv) {
         return 1;
     }
     if (!model_path) {
-        LaunchConfig cfg = pick_model();
-        if (!cfg.model_path) {
+        LaunchConfig cfg = pick_model(picker_remote_tab());
+        if (cfg.api_model) {                /* first run, and a hosted model chosen */
+            remote_api = (api_setup_remote(cfg.api_provider, cfg.api_model) == 1);
+            free(cfg.api_model);
+            if (!remote_api) return 1;      /* api_setup_remote said why */
+            model_path = enter_hosted_mode();
+            n_gpu_layers = 0;
+        } else if (!cfg.model_path) {
             fprintf(stderr, "No model selected.\n");
             return 1;
+        } else {
+            strncpy(picked_model, cfg.model_path, sizeof(picked_model) - 1);
+            picked_model[sizeof(picked_model) - 1] = '\0';  /* strncpy may not NUL-terminate */
+            free(cfg.model_path);
+            model_path = picked_model;
+            if (!ngl_set) n_gpu_layers = cfg.gpu_layers;
+            ctx_override = cfg.ctx_size;
+            temp_override = cfg.temperature;
+            picker_spec  = cfg.spec_draft_mtp;
+            picker_fa    = cfg.flash_attn;
+            picker_cpumoe = cfg.cpu_moe;
+            if (cfg.backend) backend_select(cfg.backend);
+            /* An explicit pick always (re)writes the default — including repairing a
+               stale file that pointed at a since-deleted model. */
+            save_default_model(model_path, n_gpu_layers, cfg.ctx_size);
         }
-        strncpy(picked_model, cfg.model_path, sizeof(picked_model) - 1);
-        picked_model[sizeof(picked_model) - 1] = '\0';  /* strncpy may not NUL-terminate */
-        free(cfg.model_path);
-        model_path = picked_model;
-        if (!ngl_set) n_gpu_layers = cfg.gpu_layers;
-        ctx_override = cfg.ctx_size;
-        temp_override = cfg.temperature;
-        picker_spec  = cfg.spec_draft_mtp;
-        picker_fa    = cfg.flash_attn;
-        picker_cpumoe = cfg.cpu_moe;
-        /* An explicit pick always (re)writes the default — including repairing a
-           stale file that pointed at a since-deleted model. */
-        save_default_model(model_path, n_gpu_layers, cfg.ctx_size);
     }
 
     /* Explicit CLI knobs win over picker / built-in defaults. */
@@ -3690,13 +5096,28 @@ int main(int argc, char **argv) {
        drops straight into chat instead of the picker. Covers the picker pick,
        -m, and $BASI_MODEL uniformly. Seed only when no default file exists yet,
        so a one-off `-m other.gguf` never overwrites a default the user chose (via
-       the picker or /model); those paths write the file explicitly elsewhere. */
-    if (!oneshot && model_path && !loaded_from_default && !default_model_file_exists())
+       the picker or /model); those paths write the file explicitly elsewhere.
+       In --api mode model_path is a remote model id, not a GGUF on disk — writing
+       it as the local default would leave a path that never resolves again. */
+    if (!oneshot && model_path && !remote_api && !loaded_from_default && !default_model_file_exists())
         save_default_model(model_path, n_gpu_layers, ctx_override);
 
     /* Warm up the local SearXNG (web_search backend) while the model loads.
      * --no-tools never touches the web, so don't spin SearXNG up for it. */
-    if (!no_tools) web_ensure_searxng();
+    if (!no_tools) {
+        const char *bkey = getenv("BRAVE_API_KEY");
+        bool searchable = (web_ensure_searxng() != WEB_SEARCH_UNAVAILABLE) ||
+                          (bkey && bkey[0]);
+        /* Don't advertise a capability that cannot work. Left in the table it
+         * costs turns — the model tries it, reads the failure as an empty web,
+         * and moves on without ever telling anyone search was missing. */
+        if (!searchable) {
+            basi_tooldefs_disable("web_search");
+            fprintf(stderr, "\033[33m[web] web_search withdrawn from the tool set for "
+                            "this run — better the model knows it has no search than "
+                            "discovers it one failed call at a time.\033[0m\n");
+        }
+    }
 
     /* Server-backed generation spike (M1): BASI_SERVER_SELFTEST=1 spawns a
        llama-server, streams a completion over its SSE /completion, and exits —
@@ -3731,8 +5152,7 @@ int main(int argc, char **argv) {
        ANSWERS from the tool result — proving the message serialization + id
        pairing template correctly server-side. */
     if (getenv("BASI_SRV_CHAT_MSGTEST") && model_path) {
-        const char *sbin = getenv("BASI_SERVER_BIN");
-        if (!sbin || !*sbin) sbin = "/home/alberto/llama.cpp/build_vulkan/bin/llama-server";
+        const char *sbin = backend_active()->server_bin;   /* honors $BASI_SERVER_BIN */
         int n; const BasiToolDef *defs = basi_tool_defs(&n); basi_set_tools(defs, n);
         pid_t pid = srvgen_spawn(sbin, model_path, n_gpu_layers, 4096,
                                  "--jinja --reasoning-format auto", 8181, "/tmp/basi_srvgen.log", 300);
@@ -3762,22 +5182,51 @@ int main(int argc, char **argv) {
 
     /* In --no-tools mode stdout must carry only the completion, so load chatter
      * goes to stderr. */
-    fprintf(no_tools ? stderr : stdout, "BASI-CLI - Loading model...\n");
-    fflush(no_tools ? stderr : stdout);
+    if (!remote_api) {
+        fprintf(no_tools ? stderr : stdout, "BASI-CLI - Loading model...\n");
+        fflush(no_tools ? stderr : stdout);
+    }
 
     /* Server-backed generation only: the weights + KV + templating + tool grammar
        all live in the spawned llama-server. BASI loads NO model in-process — the
        model/vocab/ctx handles stay NULL (retained only in the signatures of
-       functions that no longer touch them). */
-    const bool use_server = true;
+       functions that no longer touch them).
+
+       --api is the same client against someone else's server: nothing to load,
+       nothing to spawn, nothing to tear down. */
+    const bool use_server = !remote_api;
+
+    if (remote_api) {
+        /* The ctx meter and the compaction trigger both budget against this. There
+           is no /props to ask as there is for a local llama-server, so: an explicit
+           -c / BASI_API_CTX wins, else ASK the provider (GET /models reports
+           context_length), else fall back. Detecting beats defaulting because the
+           real window ranges from 8k to 1M across models on the same endpoint, and
+           guessing low compacts conversations that would have been accepted whole. */
+        int rctx = cli_ctx > 0 ? cli_ctx : 0;
+        if (!rctx) { const char *e = getenv("BASI_API_CTX"); if (e && *e) rctx = atoi(e); }
+        const char *ctx_src = "declared";
+        if (rctx <= 0) {
+            rctx = srvchat_remote_context_length();
+            ctx_src = "reported by the provider";
+        }
+        if (rctx <= 0) { rctx = 131072; ctx_src = "fallback — pass -c if the model has more"; }
+        basi_srv_ctx_total = rctx;
+        fprintf(stderr, "\033[90m[api] %s  model %s  ctx %d (%s)%s\033[0m\n",
+                srvchat_remote_base(), srvchat_remote_model(), basi_srv_ctx_total, ctx_src,
+                api_from_saved_default ? "  [saved default — `--local` for a GGUF]" : "");
+    }
 
     /* In one-shot deep-research shrink the server context to free VRAM. */
     if (oneshot_deepsearch_q) ctx_override = 4096;
 
     /* Spawn the llama-server that holds the weights + does generation. */
     if (use_server) {
-        const char *sbin = getenv("BASI_SERVER_BIN");
-        if (!sbin || !*sbin) sbin = "/home/alberto/llama.cpp/build_vulkan/bin/llama-server";
+        /* The selected llama-server binary (+ its per-binary default flags).
+           Resolution order lives in backend_active(): $BASI_SERVER_BIN, then
+           $BASI_BACKEND, then the picker/saved choice, then Vulkan. */
+        const Backend *bk   = backend_active();
+        const char    *sbin = bk->server_bin;
         int spec_nmax = 1;
         { const char *e = getenv("BASI_SPEC_NMAX"); if (e && *e) spec_nmax = atoi(e); }
         int srv_ctx = ctx_override > 0 ? ctx_override : CONTEXT_SIZE;
@@ -3843,8 +5292,9 @@ int main(int argc, char **argv) {
 
         /* "How to run llama-server for this model" IS the config now, so BASI keeps
            it as a standalone, editable script (.basi/run-llama-server.sh) and execs
-           it. Reuse the user's script when it targets THIS model (respecting edits);
-           regenerate when it's missing or for a different model (e.g. after /model). */
+           it. Reuse the user's script when it targets THIS model AND THIS backend
+           (respecting edits); regenerate when it's missing, for a different model
+           (e.g. after /model), or for a different binary (after a backend switch). */
         const char *script = ".basi/run-llama-server.sh";
         /* best-of-N needs one slot per sampled candidate (the server caps `n` at
            the slot count), so the launch script must be generated with -np N. */
@@ -3856,9 +5306,18 @@ int main(int argc, char **argv) {
             .spec_type = spec_type, .spec_nmax = spec_nmax,
             .flash_attn = fa_on, .cpu_moe = cpu_moe_on, .jinja = 1, .reasoning_format = "auto",
             .n_parallel = srv_slots,
+            .backend_name = bk->name, .extra_flags = bk->extra_flags,
         };
-        if (srvgen_script_matches(script, model_path)) {
+        if (srvgen_script_matches(script, model_path) &&
+            srvgen_script_backend_matches(script, bk->name)) {
             fprintf(stderr, "\033[90m[server mode] using launch script %s (edit it to change flags)\033[0m\n", script);
+            /* An unmarked script (hand-written, or from before backend selection) is
+               honored rather than overwritten — but say so when it runs a different
+               binary than the one selected, instead of letting the menu look broken. */
+            if (!srvgen_script_uses_bin(script, sbin))
+                fprintf(stderr, "\033[33m[backend] %s does not run the selected '%s' (%s); "
+                        "the script wins. Delete it to regenerate.\033[0m\n",
+                        script, bk->name, sbin);
             /* A hand-edited or pre-best-of-N script may not request the slots.
                llama-server's default (-np auto) often allocates enough anyway, so
                this is a heads-up, not a verdict: if auto lands below N the server
@@ -3872,11 +5331,132 @@ int main(int argc, char **argv) {
             if (srvgen_write_launch_script(&L, script) == 0)
                 fprintf(stderr, "\033[90m[server mode] wrote launch script %s\033[0m\n", script);
         }
+        /* Preflight the binary before spawning it. The launch script is a plain exec
+           with no env prelude — BASI inherits the environment rather than sourcing a
+           toolchain — so a SYCL build launched from a shell without oneAPI dies in the
+           dynamic loader. `--version` reproduces that failure in ~50ms and hands back
+           the loader's own message, instead of the user getting "failed to start" and
+           a log file to go read. Skipped when the script runs some other binary (a
+           hand-edited script is honored, and was already reported above). */
+        if (srvgen_script_uses_bin(script, sbin)) {
+            char berr[400];
+            if (backend_probe(bk, berr, sizeof berr) != 0) {
+                fprintf(stderr, "\033[1;31mError: backend '%s' cannot run in this environment.\033[0m\n",
+                        bk->name);
+                fprintf(stderr, "  %s\n", berr);
+                const char *hint = backend_probe_hint(bk, berr);
+                if (*hint) fprintf(stderr, "  Fix:  %s\n", hint);
+                int nb; const Backend *bl = backend_list(&nb);
+                if (nb > 1) {
+                    fprintf(stderr, "  Or:   choose another backend in /model  (declared:");
+                    for (int i = 0; i < nb; i++) fprintf(stderr, " %s", bl[i].name);
+                    fprintf(stderr, ")\n");
+                }
+                return 1;
+            }
+
+            /* Does this build actually accept the flags we composed? Different
+               binaries can be different llama.cpp vintages, and an unknown flag
+               makes llama-server exit during startup — naming it here beats
+               "failed to start, see the log". A WARNING, never a refusal: this
+               reads help TEXT, and a parser miss must not block a valid launch
+               (if the flag really is unsupported, the spawn below fails anyway
+               and this line explains it). */
+            char *unknown[6] = {0};
+            int nu = helpspec_check_script(script, sbin, unknown, 6);
+            if (nu > 0) {
+                fprintf(stderr, "\033[33m[backend] '%s' does not list", bk->name);
+                for (int i = 0; i < nu && i < 6; i++)
+                    fprintf(stderr, " %s", unknown[i] ? unknown[i] : "?");
+                if (nu > 6) fprintf(stderr, " (+%d more)", nu - 6);
+                fprintf(stderr, " in its --help. If the server exits at startup, "
+                                "that is why — edit %s.\033[0m\n", script);
+            }
+            for (int i = 0; i < nu && i < 6; i++) free(unknown[i]);
+        }
+        /* ── VRAM: estimate vs reality ──────────────────────────────────────
+           The picker's estimate errs high (its overhead term charges ~1.2 GB more
+           than the real compute buffer on a dense 7B), so BASI records what each
+           model ACTUALLY used and, once it has a measurement, says up front when
+           the truth is more than 1 GB away from the estimate — while reconfiguring
+           is still cheap, i.e. before the weights load. */
+        /* Use the -ngl/-c the SCRIPT will run with, not the ones we were invoked
+           with: reuse is keyed on model+backend, so a reused or hand-edited script
+           keeps its own values and silently wins. Predicting from the requested
+           numbers would describe a server that isn't running — and would record the
+           observation under the wrong key. */
+        int eff_ngl = n_gpu_layers, eff_ctx = srv_ctx;
+        srvgen_script_params(script, &eff_ngl, &eff_ctx);
+        if (eff_ngl != n_gpu_layers || eff_ctx != srv_ctx)
+            fprintf(stderr, "\033[33m[server mode] %s runs -ngl %d -c %d, overriding the "
+                            "requested -ngl %d -c %d (the script wins; delete it to "
+                            "regenerate)\033[0m\n",
+                    script, eff_ngl, eff_ctx, n_gpu_layers, srv_ctx);
+
+        double vram_pred = basi_predict_vram_mb(model_path, eff_ngl, eff_ctx);
+        HwInfo vram_before = hw_probe();
+        if (vram_pred > 0) {
+            int measured = 0;
+            double corrected = vramobs_correct(model_path, eff_ngl, eff_ctx,
+                                               vram_pred, &measured);
+            double diff = corrected - vram_pred;
+            if (fabs(diff) > 1024.0) {
+                fprintf(stderr,
+                        "\033[33m[vram] this model last used \033[1m%.1f GB\033[0m\033[33m here, "
+                        "but the estimate says %.1f GB — %.1f GB %s than expected.\033[0m\n",
+                        corrected / 1024.0, vram_pred / 1024.0, fabs(diff) / 1024.0,
+                        diff < 0 ? "LESS" : "MORE");
+                if (vram_before.has_gpu && vram_before.vram_budget_known)
+                    fprintf(stderr, "\033[33m       %.1f GB is free right now.%s\033[0m\n",
+                            vram_before.vram_avail_mb / 1024.0,
+                            diff < 0 ? "  You could raise -ngl or -c."
+                                     : "  Consider lowering -ngl or -c.");
+                /* Only ASK when there is someone to answer: a one-shot run, a pipe
+                   or the factory harness must never block on a prompt. */
+                if (isatty(STDIN_FILENO) && !oneshot && !no_tools) {
+                    fprintf(stderr, "\033[33m       Continue with this configuration? [Y/n] \033[0m");
+                    fflush(stderr);
+                    char resp[16] = {0};
+                    if (fgets(resp, sizeof resp, stdin) && (resp[0] == 'n' || resp[0] == 'N')) {
+                        fprintf(stderr, "\033[90m[vram] stopped. Run `basi --pick` or /model "
+                                        "to change the configuration.\033[0m\n");
+                        return 0;
+                    }
+                }
+            }
+        }
+
         fprintf(stderr, "\033[90m[server mode] spawning llama-server (holds the weights)…\033[0m\n");
         g_srv_pid = srvgen_spawn_script(script, 8181, "/tmp/basi_srvgen.log", 300);
         if (g_srv_pid < 0) {
             fprintf(stderr, "Error: llama-server failed to start (see /tmp/basi_srvgen.log and %s)\n", script);
+            /* The likeliest cause of a load-time death is not fitting, so report the
+               two numbers that show it. The server is gone by now, so its VRAM is
+               already released — there is no delta left to measure, only this. */
+            if (vram_pred > 0 && vram_before.has_gpu && vram_before.vram_budget_known)
+                fprintf(stderr, "       Estimated need %.1f GB; %.1f GB was free at launch. "
+                                "If it ran out, lower -ngl or -c (currently -ngl %d -c %d).\n",
+                        vram_pred / 1024.0, vram_before.vram_avail_mb / 1024.0,
+                        eff_ngl, eff_ctx);
             return 1;
+        }
+
+        /* The server is up and its buffers are reserved, so this is the real number.
+           Recorded even when it matches, because an observation is what lets the next
+           launch (and the picker) stop guessing. */
+        if (vram_pred > 0 && vram_before.has_gpu && vram_before.vram_budget_known) {
+            HwInfo vram_after = hw_probe();
+            if (vram_after.has_gpu && vram_after.vram_budget_known &&
+                vram_after.vram_avail_mb < vram_before.vram_avail_mb) {
+                double used = (double) (vram_before.vram_avail_mb - vram_after.vram_avail_mb);
+                double err  = used - vram_pred;
+                vramobs_record(model_path, eff_ngl, eff_ctx, vram_pred, used);
+                if (fabs(err) > 1024.0)
+                    fprintf(stderr, "\033[90m[vram] measured %.1f GB (estimate %.1f GB, "
+                                    "%.1f GB %s) — recorded for next time\033[0m\n",
+                            used / 1024.0, vram_pred / 1024.0, fabs(err) / 1024.0,
+                            err < 0 ? "less" : "more");
+            }
         }
         atexit(kill_srv);
         basi_srv_port      = 8181;
@@ -3894,10 +5474,58 @@ int main(int argc, char **argv) {
         const char *rp = getenv("BASI_REPEAT_PENALTY");
         if (rp) { float v = (float)atof(rp); if (v >= 1.0f && v <= 2.0f) repeat_pen = v; }
     }
-    basi_srv_sampling.temperature    = temp_override >= 0 ? temp_override : 0.4;
+    /* min_p was the one sampling parameter with no way to reach it from outside,
+       which matters because model cards specify it: Qwen3.8 asks for min_p=0.0 in
+       thinking mode, and a hardcoded 0.05 quietly overrode the vendor's own
+       recommendation with no flag, no env var and no way to tell. */
+    float min_p_v = 0.05f;
+    bool  min_p_explicit = false, repeat_explicit = false;
+    {
+        const char *mp = getenv("BASI_MIN_P");
+        if (mp) { float v = (float) atof(mp);
+                  if (v >= 0.0f && v < 1.0f) { min_p_v = v; min_p_explicit = true; } }
+        if (getenv("BASI_REPEAT_PENALTY")) repeat_explicit = true;
+    }
+
+    double temp_v = temp_override >= 0 ? temp_override : 0.4;
+
+    /* Per-model recommended sampling. BASI's defaults are one compromise applied
+       to every model, and against Qwen3.8 every one of the five was wrong —
+       silently, because nothing printed what was in use. A profile fills in only
+       what the caller did NOT specify: an explicit flag or env var still wins. */
+    {
+        /* Key on whatever identifies the model in THIS mode. A hosted run has no
+           local file — it has an id like "Qwen/Qwen3.8-27B-FP8", which is both
+           the natural key and where this bug was first found. */
+        const char *samp_key = remote_api ? srvchat_remote_model() : model_path;
+        SamplingProfile prof;
+        if (sampling_profile_for(samp_key, &prof) > 0) {
+            char applied[256]; size_t al = 0; applied[0] = '\0';
+            #define NOTE(fmt, ...) do { \
+                al += (size_t) snprintf(applied + al, sizeof(applied) - al, \
+                                        (al ? " " fmt : fmt), __VA_ARGS__); } while (0)
+            if (prof.temperature >= 0 && temp_override < 0) {
+                temp_v = prof.temperature;           NOTE("temp=%.2f", temp_v); }
+            if (prof.top_p >= 0 && cli.cli_top_p == 1.0f && !getenv("BASI_TOP_P")) {
+                top_p = (float) prof.top_p;          NOTE("top_p=%.2f", (double) top_p); }
+            if (prof.top_k >= 0 && cli.cli_top_k == 0 && !getenv("BASI_TOP_K")) {
+                top_k = prof.top_k;                  NOTE("top_k=%d", top_k); }
+            if (prof.min_p >= 0 && !min_p_explicit) {
+                min_p_v = (float) prof.min_p;        NOTE("min_p=%.2f", (double) min_p_v); }
+            if (prof.repeat_penalty >= 0 && !repeat_explicit) {
+                repeat_pen = (float) prof.repeat_penalty;
+                NOTE("repeat_penalty=%.2f", (double) repeat_pen); }
+            #undef NOTE
+            if (applied[0])
+                fprintf(stderr, "\033[90m[sampling] %s  (from %s)\033[0m\n",
+                        applied, prof.source);
+        }
+    }
+
+    basi_srv_sampling.temperature    = temp_v;
     basi_srv_sampling.repeat_penalty = repeat_pen;
     basi_srv_sampling.repeat_last_n  = 256;
-    basi_srv_sampling.min_p          = 0.05;
+    basi_srv_sampling.min_p          = min_p_v;
     basi_srv_sampling.top_k          = top_k;
     basi_srv_sampling.top_p          = top_p;
     basi_srv_sampling.seed           = (cli_seed == BASI_DEFAULT_SEED) ? -1 : (long) cli_seed;
@@ -3944,6 +5572,13 @@ int main(int argc, char **argv) {
         GenerateResult r = generate_chat(messages, msg_count, NULL, NULL);
         printf("%s\n", r.text ? r.text : "");
         fflush(stdout);
+        /* This path bypasses the agent loop's accounting, so bill it here — a
+           scripted data-gen run over a paid API is exactly where an unnoticed
+           bill accumulates. */
+        session_prompt_tokens    += r.prompt_tokens;
+        session_gen_tokens       += r.gen_tokens;
+        session_reasoning_tokens += r.reasoning_tokens;
+        cost_add_turn(r.prompt_tokens, r.cached_tokens, r.gen_tokens);
         free(r.text);
         goto cleanup;
     }
@@ -3951,14 +5586,38 @@ int main(int argc, char **argv) {
     /* Native tool-calling (phase 2a): register the tool set, then ask whether
        the server templates them and returns STRUCTURED tool_calls. Server-only, so
        tools are always "native" (the /v1/chat/completions path owns the format). */
-    int tool_n = 0;
-    const BasiToolDef *tool_defs = basi_tool_defs(&tool_n);
-    if (cli.tool_subset && *cli.tool_subset) {         /* --tools: hard-scope this phase */
-        tool_defs = filter_tool_defs(cli.tool_subset, &tool_n);
-        printf("\033[36m[Tools scoped to: %s (%d tool%s)]\033[0m\n",
-               cli.tool_subset, tool_n, tool_n == 1 ? "" : "s");
+    /* MCP servers are enumerated BEFORE the tool set is read, because their tools
+       are appended to the very table basi_tool_defs() returns. Skipped when the
+       phase is hard-scoped to native tools only: a `--tools read,edit` factory
+       step would pay every server's startup cost and then advertise none of them,
+       and those steps run in their hundreds. */
+    bool want_mcp = !cli.no_mcp;
+    if (want_mcp && cli.tool_subset && *cli.tool_subset && !strstr(cli.tool_subset, "mcp__"))
+        want_mcp = false;
+    if (want_mcp) {
+        int mcp_n = 0;
+        mcp_init(cli.mcp_config, /*verbose=*/!oneshot_prompt || debug_mode, &mcp_n);
+    } else {
+        mcp_skipped_this_run = true;   /* so /mcp says "off", not "unconfigured" */
     }
-    basi_set_tools(tool_defs, tool_n);
+
+    active_tool_subset = cli.tool_subset;              /* --tools: hard-scope this phase */
+    reregister_tools();
+    int tool_n = basi_tools_registered();
+    if (active_tool_subset && *active_tool_subset) {
+        /* A subset that matches nothing is never what anyone meant, and it used to
+           be reported in the same cyan as a healthy startup line. Refuse: an agent
+           with no tools cannot do the job it was launched for, and the failure is
+           invisible from the outside — it looks like a model that chose not to act. */
+        if (tool_n == 0) {
+            fprintf(stderr, "basi: --tools %s matched no tools — the session would run "
+                            "with nothing to act with. Check the names against `basi --help`.\n",
+                    active_tool_subset);
+            return 2;
+        }
+        printf("\033[36m[Tools scoped to: %s (%d tool%s)]\033[0m\n",
+               active_tool_subset, tool_n, tool_n == 1 ? "" : "s");
+    }
     int native_tools = 1;
     generate_native_tools = native_tools;
     /* Render the answer stream as markdown, but only for the interactive REPL on
@@ -4101,12 +5760,17 @@ cleanup:
     statusbar_disable();   /* release the reserved bottom row before we exit */
     if (session_fp) fclose(session_fp);
     lsp_shutdown();
+    mcp_shutdown();     /* close each server's stdin, then escalate — spec order */
     embed_shutdown();
     mem_clear();
     for (size_t i = 0; i < msg_count; i++)
         free((void *)messages[i].content);
     free(messages);
     history_free_all();
+
+    print_session_spend(session_prompt_tokens, session_gen_tokens);
+    /* Last thing on screen: what was broken while that answer was produced. */
+    basi_toolstat_report(stderr);
 
     /* --no-tools keeps stdout to the completion alone; no sign-off banner. */
     if (!no_tools) printf("\nGoodbye!\n");

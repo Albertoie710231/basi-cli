@@ -11,6 +11,7 @@ static const SlashCmd TABLE[] = {
     { "/help",        "this help",                              false },
     { "/model",       "switch model (picker or name)",          true  },
     { "/cookbook",    "download & manage models",               true  },
+    { "/mcp",         "MCP servers: status, tools, reconnect",  true  },
     { "/clear",       "drop conversation history",              false },
     { "/cost",        "show session token usage",               false },
     { "/save",        "export transcript as JSONL",             true  },

@@ -24,8 +24,18 @@ typedef struct {
     SrvToolCall *tool_calls;      /* array (malloc'd; NULL if none) */
     int          n_tool_calls;
     int          prompt_tokens;   /* from usage: the WHOLE prompt, INCLUDING the KV-cache-hit
-                                     prefix. This is context occupancy, NOT work done. */
+                                     prefix. This is context occupancy, NOT work done.
+                                     On a hosted API it is also exactly what you are
+                                     BILLED for on this turn (the full history is resent). */
     int          completion_tokens;
+    /* usage.prompt_tokens_details.cached_tokens — the part of prompt_tokens that hit
+       the provider's prompt cache, normally billed at a discount. 0 when absent.
+       A SUBSET of prompt_tokens, never additional to it. */
+    int          cached_tokens;
+    /* usage.completion_tokens_details.reasoning_tokens — thinking tokens. Already
+       counted inside completion_tokens (billed as output); carried only so a
+       reasoning model's hidden spend is visible rather than mysterious. */
+    int          reasoning_tokens;
     double       tps;             /* predicted (generation) tokens/sec from timings (0 if absent) */
     double       prompt_tps;      /* prompt (prefill) tokens/sec from timings (0 if absent/cached) */
     /* Prefill WORK, as opposed to prompt size. The server evaluates only the tokens
@@ -68,6 +78,71 @@ int srvchat_complete_n(int port, const char *messages_json, const char *tools_js
                        void *ud, SrvChatResult **out, int max_out);
 
 void srvchat_free(SrvChatResult *r);
+
+/* ── Remote (hosted) OpenAI-compatible endpoint ──────────────────────────────
+ * BASI's chat path is already plain /v1/chat/completions, so a hosted provider
+ * (Fireworks, OpenAI, OpenRouter, Together, Groq, DeepSeek…) is the SAME client
+ * pointed at a different base URL, with a bearer token and an explicit `model`.
+ *
+ * Once this is configured, every srvchat_complete/_n call goes to the remote and
+ * the `port` argument is ignored — main.c spawns no llama-server at all. The
+ * request body drops the llama-server-only extensions (cache_prompt,
+ * repeat_penalty/repeat_last_n, min_p, reasoning_budget, chat_template_kwargs):
+ * those are not in the OpenAI schema and hosted providers differ on whether an
+ * unknown field is ignored or 400s. Add provider-specific knobs (e.g. Fireworks'
+ * top_k) with BASI_API_EXTRA_JSON, which is merged into the body verbatim.
+ *
+ * base_url is the part BEFORE /chat/completions (e.g.
+ * "https://api.fireworks.ai/inference/v1"); a trailing '/' is trimmed. api_key
+ * may be NULL/empty for an unauthenticated endpoint. Returns 0 on success, -1 if
+ * base_url or model is missing/unusable.
+ *
+ * The key is never placed on a command line (that would expose it in `ps` to
+ * every user on the box) — it is passed to curl through a 0600 config file.
+ *
+ * NOTE: embeddings (srvchat_embed*) are unaffected and stay on the LOCAL
+ * llama-server embedder — the remote is the chat model only. */
+int srvchat_set_remote(const char *base_url, const char *api_key, const char *model);
+
+/* Nonzero once srvchat_set_remote() has succeeded. */
+int srvchat_remote_active(void);
+
+/* The configured remote model id, or NULL when running locally. Never the key. */
+const char *srvchat_remote_model(void);
+
+/* The configured remote base URL, or NULL when running locally. */
+const char *srvchat_remote_base(void);
+
+/* Ask the provider for the configured model's context window, over the
+ * OpenAI-standard GET <base>/models. Returns the length in tokens, or 0 when the
+ * endpoint is missing, the model is not listed, or no length is reported — the
+ * caller keeps its own default. One short request at startup, so the ctx meter
+ * and the compaction trigger budget against the real window instead of a guess
+ * (guessing LOW silently compacts what the provider would have accepted whole). */
+int srvchat_remote_context_length(void);
+
+/* One chat model a hosted endpoint offers, from its GET <base>/models listing. */
+typedef struct {
+    char *id;       /* the id to send as "model" (malloc'd) */
+    int   ctx;      /* context window in tokens; 0 = not reported */
+    int   tools;    /* 1 = function calling, 0 = none, -1 = not reported */
+    int   vision;   /* 1 = accepts images, 0 = does not, -1 = not reported */
+} SrvRemoteModel;
+
+/* List the CHAT models at an OpenAI-compatible endpoint (GET <base_url>/models),
+ * sorted by the last path segment of the id so a router sits beside its model.
+ * Embedding and reranker entries are dropped: Fireworks lists them with
+ * supports_chat=true (measured 2026-09-11), and choosing one fails on the first
+ * turn. Needs no srvchat_set_remote — the /model picker lists what it could switch
+ * TO. The key reaches curl through the same 0600 config file as every other
+ * request. Returns the count (*out malloc'd; free with srvchat_free_models), or -1
+ * when the listing could not be read. */
+int  srvchat_list_chat_models(const char *base_url, const char *api_key, SrvRemoteModel **out);
+void srvchat_free_models(SrvRemoteModel *models, int n);
+
+/* 1 once a request has been refused because the model cannot take images, so a
+ * caller can stop sending them and degrade instead of losing the turn. */
+int srvchat_vision_unsupported(void);
 
 /* POST one text to a llama-server /embedding endpoint (spawned with --embedding).
  * Writes up to max_dim floats of the pooled embedding into out and returns the

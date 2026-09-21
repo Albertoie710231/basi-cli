@@ -15,9 +15,37 @@ typedef struct {
     int   spec_draft_mtp;  /* 1 = launch llama-server with --spec-type draft-mtp (MTP models) */
     int   flash_attn;      /* 1 = -fa on */
     int   cpu_moe;         /* 1 = --cpu-moe (MoE: experts to RAM, attention to GPU) */
+    /* Name of the selected llama-server binary, or NULL when the BACKEND row was
+     * hidden (fewer than two declared) or untouched. Borrowed from the backend
+     * module's static list — not malloc'd, and outlives the caller. */
+    const char *backend;
+    /* Set instead of model_path when the choice was made on the hosted tab:
+     * api_model is the id to send (malloc'd, caller frees) and api_provider is
+     * borrowed from the PickerRemote the picker was given. */
+    char       *api_model;
+    const char *api_provider;
 } LaunchConfig;
 
-LaunchConfig pick_model(void);
+/* The picker's hosted tab, beside LOCAL. main.c fills it because it owns the
+ * provider table and the key lookup; model.c only lists and draws. */
+typedef struct {
+    const char *label;          /* tab title, e.g. "FIREWORKS AI" */
+    const char *provider;       /* provider name, handed back in LaunchConfig */
+    const char *base_url;       /* OpenAI-compatible base the list comes from */
+    const char *api_key;        /* NULL/"" → the tab says which variable to export */
+    const char *key_env;        /* that variable, for the message */
+    const char *current_model;  /* hosted id in use now, or NULL. Non-NULL opens the
+                                   picker on this tab with it selected. */
+} PickerRemote;
+
+/* remote may be NULL: no hosted tab, the local-only picker. */
+LaunchConfig pick_model(const PickerRemote *remote);
+
+/* Predicted VRAM in MB for `model_path` at ngl/ctx — the same figure the picker's
+ * MEMORY row shows (GGUF tensor walk + per-layer KV + overhead term). Returns <0 if
+ * the GGUF can't be read. Exposed so the launch path can hold the estimate up
+ * against what the GPU actually reports afterwards. ngl<0 means "all layers". */
+double basi_predict_vram_mb(const char *model_path, int ngl, int ctx);
 
 /* Scan the model search dirs for .gguf files. Fills *out with a malloc'd array
  * of malloc'd path strings (caller frees each, then the array) and returns the
@@ -38,6 +66,9 @@ typedef struct {
                              on a cache hit. Pair it with prompt_n, never prompt_tokens. */
     double prompt_tps;    /* server's prefill rate, over prompt_n */
     double gen_time_s;
+    size_t cached_tokens; /* subset of prompt_tokens served from the provider's prompt
+                             cache (hosted APIs bill these at a discount). 0 locally. */
+    size_t reasoning_tokens; /* thinking tokens, already inside gen_tokens. 0 locally. */
 } GenerateResult;
 
 /* Server-backed generation: when basi_srv_port>0, generate() delegates to a
@@ -62,6 +93,12 @@ extern int basi_srv_no_think;
    prompt token count (res.prompt_tokens) and fills tc_out/n_tc_out with the
    STRUCTURED tool calls (caller frees via basi_free_tool_calls). */
 struct BasiToolCall;
+/* Reasoning text from the most recent generate_chat call, or NULL if there was
+ * none. Borrowed, valid until the next call — do not free. Exists because a
+ * reasoning model emitting a tool call returns empty content, so `text` alone
+ * cannot tell you why the turn did what it did. */
+const char *basi_last_reasoning(void);
+
 GenerateResult generate_chat(const BasiMsg *messages, size_t msg_count,
                              struct BasiToolCall **tc_out, int *n_tc_out);
 

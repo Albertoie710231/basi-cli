@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 #include <strings.h>
 #include <math.h>
 #include <regex.h>
@@ -23,6 +24,7 @@
 #include "symbols.h"    /* execute_symbols */
 #include "chat_tmpl.h"  /* basi_set_tools / basi_tools_registered */
 #include "tooldefs.h"   /* basi_tool_defs — restore tool grammar after grounding */
+#include "patch.h"      /* patch_block_is_noop — the edit tool's no-op rule, reused */
 
 static void cli_progress(const char *arm, int run, int of, void *ud);
 
@@ -1492,6 +1494,32 @@ char *execute_study_write(const char *body) {
  * command's PREFIX, which means nothing if the command can chain a second one. */
 static const char *arm_forbidden_chars = ";&|`$><\n";
 
+/* `env VAR=1 /path/to/tool …` is the canonical way to make two arms differ, and
+ * the divergence guard explicitly recommends "a flag, an env var, or separate
+ * build outputs". Authorising on the literal `env` prefix would be wrong twice
+ * over: it rejects that advice when `env` is absent from allow_commands, and it
+ * authorises *any* program when `env` is present. So step over `env` and its
+ * VAR=VALUE assignments and authorise the real program instead. */
+static const char *arm_skip_env_prefix(const char *cmd) {
+    const char *p = cmd;
+    while (*p == ' ' || *p == '\t') p++;
+    /* An optional `env` keyword, then any number of NAME=VALUE assignments.
+     * Both `env VAR=1 prog` and the bare shell form `VAR=1 prog` occur in
+     * practice — the loop has emitted each — so accept either. */
+    if (strncmp(p, "env", 3) == 0 && (p[3] == ' ' || p[3] == '\t')) p += 3;
+    for (;;) {
+        while (*p == ' ' || *p == '\t') p++;
+        const char *t = p;
+        if (!(isalpha((unsigned char)*t) || *t == '_')) break;   /* not a NAME */
+        while (isalnum((unsigned char)*t) || *t == '_') t++;
+        if (*t != '=') break;                                    /* not an assignment */
+        p = t;
+        while (*p && *p != ' ' && *p != '\t') p++;               /* skip =VALUE */
+    }
+    while (*p == ' ' || *p == '\t') p++;
+    return *p ? p : cmd;
+}
+
 static bool arm_command_allowed(const char *cmd, const char *allow_csv, char *why, size_t whysz) {
     for (const char *c = cmd; *c; c++) {
         if (strchr(arm_forbidden_chars, *c)) {
@@ -1507,6 +1535,7 @@ static bool arm_command_allowed(const char *cmd, const char *allow_csv, char *wh
             "command can be authorised");
         return false;
     }
+    const char *prog = arm_skip_env_prefix(cmd);
     const char *p = allow_csv;
     while (*p) {
         while (*p == ' ' || *p == ',') p++;
@@ -1516,12 +1545,60 @@ static bool arm_command_allowed(const char *cmd, const char *allow_csv, char *wh
         while (n && (p[n-1] == ' ' || p[n-1] == '\t')) n--;
         /* The prefix must end on a word boundary, or `./bench.sh` would also
          * authorise `./bench.sh.evil` — a different program entirely. */
-        if (n && strncmp(cmd, p, n) == 0 &&
-            (cmd[n] == '\0' || cmd[n] == ' ' || cmd[n] == '\t')) return true;
+        if (n && strncmp(prog, p, n) == 0 &&
+            (prog[n] == '\0' || prog[n] == ' ' || prog[n] == '\t')) return true;
         p = e;
     }
     snprintf(why, whysz, "does not start with any prefix in allow_commands: %s", allow_csv);
     return false;
+}
+
+/* A well-formed study that names a file which is not on this machine is not a
+ * study: every run fails, the decision rule cannot fire, and the round is spent.
+ * Catch it at design time — where the loop can still retry with a legible
+ * reason — instead of at run time as five identical rc=1 failures.
+ *
+ * Deliberately narrow to keep false positives at zero: the program itself, and
+ * the operand of -m/--model. Output paths and yet-to-be-built artifacts are not
+ * checked, because those legitimately do not exist yet. */
+static bool arm_paths_exist(const char *cmd, char *why, size_t whysz) {
+    const char *prog = arm_skip_env_prefix(cmd);
+    char tok[1024];
+    const char *e = prog;
+    while (*e && *e != ' ' && *e != '\t') e++;
+    size_t n = (size_t)(e - prog);
+    if (n && n < sizeof(tok)) {
+        memcpy(tok, prog, n); tok[n] = '\0';
+        if (strchr(tok, '/') && access(tok, X_OK) != 0) {
+            snprintf(why, whysz, "the program '%.150s' does not exist on this machine", tok);
+            return false;
+        }
+    }
+    for (const char *p = e; *p; ) {
+        while (*p == ' ' || *p == '\t') p++;
+        if (!*p) break;
+        const char *t = p;
+        while (*t && *t != ' ' && *t != '\t') t++;
+        size_t tn = (size_t)(t - p);
+        bool is_m = (tn == 2 && strncmp(p, "-m", 2) == 0) ||
+                    (tn == 7 && strncmp(p, "--model", 7) == 0);
+        p = t;
+        if (!is_m) continue;
+        while (*p == ' ' || *p == '\t') p++;
+        const char *v = p;
+        while (*p && *p != ' ' && *p != '\t') p++;
+        size_t vn = (size_t)(p - v);
+        if (vn && vn < sizeof(tok)) {
+            memcpy(tok, v, vn); tok[vn] = '\0';
+            if (access(tok, R_OK) != 0) {
+                snprintf(why, whysz,
+                    "the model file '%.150s' does not exist on this machine; "
+                    "name a path that is actually present", tok);
+                return false;
+            }
+        }
+    }
+    return true;
 }
 
 /* Pull the artifact out of the model's reply.
@@ -2148,8 +2225,13 @@ static char *propose_artifact(const StudyLoopOpts *opts, const char *user_msg,
             if (r && r->reasoning && *r->reasoning)
                 snprintf(line, sizeof(line),
                     "loop: model produced %d tokens of reasoning but no answer (finish=%s); "
-                    "stopping. Try BASI_NO_THINK=1.\n",
-                    r->completion_tokens, r->finish_reason ? r->finish_reason : "?");
+                    "stopping. Try BASI_NO_THINK=1%s.\n",
+                    r->completion_tokens, r->finish_reason ? r->finish_reason : "?",
+                    srvchat_remote_active()
+                        ? " (on a hosted endpoint this sends reasoning_effort=none; if the "
+                          "provider ignores it, override with "
+                          "BASI_API_EXTRA_JSON='{\"reasoning_effort\":\"none\"}')"
+                        : "");
             else
                 snprintf(line, sizeof(line),
                     "loop: no response from llama-server on port %d; stopping.\n", opts->port);
@@ -2200,6 +2282,12 @@ static char *propose_artifact(const StudyLoopOpts *opts, const char *user_msg,
                     if (!arm_command_allowed(arms[i].command, allow, why, sizeof(why))) {
                         snprintf(line, sizeof(line),
                             "- arm '%s' is not authorised: %s\n  command: %s\n",
+                            arms[i].name, why, arms[i].command);
+                        sb_append_str(&gb, line);
+                        fputs(line, stderr);
+                    } else if (!arm_paths_exist(arms[i].command, why, sizeof(why))) {
+                        snprintf(line, sizeof(line),
+                            "- arm '%s' cannot run: %s\n  command: %s\n",
                             arms[i].name, why, arms[i].command);
                         sb_append_str(&gb, line);
                         fputs(line, stderr);
@@ -2286,6 +2374,15 @@ static bool summarize_study(const char *slug, TrajFinding *out) {
             if (out->other != 0.0)
                 out->effect_pct = (out->best - out->other) / out->other * 100.0;
         }
+    }
+
+    /* A parsable "substituted:" line is NOT evidence that anything ran: a study
+     * whose every run failed still prints "mean(B) = 0 < mean(A) = 0", which was
+     * being ranked as "no gain (0 vs 0)" — a confident negative from zero data.
+     * When the runner says it could not apply the rule, there is no measurement. */
+    if (strstr(c, "The rule was not applied")) {
+        out->measured   = false;
+        out->effect_pct = 0.0;
     }
 
     snprintf(out->verdict, sizeof(out->verdict), "%s",
@@ -2650,8 +2747,18 @@ static void study_rank_synthesis(StringBuf *log, TrajFinding *finds, int nfind) 
                  finds[i].p, finds[i].what, finds[i].slug);
         sb_append_str(log, rl);
     }
-    if (!shown)
-        sb_append_str(log, "Nothing beat the baseline. The measured negatives:\n\n");
+    if (!shown) {
+        /* "Nothing beat the baseline" claims an experiment happened. If not one
+         * arm produced a number, nothing was tested and saying otherwise turns a
+         * broken run into a fabricated negative result. */
+        int any_measured = 0;
+        for (int i = 0; i < nfind; i++) if (finds[i].measured) any_measured = 1;
+        sb_append_str(log, any_measured
+            ? "Nothing beat the baseline. The measured negatives:\n\n"
+            : "NOTHING WAS MEASURED — every study failed to produce a usable number,\n"
+              "so this is not a negative result, it is a broken run. Fix the commands\n"
+              "below and re-run before concluding anything:\n\n");
+    }
 
     /* Negative results are results. A knob that provably does nothing is worth
      * as much as one that works — it stops the next person retrying it — so
@@ -3289,7 +3396,8 @@ static double fac_median(double *v, int n) {
 
 /* Measure with theory `t` applied (or baseline if NULL): back up file, apply exact
  * SEARCH->REPLACE, run measure `warmup + repeat` times, restore.
- *   1=ok, 0=measure/extract failed, -1=SEARCH not found, -2=correctness failed.
+ *   1=ok, 0=measure/extract failed, -1=SEARCH not found, -2=correctness failed,
+ *   -3=no-op edit (SEARCH == REPLACE, so the file cannot change).
  *
  * Correctness (behavior-preservation, same principle as reuse_regress_guard):
  *   PREFERRED — `expect_re`: one regex that must match the measure output (stdout+stderr
@@ -3309,21 +3417,38 @@ static double fac_median(double *v, int n) {
  * caller discards `warmup` leading runs and ranks on the median of the rest. */
 static int factory_trial(const FactoryTheory *t, const char *measure, const regex_t *re,
                          int timeout_s, const char *verify, const regex_t *expect_re,
-                         int warmup, int repeat, double *out, double *spread_out) {
+                         int warmup, int repeat, double *out, double *spread_out,
+                         char **match_err) {
+    if (match_err) *match_err = NULL;
     if (repeat < 1) repeat = 1;
     if (repeat > FACTORY_MAX_REPEAT) repeat = FACTORY_MAX_REPEAT;
     char *orig = NULL; size_t ol = 0;
     if (t) {
+        /* A theory whose SEARCH and REPLACE are identical applies cleanly and
+         * leaves the file byte-for-byte unchanged, so the trial below would
+         * measure the UNEDITED code and report it as a real datum (+0.00%,
+         * "inside noise"). Same rule as the edit tool — one definition, in
+         * patch.c — rather than a second copy that can drift from it. */
+        if (patch_block_is_noop(t->search, t->replace)) return -3;
         orig = kb_read_file(t->file, &ol);
         if (!orig) return -1;
-        char *pos = strstr(orig, t->search);
-        if (!pos) { free(orig); return -1; }
+        /* Same matcher the edit tool uses (patch.c): exact substring, then a
+         * whitespace-insensitive line match with re-indentation — and it REFUSES
+         * an ambiguous SEARCH rather than patching the first of several identical
+         * sites, which the bare strstr here used to do silently. Its error string
+         * is model-facing and says what to fix, so hand it back to the caller. */
+        StringBuf cur; sb_init(&cur);
+        sb_append(&cur, orig, ol);
+        char *perr = patch_replace_one(&cur, t->search, t->replace, t->file, 0);
+        if (perr) {
+            if (match_err) *match_err = perr; else free(perr);
+            sb_free(&cur); free(orig); return -1;
+        }
         FILE *f = fopen(t->file, "w");
-        if (!f) { free(orig); return 0; }
-        fwrite(orig, 1, (size_t)(pos - orig), f);
-        fwrite(t->replace, 1, strlen(t->replace), f);
-        fputs(pos + strlen(t->search), f);
+        if (!f) { sb_free(&cur); free(orig); return 0; }
+        fwrite(cur.data, 1, cur.len, f);
         fclose(f);
+        sb_free(&cur);
 
         /* Legacy two-run path: only when --expect is not in use. */
         if (!expect_re && verify && *verify) {
@@ -3362,8 +3487,68 @@ static int factory_trial(const FactoryTheory *t, const char *measure, const rege
 }
 
 typedef struct { int idx, ok, rc, noise; double val; } FacRank;
-static int fac_cmp_hi(const void *a, const void *b) { double x=((const FacRank*)a)->val,y=((const FacRank*)b)->val; return (x<y)-(x>y); }
-static int fac_cmp_lo(const void *a, const void *b) { double x=((const FacRank*)a)->val,y=((const FacRank*)b)->val; return (x>y)-(x<y); }
+/* A trial that never produced a measurement keeps val==0, and under --minimize 0
+ * beats every real metric — so ordering on val alone floats REJECTED / NO-OP /
+ * SEARCH-not-found entries above the theories that actually ran. Measured trials
+ * sort first; the rest keep their relative order below them. */
+static int fac_cmp_hi(const void *a, const void *b) {
+    const FacRank *p = a, *q = b;
+    if (p->ok != q->ok) return q->ok - p->ok;
+    double x = p->val, y = q->val; return (x<y)-(x>y);
+}
+static int fac_cmp_lo(const void *a, const void *b) {
+    const FacRank *p = a, *q = b;
+    if (p->ok != q->ok) return q->ok - p->ok;
+    double x = p->val, y = q->val; return (x>y)-(x<y);
+}
+
+/* ── Recording what the model actually EMITTED ────────────────────────────────
+ * The outcome of a trial is not enough to debug it. Two questions came up in one
+ * session and neither could be answered: "did those four +0.00% theories change
+ * the file at all, or change it to no effect?" and "why did the one correct
+ * theory fail to build?" Both live in the SEARCH/REPLACE text, which existed only
+ * inside the run. Every theory is written out BEFORE any trial runs, so a crash
+ * mid-run still leaves the evidence. Same home as a study artifact; best-effort,
+ * a failure here never blocks a run. */
+static FILE *factory_record_open(const char *question, const char *measure, int rounds) {
+    if (mkdir_p(KB_STUDIES_DIR) != 0) return NULL;
+    char path[512];
+    snprintf(path, sizeof(path), "%s/factory-%d.md", KB_STUDIES_DIR, (int)getpid());
+    FILE *f = fopen(path, "w");
+    if (!f) return NULL;
+    fprintf(f, "# factory run\n\n- question: %s\n- measure: %s\n- rounds: %d\n",
+            question ? question : "", measure ? measure : "", rounds);
+    fflush(f);
+    fprintf(stderr, "factory: patches recorded in %s\n", path);
+    return f;
+}
+
+static void factory_record_theories(FILE *f, int round, const FactoryTheory *th, int nth) {
+    if (!f) return;
+    fprintf(f, "\n# round %d (%d theories)\n", round, nth);
+    for (int i = 0; i < nth; i++)
+        fprintf(f, "\n## R%dT%d\n\n- desc: %s\n- file: %s\n\n@@SEARCH@@\n%s\n@@REPLACE@@\n%s\n@@END@@\n",
+                round, i + 1, th[i].desc ? th[i].desc : "", th[i].file ? th[i].file : "",
+                th[i].search ? th[i].search : "", th[i].replace ? th[i].replace : "");
+    fflush(f);
+}
+
+/* Enough of a failing patch to diagnose it inline; the record file has it whole. */
+static void fac_print_excerpt(const char *label, const char *s) {
+    enum { CAP = 600 };
+    if (!s) { printf("     %s: (none)\n", label); return; }
+    size_t n = strlen(s);
+    printf("     %s:\n%.*s%s\n", label, (int)(n > CAP ? CAP : n), s, n > CAP ? "\n     [...truncated, see record]" : "");
+}
+
+/* One trial's outcome, kept across ROUNDS. A single round is one sample of a
+ * high-variance generator: measured on one fixed question, five identical runs
+ * gave best-metrics of 1617, 76, 333, 1608, 573 — two of them found nothing.
+ * Reporting one round's top row as "the answer" hides that; accumulating rounds
+ * and ranking the pool is what turns a coin flip into a result. */
+typedef struct { char *desc, *file; double val; int rc, ok, noise, round; } FacResult;
+#define FACTORY_MAX_RESULTS  96
+#define FACTORY_MAX_ROUNDS   25
 
 #define FACTORY_MAX_THEORIES 12
 #define FACTORY_MAX_FILES     8
@@ -3544,6 +3729,7 @@ static char *factory_retrieve_big(const char *path, const char *question, size_t
 
 int cmd_factory(int argc, char **argv) {
     const char *question = NULL, *measure = NULL, *extract = "([0-9]+\\.[0-9]+)", *verify = NULL;
+    int rounds = 1;
     const char *expect = NULL;
     int port = 8181, timeout_s = 1800, maxth = 6, repeat = 1; bool minimize = false;
     const char *files[FACTORY_MAX_FILES]; int nfiles = 0;
@@ -3556,6 +3742,7 @@ int cmd_factory(int argc, char **argv) {
         else if (!strcmp(argv[i], "--extract")  && i+1 < argc) extract  = argv[++i];
         else if (!strcmp(argv[i], "--theories") && i+1 < argc) maxth    = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--repeat")   && i+1 < argc) repeat   = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--rounds")   && i+1 < argc) rounds   = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--timeout")  && i+1 < argc) timeout_s= atoi(argv[++i]);
         else if (!strcmp(argv[i], "--port")     && i+1 < argc) port     = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--file")     && i+1 < argc) {
@@ -3597,11 +3784,15 @@ int cmd_factory(int argc, char **argv) {
     if (maxth < 1) maxth = 1;
     if (maxth > FACTORY_MAX_THEORIES) maxth = FACTORY_MAX_THEORIES;
 
-    char hc[192]; snprintf(hc, sizeof(hc), "curl -sf -o /dev/null http://127.0.0.1:%d/health", port);
-    if (system(hc) != 0) { fprintf(stderr, "factory: no healthy llama-server on :%d (the theory step needs one).\n", port); return 1; }
+    if (!srvchat_remote_active()) {
+        char hc[192]; snprintf(hc, sizeof(hc), "curl -sf -o /dev/null http://127.0.0.1:%d/health", port);
+        if (system(hc) != 0) { fprintf(stderr, "factory: no healthy llama-server on :%d (the theory step needs one).\n", port); return 1; }
+    }
     if (repeat < 1) repeat = 1;
     if (repeat > FACTORY_MAX_REPEAT) repeat = FACTORY_MAX_REPEAT;
     regex_t re;
+    if (rounds < 1) rounds = 1;
+    if (rounds > FACTORY_MAX_ROUNDS) rounds = FACTORY_MAX_ROUNDS;
     if (regcomp(&re, extract, REG_EXTENDED | REG_NEWLINE) != 0) { fprintf(stderr, "factory: --extract regex does not compile\n"); return 2; }
     regex_t expect_re_storage, *expect_re = NULL;
     if (expect && *expect) {
@@ -3652,18 +3843,9 @@ int cmd_factory(int argc, char **argv) {
     fprintf(stderr, "factory: generating theories...%s\n",
             nfiles ? (retrieved ? " (source injected; large files ranked-retrieved)" : " (source injected)") : "");
     StringBuf log; sb_init(&log);
-    char *th_txt = study_react_brief(port, FACTORY_THEORY_PROMPT,
-        "Optimization question — find code changes that improve the metric:\n\n",
-        ctx_s, "theory", 20 /*deeper investigation than a grounding brief*/,
-        nfiles > 0 /*pre_grounded when source is injected*/, &log);
-    free(ctx_s);
-    if (!th_txt) { fprintf(stderr, "factory: theory step produced nothing.\n"); regfree(&re); if (expect_re) regfree(expect_re); sb_free(&log); return 1; }
-    FactoryTheory th[FACTORY_MAX_THEORIES];
-    int nth = factory_parse(th_txt, th, maxth);
-    if (nth == 0) { fprintf(stderr, "factory: no parseable @@THEORY@@ blocks:\n%s\n", th_txt); free(th_txt); regfree(&re); if (expect_re) regfree(expect_re); sb_free(&log); return 1; }
-    printf("factory: %d theories\n", nth);
-    for (int i = 0; i < nth; i++) printf("  T%d: %s\n", i+1, th[i].desc ? th[i].desc : "(no desc)");
-
+    /* Baseline BEFORE any theory generation: it validates the measure command and
+     * the --expect oracle on the pristine tree, and a broken oracle should cost
+     * nothing to discover. Theory generation is the expensive step. */
     printf("-- measuring baseline (1 warm-up + %d scored run%s) --\n", repeat, repeat == 1 ? "" : "s");
     fflush(stdout);
     double base = 0, band = 0;
@@ -3676,17 +3858,15 @@ int cmd_factory(int argc, char **argv) {
      * invocation (not one per theory) and it is what removes the cold-first-run bias. Only
      * the noise band is given up at --repeat 1. */
     int brc = factory_trial(NULL, measure, &re, timeout_s, NULL, expect_re,
-                            1 /*warmup*/, repeat, &base, &band);
+                            1 /*warmup*/, repeat, &base, &band, NULL);
     if (brc == -2) {
         fprintf(stderr, "factory: --expect regex did not match the UNEDITED baseline measure output.\n"
                         "  The measure cmd must emit the correctness token even before any edit.\n");
-        for (int i=0;i<nth;i++) fac_free(&th[i]);
-        free(th_txt); regfree(&re); if (expect_re) regfree(expect_re); sb_free(&log); return 1;
+        free(ctx_s); regfree(&re); if (expect_re) regfree(expect_re); sb_free(&log); return 1;
     }
     if (brc != 1) {
         fprintf(stderr, "factory: baseline measure produced no number matching the extract regex.\n");
-        for (int i=0;i<nth;i++) { fac_free(&th[i]); }
-        free(th_txt); regfree(&re); if (expect_re) regfree(expect_re); sb_free(&log); return 1;
+        free(ctx_s); regfree(&re); if (expect_re) regfree(expect_re); sb_free(&log); return 1;
     }
     printf("  baseline = %g  (median of %d)\n", base, repeat);
     if (repeat > 1) {
@@ -3713,47 +3893,141 @@ int cmd_factory(int argc, char **argv) {
         if (vec != 0) {
             fprintf(stderr, "factory: --verify must pass on the UNEDITED baseline, but it exited %d.\n"
                             "  It is the correctness oracle; fix it so it succeeds before any edit.\n", vec);
-            for (int i=0;i<nth;i++) fac_free(&th[i]);
-            free(th_txt); regfree(&re); sb_free(&log); return 1;
+            free(ctx_s); regfree(&re); sb_free(&log); return 1;
         }
         printf("  --verify passes on baseline; theories that break correctness will be rejected\n");
     }
 
-    FacRank rank[FACTORY_MAX_THEORIES];
+    FILE *rec = factory_record_open(question, measure, rounds);
     const char *vcmd = expect_re ? NULL : verify;   /* trials: expect folds verify away */
-    for (int i = 0; i < nth; i++) {
-        printf("-- T%d/%d --\n", i+1, nth); fflush(stdout);
-        /* No warm-up for a theory: the process is already warm by now, and a warm-up here
-         * would only re-introduce the asymmetry the baseline warm-up exists to remove. */
-        double v = 0; int rc = factory_trial(&th[i], measure, &re, timeout_s, vcmd, expect_re, 0, repeat, &v, NULL);
-        rank[i].idx = i; rank[i].ok = (rc == 1); rank[i].rc = rc; rank[i].val = v;
-        rank[i].noise = (rc == 1 && fabs(v - base) <= band);
-        if (rc == 1) printf("  T%d  metric=%g  (%+.2f%% vs %g)%s  ::  %s\n", i+1, v,
-                            base!=0?(v-base)/base*100:0, base,
-                            rank[i].noise ? "  [INSIDE NOISE]" : "", th[i].desc?th[i].desc:"");
-        else if (rc == -2) printf("  T%d  REJECTED -- edit changes behavior  ::  %s\n", i+1, th[i].desc?th[i].desc:"");
-        else if (rc == -1) printf("  T%d  SEARCH not found -- could not apply  ::  %s\n", i+1, th[i].desc?th[i].desc:"");
-        else printf("  T%d  measure failed  ::  %s\n", i+1, th[i].desc?th[i].desc:"");
+    FacResult res[FACTORY_MAX_RESULTS];
+    int nres = 0;
+    double round_best[FACTORY_MAX_ROUNDS];
+    int nrb = 0;
+
+    for (int r = 1; r <= rounds; r++) {
+        if (rounds > 1) { printf("\n======== ROUND %d/%d ========\n", r, rounds); fflush(stdout); }
+        /* Each round re-asks the SAME question with the same injected source. The
+         * point is not to refine a previous answer (nothing is fed back) but to
+         * sample the generator more than once, because one sample is not a result. */
+        char *th_txt = study_react_brief(port, FACTORY_THEORY_PROMPT,
+            "Optimization question — find code changes that improve the metric:\n\n",
+            ctx_s, "theory", 20 /*deeper investigation than a grounding brief*/,
+            nfiles > 0 /*pre_grounded when source is injected*/, &log);
+        if (!th_txt) {
+            fprintf(stderr, "factory: round %d theory step produced nothing.\n", r);
+            if (nrb < FACTORY_MAX_ROUNDS) round_best[nrb++] = NAN;
+            continue;
+        }
+        FactoryTheory th[FACTORY_MAX_THEORIES];
+        int nth = factory_parse(th_txt, th, maxth);
+        if (nth == 0) {
+            fprintf(stderr, "factory: round %d produced no parseable @@THEORY@@ blocks.\n", r);
+            free(th_txt);
+            if (nrb < FACTORY_MAX_ROUNDS) round_best[nrb++] = NAN;
+            continue;
+        }
+        printf("factory: %d theories\n", nth);
+        for (int i = 0; i < nth; i++) printf("  T%d: %s\n", i+1, th[i].desc ? th[i].desc : "(no desc)");
+        factory_record_theories(rec, r, th, nth);
+
+        double best_this = 0; bool have_best = false;
+        for (int i = 0; i < nth; i++) {
+            printf("-- T%d/%d --\n", i+1, nth); fflush(stdout);
+            /* No warm-up for a theory: the process is already warm by now, and a warm-up here
+             * would only re-introduce the asymmetry the baseline warm-up exists to remove. */
+            double v = 0; char *merr = NULL;
+            int rc = factory_trial(&th[i], measure, &re, timeout_s, vcmd, expect_re, 0, repeat, &v, NULL, &merr);
+            bool noise = (rc == 1 && fabs(v - base) <= band);
+            if (rc == 1) printf("  T%d  metric=%g  (%+.2f%% vs %g)%s  ::  %s\n", i+1, v,
+                                base!=0?(v-base)/base*100:0, base,
+                                noise ? "  [INSIDE NOISE]" : "", th[i].desc?th[i].desc:"");
+            else if (rc == -2) printf("  T%d  REJECTED -- edit changes behavior  ::  %s\n", i+1, th[i].desc?th[i].desc:"");
+            else if (rc == -1) printf("  T%d  could not apply -- %s  ::  %s\n", i+1,
+                                      merr ? merr : "SEARCH not found", th[i].desc?th[i].desc:"");
+            else if (rc == -3) printf("  T%d  NO-OP -- SEARCH and REPLACE are identical, the file cannot change  ::  %s\n", i+1, th[i].desc?th[i].desc:"");
+            else printf("  T%d  measure failed  ::  %s\n", i+1, th[i].desc?th[i].desc:"");
+            /* A failed trial is where the patch text is worth reading: it is the only
+             * thing that distinguishes a bad edit from a bad measure command. */
+            if (rc != 1) {
+                printf("     file: %s\n", th[i].file ? th[i].file : "(none)");
+                fac_print_excerpt("SEARCH", th[i].search);
+                fac_print_excerpt("REPLACE", th[i].replace);
+            }
+            if (rec) { fprintf(rec, "\n### R%dT%d outcome: rc=%d metric=%g%s%s\n", r, i+1, rc, v, merr?" err=":"", merr?merr:""); fflush(rec); }
+            free(merr);
+
+            if (nres < FACTORY_MAX_RESULTS) {
+                res[nres].desc  = th[i].desc ? strdup(th[i].desc) : NULL;
+                res[nres].file  = th[i].file ? strdup(th[i].file) : NULL;
+                res[nres].val   = v;
+                res[nres].rc    = rc;
+                res[nres].ok    = (rc == 1);
+                res[nres].noise = noise;
+                res[nres].round = r;
+                nres++;
+            } else if (nres == FACTORY_MAX_RESULTS) {
+                fprintf(stderr, "factory: result pool full at %d; later trials are measured but not ranked.\n",
+                        FACTORY_MAX_RESULTS);
+                nres++;   /* warn once */
+            }
+            if (rc == 1 && (!have_best || (minimize ? v < best_this : v > best_this))) { best_this = v; have_best = true; }
+        }
+        if (nrb < FACTORY_MAX_ROUNDS) round_best[nrb++] = have_best ? best_this : NAN;
+        for (int i = 0; i < nth; i++) fac_free(&th[i]);
+        free(th_txt);
+    }
+    if (rec) fclose(rec);
+    free(ctx_s);
+
+    if (nres > FACTORY_MAX_RESULTS) nres = FACTORY_MAX_RESULTS;
+    if (nres == 0) {
+        fprintf(stderr, "factory: no theory was measured in any round.\n");
+        regfree(&re); if (expect_re) regfree(expect_re); sb_free(&log);
+        return 1;
     }
 
-    qsort(rank, (size_t)nth, sizeof(rank[0]), minimize ? fac_cmp_lo : fac_cmp_hi);
-    printf("\n==== CONCLUSION (baseline %g, noise band %g; %s is better) ====\n",
-           base, band, minimize ? "lower" : "higher");
+    FacRank rank[FACTORY_MAX_RESULTS];
+    for (int i = 0; i < nres; i++) {
+        rank[i].idx = i; rank[i].ok = res[i].ok; rank[i].rc = res[i].rc;
+        rank[i].val = res[i].val; rank[i].noise = res[i].noise;
+    }
+    qsort(rank, (size_t)nres, sizeof(rank[0]), minimize ? fac_cmp_lo : fac_cmp_hi);
+    printf("\n==== CONCLUSION (baseline %g, noise band %g; %s is better; %d trial%s over %d round%s) ====\n",
+           base, band, minimize ? "lower" : "higher",
+           nres, nres == 1 ? "" : "s", rounds, rounds == 1 ? "" : "s");
     int nwin = 0;
-    for (int i = 0; i < nth; i++) {
+    for (int i = 0; i < nres; i++) {
         int k = rank[i].idx;
         double d = base != 0 ? (rank[i].val - base) / base * 100 : 0;
-        if (rank[i].ok && rank[i].noise) printf("  (inside noise)  metric=%g  %+.2f%%  ::  %s\n", rank[i].val, d, th[k].desc?th[k].desc:"");
-        else if (rank[i].ok)             { printf("  %+.2f%%  metric=%g  ::  %s\n", d, rank[i].val, th[k].desc?th[k].desc:"");
+        const char *ds = res[k].desc ? res[k].desc : "";
+        if (rank[i].ok && rank[i].noise) printf("  (inside noise)  metric=%g  %+.2f%%  [r%d]  ::  %s\n", rank[i].val, d, res[k].round, ds);
+        else if (rank[i].ok)             { printf("  %+.2f%%  metric=%g  [r%d]  ::  %s\n", d, rank[i].val, res[k].round, ds);
                                            if (minimize ? (rank[i].val < base) : (rank[i].val > base)) nwin++; }
-        else if (rank[i].rc == -2)       printf("  (rejected: changes behavior)  ::  %s\n", th[k].desc?th[k].desc:"");
-        else                             printf("  (n/a)  ::  %s\n", th[k].desc?th[k].desc:"");
+        else if (rank[i].rc == -2)       printf("  (rejected: changes behavior)  [r%d]  ::  %s\n", res[k].round, ds);
+        else if (rank[i].rc == -3)       printf("  (no-op: edit changes nothing)  [r%d]  ::  %s\n", res[k].round, ds);
+        else                             printf("  (n/a)  [r%d]  ::  %s\n", res[k].round, ds);
     }
     if (nwin == 0)
         printf("\nNo theory beat the noise band. The honest answer is NO WIN, not the top row.\n");
 
-    for (int i = 0; i < nth; i++) fac_free(&th[i]);
-    free(th_txt); regfree(&re); if (expect_re) regfree(expect_re); sb_free(&log);
+    /* The spread across rounds IS the result's reliability. Printing only the best
+     * row would present one lucky sample as the answer. */
+    if (rounds > 1) {
+        int barren = 0;
+        printf("\n-- per-round best (one round is ONE sample of a high-variance generator) --\n");
+        for (int i = 0; i < nrb; i++) {
+            if (round_best[i] != round_best[i]) { printf("  round %d: no gated result\n", i+1); barren++; }
+            else printf("  round %d: metric=%g  (%+.2f%%)\n", i+1, round_best[i],
+                        base != 0 ? (round_best[i] - base) / base * 100 : 0);
+        }
+        if (barren)
+            printf("  %d of %d rounds found nothing that passed the gate -- a single run would have\n"
+                   "  reported that as the whole answer.\n", barren, nrb);
+    }
+
+    for (int i = 0; i < nres; i++) { free(res[i].desc); free(res[i].file); }
+    regfree(&re); if (expect_re) regfree(expect_re); sb_free(&log);
     return 0;
 }
 
@@ -3818,15 +4092,17 @@ int cmd_study(int argc, char **argv) {
             fprintf(stderr, "study loop: --max-rounds must be 0..1000 (0 = until STOP)\n");
             return 2;
         }
-        char hc[192];
-        snprintf(hc, sizeof(hc),
-                 "curl -sf -o /dev/null http://127.0.0.1:%d/health", o.port);
-        if (system(hc) != 0) {
-            fprintf(stderr,
-                "study loop: no healthy llama-server on 127.0.0.1:%d.\n"
-                "The loop needs one to propose hypotheses; start it, or pass --port.\n",
-                o.port);
-            return 1;
+        if (!srvchat_remote_active()) {
+            char hc[192];
+            snprintf(hc, sizeof(hc),
+                     "curl -sf -o /dev/null http://127.0.0.1:%d/health", o.port);
+            if (system(hc) != 0) {
+                fprintf(stderr,
+                    "study loop: no healthy llama-server on 127.0.0.1:%d.\n"
+                    "The loop needs one to propose hypotheses; start it, or pass --port.\n",
+                    o.port);
+                return 1;
+            }
         }
         char *rep = study_loop(argv[1], &o);
         fputs(rep, stdout);
