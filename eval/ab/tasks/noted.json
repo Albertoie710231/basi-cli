@@ -1,0 +1,54 @@
+{
+ "name": "noted",
+ "source": ".basi/plans/note-cli.md (2026-05-01 manager/worker experiment); worker prompt format from session 20260501-214746.jsonl",
+ "setup": "python3 -m venv .venv",
+ "env": {
+  "HOME": "{box}/.home",
+  "PATH": "{box}/.venv/bin:$PATH",
+  "VIRTUAL_ENV": "{box}/.venv"
+ },
+ "stop_on_fail": true,
+ "timeout": 600,
+ "steps": [
+  {
+   "id": "1.1",
+   "prompt": "You are a worker. Execute the task with read/edit/bash, then run the verify clause and report PASS or FAIL. TASK: Create noted/__init__.py (empty file), noted/store.py (empty for now), and pyproject.toml declaring package noted, requires-python = \">=3.11\", no runtime deps, and entry point noted = \"noted.cli:main\" (the cli module is created in phase 2 — declare the entry point now). VERIFY: test -f noted/__init__.py && test -f noted/store.py && test -f pyproject.toml",
+   "check": "test -f noted/__init__.py && test -f noted/store.py && test -f pyproject.toml"
+  },
+  {
+   "id": "1.2",
+   "prompt": "You are a worker. Execute the task with read/edit/bash, then run the verify clause and report PASS or FAIL. TASK: In noted/store.py, add import os, json and from datetime import datetime. Define _storage_path() -> str returning os.path.expanduser(\"~/.noted/notes.json\") (use os.path.expanduser literally — not pathlib.Path.home()). Define _load() -> list[dict] which creates the parent directory via os.makedirs(os.path.dirname(_storage_path()), exist_ok=True), returns [] if the file is missing or has size 0, otherwise returns json.load(open(path)). VERIFY: python -c \"from noted.store import _storage_path, _load; print(_storage_path()); print(_load())\"",
+   "check": "python -c \"from noted.store import _storage_path, _load; print(_storage_path()); print(_load())\""
+  },
+  {
+   "id": "1.3",
+   "prompt": "You are a worker. Execute the task with read/edit/bash, then run the verify clause and report PASS or FAIL. TASK: In noted/store.py, append: _save(notes: list[dict]) -> None writes json.dump(notes, fp, indent=2) to _storage_path(). add_note(body: str, tags: list[str]) -> dict assigns id = max((n[\"id\"] for n in existing), default=0) + 1, sets created_at = datetime.now().isoformat(), appends to the loaded list, saves, returns the new note dict. list_notes() -> list[dict] returns _load(). get_note(note_id: int) -> dict | None returns the matching note or None. delete_note(note_id: int) -> bool removes the matching note, saves, returns True if found, else False. Do not modify functions defined in 1.2. VERIFY: python -c \"from noted import store; n = store.add_note('hello', ['x']); assert store.get_note(n['id']) == n; assert store.delete_note(n['id'])\"",
+   "check": "python -c \"from noted import store; n = store.add_note('hello', ['x']); assert store.get_note(n['id']) == n; assert store.delete_note(n['id'])\""
+  },
+  {
+   "id": "1.4",
+   "prompt": "You are a worker. Execute the task with read/edit/bash, then run the verify clause and report PASS or FAIL. TASK: No new code. Run a smoke test that adds 3 notes, lists them, deletes all 3, and verifies the list is empty. VERIFY: rm -f ~/.noted/notes.json && python -c \"from noted import store; [store.add_note(f'n{i}', []) for i in range(3)]; ids=[n['id'] for n in store.list_notes()]; assert len(ids)==3; [store.delete_note(i) for i in ids]; assert store.list_notes()==[]\"",
+   "check": "rm -f ~/.noted/notes.json && python -c \"from noted import store; [store.add_note(f'n{i}', []) for i in range(3)]; ids=[n['id'] for n in store.list_notes()]; assert len(ids)==3; [store.delete_note(i) for i in ids]; assert store.list_notes()==[]\""
+  },
+  {
+   "id": "2.1",
+   "prompt": "You are a worker. Execute the task with read/edit/bash, then run the verify clause and report PASS or FAIL. TASK: Create noted/cli.py. Add import argparse, json, sys and from noted import store. Define main(): build argparse.ArgumentParser, call subparsers = p.add_subparsers(dest=\"cmd\", required=True). Register four subcommands — add (positional body, optional repeatable --tag declared with action=\"append\" so it collects into a list), list (no args), show (positional id typed as int), delete (positional id typed as int). Each subparser does set_defaults(func=cmd_<name>). main() ends with args = p.parse_args(); args.func(args). Define empty stub handlers cmd_add, cmd_list, cmd_show, cmd_delete that take args and pass. VERIFY: pip install -e . >/dev/null 2>&1 && noted --help | grep -qE '\\badd\\b' && noted --help | grep -qE '\\blist\\b'",
+   "check": "pip install -e . >/dev/null 2>&1 && noted --help | grep -qE '\\badd\\b' && noted --help | grep -qE '\\blist\\b'"
+  },
+  {
+   "id": "2.2",
+   "prompt": "You are a worker. Execute the task with read/edit/bash, then run the verify clause and report PASS or FAIL. TASK: In noted/cli.py, replace the stub bodies. cmd_add(args): n = store.add_note(args.body, args.tag or []); print(f\"added note {n['id']}\"). cmd_list(args): for each n in store.list_notes() print f\"{n['id']:>3}  {n['body'][:60]}  [{','.join(n['tags'])}]\". cmd_show(args): n = store.get_note(args.id); if n is None write f\"note {args.id} not found\" to sys.stderr and sys.exit(1), else print(json.dumps(n, indent=2)). cmd_delete(args): if store.delete_note(args.id) print f\"deleted note {args.id}\", else write error to stderr and sys.exit(1). Do not change main() or the parser. VERIFY: rm -f ~/.noted/notes.json && noted add 'first note' --tag a --tag b && noted list | grep -q 'first note' && nid=$(noted list | head -1 | awk '{print $1}') && noted show $nid | grep -q '\"body\": \"first note\"' && noted delete $nid && [ -z \"$(noted list)\" ]",
+   "check": "rm -f ~/.noted/notes.json && noted add 'first note' --tag a --tag b && noted list | grep -q 'first note' && nid=$(noted list | head -1 | awk '{print $1}') && noted show $nid | grep -q '\"body\": \"first note\"' && noted delete $nid && [ -z \"$(noted list)\" ]"
+  },
+  {
+   "id": "3.1",
+   "prompt": "You are a worker. Execute the task with read/edit/bash, then run the verify clause and report PASS or FAIL. TASK: In noted/store.py, append two functions at the end of the file. search_notes(query: str) -> list[dict] returns the list of notes whose body contains query case-insensitively (compare via query.lower() in n[\"body\"].lower()). add_tag(note_id: int, tag: str) -> bool loads notes, finds the matching note, appends tag to its tags list only if not already in the list, saves, returns True on found, False otherwise. Do not modify any existing function. VERIFY: rm -f ~/.noted/notes.json && python -c \"from noted import store; n = store.add_note('hello world', []); ns = store.search_notes('WORLD'); assert len(ns)==1; assert store.add_tag(ns[0]['id'], 'greeting'); assert 'greeting' in store.get_note(ns[0]['id'])['tags']\"",
+   "check": "rm -f ~/.noted/notes.json && python -c \"from noted import store; n = store.add_note('hello world', []); ns = store.search_notes('WORLD'); assert len(ns)==1; assert store.add_tag(ns[0]['id'], 'greeting'); assert 'greeting' in store.get_note(ns[0]['id'])['tags']\""
+  },
+  {
+   "id": "3.2",
+   "prompt": "You are a worker. Execute the task with read/edit/bash, then run the verify clause and report PASS or FAIL. TASK: In noted/cli.py, inside the existing main() function, register two more subcommands alongside the existing four — search (positional query) with set_defaults(func=cmd_search), tag (positional id typed as int, positional tag) with set_defaults(func=cmd_tag). Add cmd_search(args): print each match from store.search_notes(args.query) using the same one-line format as cmd_list. Add cmd_tag(args): if store.add_tag(args.id, args.tag) print f\"tagged note {args.id} with {args.tag}\", else write error to stderr and sys.exit(1). Do not modify the existing four handlers. VERIFY: rm -f ~/.noted/notes.json && noted add 'find me' && nid=$(noted list | head -1 | awk '{print $1}') && noted search 'FIND' | grep -q 'find me' && noted tag $nid important && noted show $nid | grep -q 'important'",
+   "check": "rm -f ~/.noted/notes.json && noted add 'find me' && nid=$(noted list | head -1 | awk '{print $1}') && noted search 'FIND' | grep -q 'find me' && noted tag $nid important && noted show $nid | grep -q 'important'"
+  }
+ ]
+}

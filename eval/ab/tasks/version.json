@@ -1,0 +1,15 @@
+{
+ "name": "version",
+ "source": "16 sessions on 2026-05-01 (e.g. 20260501-184128.jsonl); all failed on the old model",
+ "prepare": "git -C {repo} archive HEAD src Makefile | tar -x -C {cache} && make -C {cache} -j16",
+ "setup": "cp -a {cache}/. .",
+ "stop_on_fail": true,
+ "timeout": 900,
+ "steps": [
+  {
+   "id": "1",
+   "prompt": "Add a /version slash command to BASI-CLI that prints \"BASI-CLI v0.1\" in dim grey (same colour as /cost), shows up in the /help listing, takes no arguments. Plan it before implementing.",
+   "check": "make -j16 >/dev/null 2>&1 || { echo BUILD_FAILED; exit 1; }\nout=$(printf '/version\\n/help\\n' | HOME=$(mktemp -d) BASI_TELEMETRY=0 timeout 120 ./basi-cli --no-mcp 2>&1)\nprintf '%s\\n' \"$out\" > check-output.txt\nprintf '%s\\n' \"$out\" | grep -a 'BASI-CLI v0\\.1' | grep -qa $'\\e\\[90m' || { echo NO_DIM_GREY_VERSION_LINE; exit 1; }\nprintf '%s\\n' \"$out\" | grep -qaE '^\\s+/version\\b' || { echo NOT_IN_HELP; exit 1; }\necho PASS"
+  }
+ ]
+}
