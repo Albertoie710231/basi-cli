@@ -16,6 +16,9 @@
  * tokens, speed, and per-tool call/failure COUNTS. What it never holds: the
  * prompt, the answer, tool arguments or tool output.
  *
+ * BASI_TELEMETRY_TAG=<label> is copied into every record as "tag", so the runs of
+ * an experiment (e.g. A = no context, B = with notes) can be told apart later.
+ *
  * Off switch, strongest first:
  *   BASI_TELEMETRY=0|off        this run only
  *   basi-cli telemetry off      persisted in ~/.config/basi-cli/telemetry
@@ -26,6 +29,10 @@ bool telemetry_enabled(void);
 /* Who is answering, set once the backend is resolved. `backend` is "local" or
  * the remote base URL; `mode` is "repl" or "oneshot". Copied. */
 void telemetry_set_context(const char *backend, const char *model, const char *mode);
+
+/* The chat log these turns are appended to (interactive sessions only; -p runs
+ * have none), so a record can be traced back to its conversation. Copied. */
+void telemetry_set_session(const char *session_path);
 
 /* Bracket one agent turn. end writes the record (no-op when disabled). */
 void telemetry_turn_begin(void);

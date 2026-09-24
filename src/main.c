@@ -5752,6 +5752,7 @@ int main(int argc, char **argv) {
         telemetry_set_context(srvchat_remote_active() ? srvchat_remote_base() : "local",
                               srvchat_remote_active() ? srvchat_remote_model() : tag,
                               oneshot_prompt ? "oneshot" : "repl");
+        telemetry_set_session(session_path);
     }
 
     /* REPL loop (or a single injected turn in -p one-shot mode) */

@@ -17,6 +17,7 @@
 static char ctx_backend[256] = "local";
 static char ctx_model[256]   = "";
 static char ctx_mode[16]     = "repl";
+static char ctx_session[512] = "";
 
 /* Per-turn tool deltas: toolstat counts for the whole run, so remember where the
  * previous turn left off. Same fixed-table bound as toolstat itself. */
@@ -83,6 +84,11 @@ void telemetry_set_context(const char *backend, const char *model, const char *m
     if (mode && *mode)       copy_str(ctx_mode,    sizeof ctx_mode,    mode);
 }
 
+void telemetry_set_session(const char *session_path) {
+    const char *base = session_path ? strrchr(session_path, '/') : NULL;
+    copy_str(ctx_session, sizeof ctx_session, base ? base + 1 : session_path);
+}
+
 void telemetry_turn_begin(void) {
     turn_t0 = time_now();
 }
@@ -131,6 +137,13 @@ void telemetry_turn_end(const char *outcome, int rounds, int elision_resets,
     sb_append_str(&sb, ",\"backend\":");          json_escape_into(&sb, ctx_backend);
     sb_append_str(&sb, ",\"model\":");            json_escape_into(&sb, ctx_model);
     sb_append_str(&sb, ",\"mode\":");             json_escape_into(&sb, ctx_mode);
+    if (ctx_session[0]) {
+        sb_append_str(&sb, ",\"session\":");    json_escape_into(&sb, ctx_session);
+    }
+    {
+        const char *tag = getenv("BASI_TELEMETRY_TAG");
+        if (tag && *tag) { sb_append_str(&sb, ",\"tag\":"); json_escape_into(&sb, tag); }
+    }
     sb_append_str(&sb, ",\"outcome\":");          json_escape_into(&sb, outcome ? outcome : "answered");
     snprintf(num, sizeof num,
              ",\"rounds\":%d,\"elision_resets\":%d,\"prompt_tokens\":%zu,"
@@ -234,6 +247,7 @@ int telemetry_cmd(int argc, char **argv) {
         "  basi-cli telemetry show [N]   print the last N records (default 20)\n"
         "  basi-cli telemetry purge      delete everything recorded\n"
         "  basi-cli telemetry path       print the data file path\n"
-        "  BASI_TELEMETRY=0 basi ...     off for a single run\n");
+        "  BASI_TELEMETRY=0 basi ...     off for a single run\n"
+        "  BASI_TELEMETRY_TAG=A basi ... label this run's records (for A/B tests)\n");
     return 2;
 }
