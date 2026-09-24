@@ -789,11 +789,12 @@ std::set<int> parse_selection(const string &in, int n) {
 extern "C" int dream_import_claude(int argc, char **argv) {
     char cwdb[4096]; string cwd = getcwd(cwdb, sizeof cwdb) ? cwdb : ".";
     string dir = claude_project_dir(cwd) + "/memory";
-    bool list = false, all = false;
+    bool list = false, all = false, quiet = false;
     vector<string> names;
     for (int i = 3; i < argc; i++) {
         if (!strcmp(argv[i], "--list")) list = true;
         else if (!strcmp(argv[i], "--all")) all = true;
+        else if (!strcmp(argv[i], "--quiet")) quiet = true;
         else if (!strcmp(argv[i], "--from") && i + 1 < argc) dir = argv[++i];
         else if (argv[i][0] != '-') names.push_back(argv[i]);
     }
@@ -826,8 +827,8 @@ extern "C" int dream_import_claude(int argc, char **argv) {
         return cur.find(n.body) != string::npos ? "imported" : "changed";
     };
 
-    printf("Claude Code memory: %s (%zu notes)\n", dir.c_str(), notes.size());
-    for (size_t i = 0; i < notes.size(); i++)
+    if (!quiet) printf("Claude Code memory: %s (%zu notes)\n", dir.c_str(), notes.size());
+    for (size_t i = 0; !quiet && i < notes.size(); i++)
         printf("  %2zu. [%-9s] %-8s %s — %s\n", i + 1, notes[i].type.c_str(), state_of(notes[i]).c_str(),
                notes[i].id.c_str(), notes[i].description.substr(0, 90).c_str());
     if (list) return 0;
@@ -895,6 +896,52 @@ extern "C" int dream_import_claude(int argc, char **argv) {
         printf("%d feedback note(s) proposed as lessons — accept them with: basi-cli sleep review\n", proposed);
     printf("BASI finds the notes through docs_search; nothing is added to every prompt.\n");
     return 0;
+}
+
+/* Called at interactive startup, before the sandbox hides ~/.claude: if Claude
+ * Code has memory notes linked to THIS folder that BASI does not have yet (new
+ * or changed), ask once. "never" is remembered per project in
+ * .basi/claude-import; "not now" asks again next session. */
+extern "C" void dream_offer_claude_import(void) {
+    string pref = read_file(".basi/claude-import");
+    if (pref.find("never") != string::npos) return;
+    char cwdb[4096];
+    if (!getcwd(cwdb, sizeof cwdb)) return;
+    string dir = claude_project_dir(cwdb) + "/memory";
+    int total = 0, pending = 0;
+    if (DIR *d = opendir(dir.c_str())) {
+        while (dirent *de = readdir(d)) {
+            string f = de->d_name;
+            if (f.size() <= 3 || f.substr(f.size() - 3) != ".md" || f == "MEMORY.md") continue;
+            ClaudeNote n;
+            if (!parse_claude_note(dir + "/" + f, n)) continue;
+            total++;
+            string cur = read_file(".basi/knowledge/pinned/claude-" + n.id + ".md");
+            if (cur.empty() || cur.find(n.body) == string::npos) pending++;
+        }
+        closedir(d);
+    }
+    if (pending == 0) return;
+    printf("\033[36mClaude Code has %d memory note%s for this project, %d not in BASI yet.\033[0m\n"
+           "\033[90m  (%s — imported into .basi/knowledge, git-ignored; BASI reads them through docs_search)\033[0m\n"
+           "Import them? [Y]es / [n]ot now / ne[v]er for this project: ",
+           total, total == 1 ? "" : "s", pending, dir.c_str());
+    fflush(stdout);
+    char buf[32];
+    if (!fgets(buf, sizeof buf, stdin)) return;
+    char c = (char)std::tolower((unsigned char)buf[0]);
+    if (c == 'v') {
+        mkdir_p(".basi");
+        std::ofstream(".basi/claude-import", std::ios::trunc)
+            << "never\n# written by BASI: do not offer to import Claude Code memory here.\n"
+               "# Delete this file to be asked again; `basi-cli import claude` still works.\n";
+        printf("\033[90mWon't ask again here (delete .basi/claude-import to undo).\033[0m\n\n");
+        return;
+    }
+    if (c == 'n') { printf("\033[90mNot now — I'll ask next time.\033[0m\n\n"); return; }
+    const char *av[] = {"basi-cli", "import", "claude", "--all", "--quiet"};
+    dream_import_claude(5, (char **)av);
+    printf("\n");
 }
 
 extern "C" int dream_cmd(int argc, char **argv) {

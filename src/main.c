@@ -5015,6 +5015,19 @@ int main(int argc, char **argv) {
      * executing an experiment and applying its decision rule is deterministic. */
     /* Everything below runs the agent (REPL, -p, deepsearch, study, factory):
        from here on, writes are confined to the project (sandbox.c). */
+    /* Before the sandbox (which hides ~/.claude): an interactive session in a
+       folder Claude Code has memory for offers to import it. Never in -p,
+       deepsearch or scripts, and not twice (the sandboxed re-exec skips it). */
+    if (!getenv("BASI_SANDBOXED") && isatty(0) && isatty(1) &&
+        !(argc >= 2 && (strcmp(argv[1], "study") == 0 || strcmp(argv[1], "factory") == 0))) {
+        bool oneshot_run = false;
+        for (int i = 1; i < argc; i++)
+            if (!strcmp(argv[i], "-p") || !strcmp(argv[i], "--prompt") || !strcmp(argv[i], "--print") ||
+                !strcmp(argv[i], "--deepsearch") || !strcmp(argv[i], "-h") ||
+                !strcmp(argv[i], "--help"))
+                oneshot_run = true;
+        if (!oneshot_run) dream_offer_claude_import();
+    }
     sandbox_maybe_reexec(argc, argv);
 
     if (argc >= 2 && (strcmp(argv[1], "study") == 0 ||

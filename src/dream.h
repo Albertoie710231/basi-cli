@@ -14,6 +14,10 @@ int dream_cmd(int argc, char **argv);
  * proposals for `sleep review`. Returns an exit code. */
 int dream_import_claude(int argc, char **argv);
 
+/* Interactive startup: if Claude Code memory linked to this folder has notes
+ * BASI does not have yet, ask whether to import them (see dream.cpp). */
+void dream_offer_claude_import(void);
+
 #ifdef __cplusplus
 }
 #endif
