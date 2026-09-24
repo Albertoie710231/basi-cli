@@ -45,6 +45,7 @@
 #include "chat_tmpl.h"
 #include "tooldefs.h"
 #include "toolstat.h"
+#include "telemetry.h"
 #include "mcp.h"
 #include "cookbook.h"
 #include "slashmenu.h"
@@ -2291,6 +2292,10 @@ static Cli parse_args(int argc, char **argv) {
                    "  --no-mcp        Do not connect to any MCP server this run\n"
                    "  -d              Debug mode (verbose tool output)\n"
                    "  -h              Show this help\n\n"
+                   "Local telemetry: BASI records per-turn outcomes, rounds, tokens and tool\n"
+                   "  call/failure counts (never prompts or output) to ~/.local/share/basi-cli/\n"
+                   "  telemetry.jsonl. It never leaves this machine. `basi-cli telemetry off`\n"
+                   "  stops it, BASI_TELEMETRY=0 skips one run, `basi-cli telemetry` shows status.\n\n"
                    "Model selection:\n"
                    "  With no -m, BASI uses the saved default (set by the first-run picker or\n"
                    "  the in-chat /model command), then $BASI_MODEL, then the picker. So after\n"
@@ -3542,6 +3547,8 @@ static void handle_slash_command(char *user_input,
                     "Subcommands (run before model load):\n"
                     "  basi-cli docs add <file.md> [--shelf=notes|pinned|docs]\n"
                     "                        copy a markdown file into ./.basi/knowledge/\n"
+                    "  basi-cli telemetry [off|on|show|purge]\n"
+                    "                        LOCAL usage stats: status, stop/resume, view, delete\n"
                     "\n"
                     "Tools the model can call: read, head, tail, grep, wc, bash,\n"
                     "  edit, scaffold, web_search, web_fetch, readfile, code_context,\n"
@@ -4185,6 +4192,15 @@ static void run_agentic_turn(char *user_input,
             strftime(today, sizeof(today), "%Y-%m-%d", t);
         }
 
+        /* Local telemetry for this turn (see telemetry.h): what happened, never
+           what was said. Rounds are counted separately from tool_iterations,
+           which compaction resets. */
+        telemetry_turn_begin();
+        const char *tm_outcome = "answered";
+        int    tm_rounds = 0;
+        size_t tm_p0 = session_prompt_tokens, tm_g0 = session_gen_tokens;
+        double tm_gen_s = 0;
+
         const char *banner = plan_phase_banner(plan_phase);
         {
             size_t blen = strlen(user_input) + (banner ? strlen(banner) : 0) + 64;
@@ -4321,6 +4337,7 @@ static void run_agentic_turn(char *user_input,
 
         while (tool_iterations < max_tool_iterations) {
             tool_iterations++;
+            tm_rounds++;
 
             /* Reclaim INSIDE the tool loop too. A long agentic turn is one user
                turn with many tool calls, each appending a result — without an
@@ -4367,6 +4384,8 @@ static void run_agentic_turn(char *user_input,
             generation_interrupted = 0;
             setup_sigint_handler();
             GenerateResult result = generate_chat(messages, msg_count, &ncalls, &n_ncalls);
+            if (generation_interrupted) tm_outcome = "interrupted";
+            tm_gen_s += result.gen_time_s;
             journal_say(result.text);   /* what it said, beside what it did */
             basi_srv_ctx_used = (int) result.prompt_tokens;   /* honest ctx meter from usage */
             reset_sigint_handler();
@@ -4511,6 +4530,7 @@ static void run_agentic_turn(char *user_input,
                             /* Exhaust the budget rather than break: the rest of this
                                iteration still frees call_name/call_env normally. */
                             tool_iterations = max_tool_iterations;
+                            tm_outcome = "repeat_stopped";
                         } else {
                             printf("\033[33m[repeat: same call %d× — nudging]\033[0m\n", c);
                         }
@@ -4725,6 +4745,8 @@ static void run_agentic_turn(char *user_input,
                     continue;   /* re-serialized from messages next iteration */
                 }
                 /* genuine final answer (or gave up after repeated parse failures) */
+                if (consec_parse_fail > 3 && strcmp(tm_outcome, "answered") == 0)
+                    tm_outcome = "parse_failed";
                 ADD_MESSAGE("assistant", result.text);
                 free(result.text);
                 break;
@@ -4742,6 +4764,7 @@ static void run_agentic_turn(char *user_input,
          * as its deliverable after 40 rounds of real work. Clearing g_tools is
          * how deepsearch already suppresses tools for its own loop. */
         if (tool_iterations >= max_tool_iterations) {
+            if (strcmp(tm_outcome, "answered") == 0) tm_outcome = "capped";
             printf("\033[90m[Tool budget exhausted — asking for a final answer]\033[0m\n");
             fflush(stdout);
 
@@ -4758,6 +4781,8 @@ static void run_agentic_turn(char *user_input,
             generation_interrupted = 0;
             setup_sigint_handler();
             GenerateResult final_result = generate_chat(messages, msg_count, NULL, NULL);
+            if (generation_interrupted) tm_outcome = "interrupted";
+            tm_gen_s += final_result.gen_time_s;
             basi_set_tools(saved_tools, n_saved_tools);
             basi_srv_ctx_used = (int) final_result.prompt_tokens;
             reset_sigint_handler();
@@ -4788,6 +4813,13 @@ static void run_agentic_turn(char *user_input,
 
         printf("\n");
         fflush(stdout);
+
+        {
+            size_t dg = session_gen_tokens - tm_g0;
+            telemetry_turn_end(tm_outcome, tm_rounds, elision_resets,
+                               session_prompt_tokens - tm_p0, dg,
+                               tm_gen_s > 0 ? dg / tm_gen_s : 0);
+        }
 
     #undef messages
     #undef msg_count
@@ -4836,6 +4868,10 @@ int main(int argc, char **argv) {
             "  basi-cli api clear                    forget it (back to local GGUF)\n");
         return 2;
     }
+
+    /* `basi-cli telemetry ...`: local usage stats — status, on/off, show, purge. */
+    if (argc >= 2 && strcmp(argv[1], "telemetry") == 0)
+        return telemetry_cmd(argc, argv);
 
     /* `basi-cli docs ...` subcommand: handle and exit before model load. */
     if (argc >= 2 && strcmp(argv[1], "docs") == 0) {
@@ -5708,6 +5744,14 @@ int main(int argc, char **argv) {
         char model_tag[32];
         derive_model_tag(model_path, model_tag, sizeof model_tag);
         statusbar_enable(model_tag);
+    }
+
+    {
+        char tag[128];
+        derive_model_tag(model_path, tag, sizeof tag);
+        telemetry_set_context(srvchat_remote_active() ? srvchat_remote_base() : "local",
+                              srvchat_remote_active() ? srvchat_remote_model() : tag,
+                              oneshot_prompt ? "oneshot" : "repl");
     }
 
     /* REPL loop (or a single injected turn in -p one-shot mode) */

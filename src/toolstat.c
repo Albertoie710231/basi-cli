@@ -88,3 +88,11 @@ void basi_toolstat_report(FILE *f) {
     fprintf(f, "\033[33m[degraded] the answer above was produced WITHOUT that tool"
                " — judge it accordingly.\033[0m\n");
 }
+
+bool basi_toolstat_row(int i, const char **name, int *calls, int *fails) {
+    if (i < 0 || i >= rows_n) return false;
+    if (name)  *name  = rows[i].name;
+    if (calls) *calls = rows[i].calls;
+    if (fails) *fails = rows[i].fails;
+    return true;
+}

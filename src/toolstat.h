@@ -42,4 +42,8 @@ bool basi_toolstat_any_failed(void);
  * quiet. */
 void basi_toolstat_report(FILE *f);
 
+/* Row i of the running counts (cumulative for the run), for callers that keep
+ * their own record — local telemetry diffs these per turn. False past the end. */
+bool basi_toolstat_row(int i, const char **name, int *calls, int *fails);
+
 #endif /* BASI_TOOLSTAT_H */
