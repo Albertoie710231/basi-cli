@@ -184,7 +184,11 @@ def report(results, tele, out):
                 fa = sum(r["full"] for r in base)
                 fb = sum(r["full"] for r in by[arm])
                 _, pf = fisher_exact([[fb, len(b) - fb], [fa, len(a) - fa]])
-                verdict = "DIFFERENT" if min(p, pf) < 0.05 else "no difference beyond noise"
+                # A one-step task's "steps passed" IS pass/fail, and Mann-Whitney on
+                # 0/1 data overstates (pwd-transfer: MW p=0.036 vs Fisher p=0.093).
+                # Fisher decides there; the step count only counts for multi-step tasks.
+                decisive = pf if rows[0]["steps"] == 1 else min(p, pf)
+                verdict = "DIFFERENT" if decisive < 0.05 else "no difference beyond noise"
                 lines.append(f"\n{arm} vs A: steps p={p:.3f}, full-pass p={pf:.3f} → **{verdict}**")
                 # Same success can still come cheaper: compare the cost of getting there.
                 for key, label in (("rounds", "rounds"), ("tok", "tokens")):
