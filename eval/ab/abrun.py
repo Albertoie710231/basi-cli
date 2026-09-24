@@ -54,6 +54,14 @@ def fill(s, **kw):
     return s
 
 
+def repo_state():
+    """HEAD + porcelain status of the real repo: a trial must never change it."""
+    head = subprocess.run(["git", "-C", str(REPO), "rev-parse", "HEAD"], capture_output=True, text=True).stdout
+    st = subprocess.run(["git", "-C", str(REPO), "status", "--porcelain", "--untracked-files=no"],
+                        capture_output=True, text=True).stdout
+    return head + st
+
+
 def run_trial(t, arm, rep, args, out, cache):
     task, name = t, t["name"]
     tdir = out / "trials" / f"{name}-{arm['name']}-{rep}"
@@ -88,7 +96,13 @@ def run_trial(t, arm, rep, args, out, cache):
                      BASI_SESSION_LOG=str(session_log))
         cmd = " ".join([shlex.quote(args.basi), *args.basi_args,
                         "--no-mcp", "--yolo", "-p", shlex.quote(prompt)])
-        sh(cmd, box, env_s, task.get("timeout", 900), tdir / f"step{i}.log")
+        sh(cmd, box, env_s, args.timeout or task.get("timeout", 900), tdir / f"step{i}.log")
+        # A server that could not start (e.g. the user took the VRAM) says nothing
+        # about the arm: mark the trial as an error, keep it out of the statistics.
+        slog = (tdir / f"step{i}.log").read_text(errors="replace")
+        if "llama-server failed to start" in slog or "[abrun] TIMEOUT" in slog:
+            res["error"] = "server failed to start" if "failed to start" in slog else "timeout"
+            break
         check_cmd = fill(step["check"], **vars_)
         rc = sh(check_cmd, box, env, 300, tdir / f"check{i}.log")
         # The check result goes into the session log where a user's reaction would
@@ -147,7 +161,12 @@ def report(results, tele, out):
         from scipy.stats import mannwhitneyu, fisher_exact
     except ImportError:
         mannwhitneyu = fisher_exact = None
+    errors = [r for r in results if r.get("error")]
+    results = [r for r in results if not r.get("error")]
     lines = []
+    if errors:
+        lines.append(f"\n{len(errors)} trial(s) excluded as errors: "
+                     + ", ".join(f"{r['task']}/{r['arm']}/{r['rep']} ({r['error']})" for r in errors))
     for task in sorted({r["task"] for r in results}):
         rows = [r for r in results if r["task"] == task]
         arms = []
@@ -225,6 +244,7 @@ def main():
     ap.add_argument("--basi", default=str(REPO / "basi-cli"))
     ap.add_argument("--basi-args", default="", help='extra flags, e.g. "--local -m model.gguf"')
     ap.add_argument("--out", default=None)
+    ap.add_argument("--timeout", type=int, default=0, help="per-step seconds (overrides the task's; local models need hours)")
     ap.add_argument("--yes", action="store_true", help="skip the confirmation")
     args = ap.parse_args()
     args.basi_args = shlex.split(args.basi_args)
@@ -245,7 +265,14 @@ def main():
                 arms.append(dict(name=nm, context=CONTEXT_HEADER + Path(path).read_text() + "\n\n---\n\n"))
 
     stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-    out = Path(args.out or HERE / "runs" / stamp).resolve()
+    # Sandboxes must NOT live inside the repo: on 2026-09-24 Qwen3.6-27B saw its
+    # working directory was .../BASI-CLI/eval/ab/runs/.../box, walked up to the
+    # real project and edited src/main.c there. Keep them where the path says
+    # nothing about the repo.
+    cache_home = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
+    out = Path(args.out or cache_home / "basi-cli" / "eval" / stamp).resolve()
+    if str(out).startswith(str(REPO) + os.sep):
+        sys.exit(f"--out {out} is inside the repo; an agent can walk up into the real project. Use a path outside {REPO}.")
     (out / "data").mkdir(parents=True, exist_ok=True)
     n_calls = sum(len(t["steps"]) for t in tasks) * len(arms) * args.repeat
     print(f"{len(tasks)} task(s) × {len(arms)} arm(s) × {args.repeat} reps = "
@@ -271,6 +298,8 @@ def main():
                 plan.append((t, arm, rep))
 
     results = []
+    before = repo_state()
+    tripped = False
     with open(out / "results.jsonl", "w") as rf, cf.ThreadPoolExecutor(args.jobs) as ex:
         futs = {ex.submit(run_trial, t, arm, rep, args, out, cache / t["name"]): (t, arm, rep)
                 for t, arm, rep in plan}
@@ -282,8 +311,17 @@ def main():
             print(f"  {r['task']:<10} {r['arm']:<10} rep {r['rep']}: "
                   f"{r['passed']}/{r['steps']} steps  {r['secs']}s"
                   + (f"  ({r['error']})" if r.get("error") else ""), flush=True)
+            if repo_state() != before:
+                print(f"\n!!! TRIPWIRE: the real repo {REPO} changed during trial "
+                      f"{r['task']}/{r['arm']}/{r['rep']} — stopping. Inspect `git status`.", flush=True)
+                tripped = True
+                for fut in futs:
+                    fut.cancel()
+                break
 
     print(report(results, telemetry_by_trial(out), out))
+    if tripped:
+        sys.exit(3)
 
 
 if __name__ == "__main__":
