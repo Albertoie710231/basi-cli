@@ -9,6 +9,11 @@ extern "C" {
  * sessions into .basi/lessons.md (see dream.cpp). Returns an exit code. */
 int dream_cmd(int argc, char **argv);
 
+/* `basi-cli import claude ...` — copy Claude Code memory notes for this project
+ * into .basi/knowledge/pinned (git-ignored); feedback notes become lesson
+ * proposals for `sleep review`. Returns an exit code. */
+int dream_import_claude(int argc, char **argv);
+
 #ifdef __cplusplus
 }
 #endif

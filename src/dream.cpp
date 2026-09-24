@@ -468,6 +468,14 @@ void append_lesson(const json &L) {
     std::ofstream(LESSONS_PATH, std::ios::trunc) << body;
 }
 
+/* Proposal state (and anything quoted from chats) never belongs in git, in any
+ * project — so the folder ignores itself. */
+void ensure_dream_dir() {
+    mkdir_p(DREAM_DIR);
+    string gi = string(DREAM_DIR) + "/.gitignore";
+    if (!file_exists(gi)) std::ofstream(gi) << "# basi-cli sleep state — local only\n*\n";
+}
+
 string now_stamp() {
     char b[32]; time_t t = time(nullptr);
     strftime(b, sizeof b, "%Y-%m-%d", localtime(&t));
@@ -493,7 +501,7 @@ int cmd_run(int argc, char **argv) {
     string sdir = sd; free(sd);
     char cwdb[4096]; string cwd = getcwd(cwdb, sizeof cwdb) ? cwdb : ".";
 
-    mkdir_p(DREAM_DIR);
+    ensure_dream_dir();
     string seen_p = string(DREAM_DIR) + "/seen.json";
     json seen = json::object();
     try { string s = read_file(seen_p); if (!s.empty()) seen = json::parse(s); } catch (...) {}
@@ -702,6 +710,186 @@ int cmd_review(int argc, char **argv) {
 }
 
 }  // namespace
+
+
+/* ── `basi-cli import claude` ───────────────────────────────────────────────
+ * Claude Code keeps per-project memory notes in ~/.claude/projects/<path>/memory:
+ * short markdown files with frontmatter (name, description, type). They hold
+ * what was learned working on THIS project — measured numbers, dead ends,
+ * how the user wants to work. This copies the ones the user picks into BASI's
+ * knowledge base (the pinned shelf docs_search already reads), and proposes the
+ * "feedback" ones — rules about how to work — as lessons for `sleep review`.
+ * Transcripts are not imported: hundreds of MB, mostly tool output. */
+
+struct ClaudeNote {
+    string file, id, name, description, type, body;   /* id = file stem: stable, filename-safe */
+};
+
+string unquote(string v) {
+    while (!v.empty() && (v.back() == ' ' || v.back() == '\r')) v.pop_back();
+    size_t a = v.find_first_not_of(' ');
+    v = a == string::npos ? "" : v.substr(a);
+    if (v.size() >= 2 && (v[0] == '"' || v[0] == '\'') && v.back() == v[0]) v = v.substr(1, v.size() - 2);
+    return v;
+}
+
+bool parse_claude_note(const string &path, ClaudeNote &n) {
+    string s = read_file(path);
+    if (!starts_with(s, "---")) return false;
+    size_t end = s.find("\n---", 3);
+    if (end == string::npos) return false;
+    std::istringstream fm(s.substr(3, end - 3));
+    string line;
+    while (std::getline(fm, line)) {
+        size_t c = line.find(':');
+        if (c == string::npos) continue;
+        string key = unquote(line.substr(0, c)), val = unquote(line.substr(c + 1));
+        if (key == "name" && n.name.empty()) n.name = val;
+        else if (key == "description") n.description = val;
+        else if (key == "type") n.type = val;            /* top-level or under metadata: */
+    }
+    size_t b = s.find('\n', end + 4);
+    n.body = b == string::npos ? "" : s.substr(b + 1);
+    n.file = path;
+    string base = path.substr(path.rfind('/') + 1);
+    n.id = base.substr(0, base.size() - 3);
+    if (n.name.empty()) n.name = n.id;
+    return true;
+}
+
+/* Claude Code names a project's folder after its path with every character that
+ * is not a letter, digit or '-' turned into '-'. */
+string claude_project_dir(const string &cwd) {
+    string enc;
+    for (unsigned char c : cwd) enc += (std::isalnum(c) || c == '-') ? (char)c : '-';
+    const char *home = getenv("HOME");
+    return string(home ? home : ".") + "/.claude/projects/" + enc;
+}
+
+std::set<int> parse_selection(const string &in, int n) {
+    std::set<int> out;
+    string tok;
+    std::istringstream ss(in);
+    while (std::getline(ss, tok, ',')) {
+        tok = unquote(tok);
+        if (tok.empty()) continue;
+        size_t d = tok.find('-');
+        int a = atoi(tok.c_str()), b = d == string::npos ? a : atoi(tok.c_str() + d + 1);
+        for (int i = std::max(1, a); i <= std::min(n, b); i++) out.insert(i);
+    }
+    return out;
+}
+
+extern "C" int dream_import_claude(int argc, char **argv) {
+    char cwdb[4096]; string cwd = getcwd(cwdb, sizeof cwdb) ? cwdb : ".";
+    string dir = claude_project_dir(cwd) + "/memory";
+    bool list = false, all = false;
+    vector<string> names;
+    for (int i = 3; i < argc; i++) {
+        if (!strcmp(argv[i], "--list")) list = true;
+        else if (!strcmp(argv[i], "--all")) all = true;
+        else if (!strcmp(argv[i], "--from") && i + 1 < argc) dir = argv[++i];
+        else if (argv[i][0] != '-') names.push_back(argv[i]);
+    }
+
+    vector<ClaudeNote> notes;
+    if (DIR *d = opendir(dir.c_str())) {
+        vector<string> files;
+        while (dirent *de = readdir(d)) {
+            string f = de->d_name;
+            if (f.size() > 3 && f.substr(f.size() - 3) == ".md" && f != "MEMORY.md") files.push_back(f);
+        }
+        closedir(d);
+        std::sort(files.begin(), files.end());
+        for (auto &f : files) {
+            ClaudeNote n;
+            if (parse_claude_note(dir + "/" + f, n)) notes.push_back(n);
+        }
+    }
+    if (notes.empty()) {
+        fprintf(stderr, "No Claude Code memory for this project at %s\n"
+                        "  (use --from <dir> to point at another memory folder)\n", dir.c_str());
+        return 1;
+    }
+
+    const string dest_dir = ".basi/knowledge/pinned";
+    auto dest_of = [&](const ClaudeNote &n) { return dest_dir + "/claude-" + n.id + ".md"; };
+    auto state_of = [&](const ClaudeNote &n) -> string {
+        string cur = read_file(dest_of(n));
+        if (cur.empty()) return "new";
+        return cur.find(n.body) != string::npos ? "imported" : "changed";
+    };
+
+    printf("Claude Code memory: %s (%zu notes)\n", dir.c_str(), notes.size());
+    for (size_t i = 0; i < notes.size(); i++)
+        printf("  %2zu. [%-9s] %-8s %s — %s\n", i + 1, notes[i].type.c_str(), state_of(notes[i]).c_str(),
+               notes[i].id.c_str(), notes[i].description.substr(0, 90).c_str());
+    if (list) return 0;
+
+    std::set<int> pick;
+    if (all) for (size_t i = 1; i <= notes.size(); i++) pick.insert((int)i);
+    for (auto &nm : names)
+        for (size_t i = 0; i < notes.size(); i++)
+            if (notes[i].id == nm || notes[i].name == nm) pick.insert((int)i + 1);
+    if (pick.empty()) {
+        if (!isatty(0)) {
+            fprintf(stderr, "Not a terminal: pass --all or note names to import.\n");
+            return 2;
+        }
+        printf("\nImport which? numbers/ranges (e.g. 1,4,7-9), 'a' = all, Enter = cancel: ");
+        fflush(stdout);
+        char buf[1024];
+        if (!fgets(buf, sizeof buf, stdin)) return 0;
+        string in = unquote(buf);
+        if (!in.empty() && in.back() == '\n') in.pop_back();
+        if (in == "a") for (size_t i = 1; i <= notes.size(); i++) pick.insert((int)i);
+        else pick = parse_selection(in, (int)notes.size());
+        if (pick.empty()) { printf("Nothing imported.\n"); return 0; }
+    }
+
+    mkdir_p(dest_dir.c_str());
+    /* Claude's notes can hold hosts, paths and private numbers, and .basi/ is
+       often committed. Keep the imported copies out of git in ANY project. */
+    string gi = dest_dir + "/.gitignore";
+    if (read_file(gi).find("claude-*.md") == string::npos)
+        std::ofstream(gi, std::ios::app) << "# imported Claude Code memory — private, never commit\nclaude-*.md\n";
+
+    string pend_p = string(DREAM_DIR) + "/pending.jsonl";
+    ensure_dream_dir();
+    vector<json> pending = read_jsonl(pend_p);
+    vector<string> known = lesson_lines();
+    for (auto &j : pending) known.push_back(j.value("lesson", ""));
+    for (auto &j : read_jsonl(string(DREAM_DIR) + "/rejected.jsonl")) known.push_back(j.value("lesson", ""));
+    int next_id = 1;
+    for (auto &j : pending) next_id = std::max(next_id, j.value("id", 0) + 1);
+
+    int added = 0, updated = 0, same = 0, proposed = 0;
+    for (int k : pick) {
+        const ClaudeNote &n = notes[k - 1];
+        string st = state_of(n);
+        if (st == "imported") { same++; continue; }
+        std::ofstream(dest_of(n), std::ios::trunc)
+            << "---\nsource: " << n.file << "\nshelf: pinned\ntitle: " << n.name
+            << "\ntype: " << n.type << "\nimported: " << now_stamp()
+            << "\n---\n\n# " << n.name << "\n\n> " << n.description << "\n\n" << n.body;
+        (st == "new" ? added : updated)++;
+        if (n.type == "feedback" && !n.description.empty() && !is_duplicate(n.description, known)) {
+            json L = {{"kind", "habit"}, {"lesson", n.description}, {"id", next_id++},
+                      {"source", "claude:" + n.id}, {"signal", "Claude Code feedback memory"},
+                      {"proposed", now_stamp()}};
+            pending.push_back(L);
+            known.push_back(n.description);
+            proposed++;
+        }
+    }
+    write_jsonl(pend_p, pending);
+    printf("\n%d added, %d updated, %d unchanged → %s/claude-*.md (git-ignored)\n",
+           added, updated, same, dest_dir.c_str());
+    if (proposed)
+        printf("%d feedback note(s) proposed as lessons — accept them with: basi-cli sleep review\n", proposed);
+    printf("BASI finds the notes through docs_search; nothing is added to every prompt.\n");
+    return 0;
+}
 
 extern "C" int dream_cmd(int argc, char **argv) {
     string sub = argc >= 3 ? argv[2] : "";

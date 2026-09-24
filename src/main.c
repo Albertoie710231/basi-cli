@@ -3592,6 +3592,9 @@ static void handle_slash_command(char *user_input,
                     "                        copy a markdown file into ./.basi/knowledge/\n"
                     "  basi-cli telemetry [off|on|show|purge]\n"
                     "                        LOCAL usage stats: status, stop/resume, view, delete\n"
+                    "  basi-cli import claude [--list|--all|<name>…]\n"
+                    "                        copy this project's Claude Code memory notes into\n"
+                    "                        .basi/knowledge (git-ignored); feedback → lesson proposals\n"
                     "  basi-cli sleep [review|show|--dry-run]\n"
                     "                        learn lessons from this project's past sessions;\n"
                     "                        you review them before BASI uses them\n"
@@ -4918,6 +4921,10 @@ int main(int argc, char **argv) {
     /* `basi-cli telemetry ...`: local usage stats — status, on/off, show, purge. */
     if (argc >= 2 && strcmp(argv[1], "telemetry") == 0)
         return telemetry_cmd(argc, argv);
+
+    /* `basi-cli import claude`: bring this project's Claude Code memory notes in. */
+    if (argc >= 3 && strcmp(argv[1], "import") == 0 && strcmp(argv[2], "claude") == 0)
+        return dream_import_claude(argc, argv);
 
     /* `basi-cli sleep ...`: learn reviewed lessons from this project's past
        sessions. Uses the saved/env API backend like study, else a local
