@@ -96,7 +96,25 @@ def run_trial(t, arm, rep, args, out, cache):
         session_log = tdir / f"session-step{i}.jsonl"
         env_s = dict(env, BASI_TELEMETRY_TAG=f"{name}:{arm['name']}:{rep}:{i}",
                      BASI_SESSION_LOG=str(session_log))
-        cmd = " ".join([shlex.quote(args.basi), *args.basi_args,
+        basi = args.basi
+        jail = []
+        if args.jail:
+            # Filesystem jail: the agent sees the system, its own trial folder, the
+            # BASI config (read-only, for the saved backend) and the binary under a
+            # neutral path — not $HOME, not ~/.claude, not the repo. Without it a
+            # "no context" arm with bash found the answers on disk anyway (30 of 48
+            # steps read ~/.claude, the other arm's notes or the real repo).
+            cfg = Path(env["XDG_CONFIG_HOME"]) / "basi-cli"
+            jail = ["bwrap", "--ro-bind", "/usr", "/usr", "--symlink", "usr/bin", "/bin",
+                    "--symlink", "usr/lib", "/lib", "--symlink", "usr/lib", "/lib64",
+                    "--symlink", "usr/bin", "/sbin", "--ro-bind", "/etc", "/etc",
+                    "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp",
+                    "--ro-bind", args.basi, "/opt/basi/basi-cli",
+                    "--ro-bind", str(cfg), str(cfg),
+                    "--bind", str(tdir), str(tdir), "--bind", str(out / "data"), str(out / "data"),
+                    "--chdir", str(box), "--die-with-parent"]
+            basi = "/opt/basi/basi-cli"
+        cmd = " ".join([*map(shlex.quote, jail), shlex.quote(basi), *args.basi_args,
                         "--no-mcp", "--yolo", "-p", shlex.quote(prompt)])
         sh(cmd, box, env_s, args.timeout or task.get("timeout", 900), tdir / f"step{i}.log")
         # A server that could not start (e.g. the user took the VRAM) says nothing
@@ -248,6 +266,8 @@ def main():
     ap.add_argument("--out", default=None)
     ap.add_argument("--timeout", type=int, default=0, help="per-step seconds (overrides the task's; local models need hours)")
     ap.add_argument("--yes", action="store_true", help="skip the confirmation")
+    ap.add_argument("--jail", action="store_true",
+                    help="run each agent in a bwrap filesystem jail (only its trial folder visible)")
     args = ap.parse_args()
     args.basi_args = shlex.split(args.basi_args)
     if "--api" in args.basi_args:
