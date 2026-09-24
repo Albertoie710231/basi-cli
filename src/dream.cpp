@@ -729,7 +729,13 @@ string unquote(string v) {
     while (!v.empty() && (v.back() == ' ' || v.back() == '\r')) v.pop_back();
     size_t a = v.find_first_not_of(' ');
     v = a == string::npos ? "" : v.substr(a);
-    if (v.size() >= 2 && (v[0] == '"' || v[0] == '\'') && v.back() == v[0]) v = v.substr(1, v.size() - 2);
+    if (v.size() >= 2 && (v[0] == '"' || v[0] == '\'') && v.back() == v[0]) {
+        bool dq = v[0] == '"';
+        v = v.substr(1, v.size() - 2);
+        if (dq)                                   /* YAML double-quoted: \" and \\ are escapes */
+            for (size_t i = 0; i + 1 < v.size(); i++)
+                if (v[i] == '\\' && (v[i + 1] == '"' || v[i + 1] == '\\')) v.erase(i, 1);
+    }
     return v;
 }
 
