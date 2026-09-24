@@ -125,6 +125,7 @@ def run_trial(t, arm, rep, args, out, cache):
             for pth in extra:
                 jail[-3:-3] = ["--ro-bind-try", pth, pth]
             basi = "/opt/basi/basi-cli"
+            env_s["BASI_SANDBOX"] = "0"      # the jail is stricter; no bwrap inside bwrap
         cmd = " ".join([*map(shlex.quote, jail), shlex.quote(basi), *args.basi_args,
                         "--no-mcp", "--yolo", "-p", shlex.quote(prompt)])
         sh(cmd, box, env_s, args.timeout or task.get("timeout", 900), tdir / f"step{i}.log")

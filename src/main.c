@@ -47,6 +47,7 @@
 #include "toolstat.h"
 #include "telemetry.h"
 #include "dream.h"
+#include "sandbox.h"
 #include "mcp.h"
 #include "cookbook.h"
 #include "slashmenu.h"
@@ -2244,6 +2245,10 @@ static Cli parse_args(int argc, char **argv) {
             c.mcp_config = argv[++i];
         } else if (strcmp(argv[i], "--no-mcp") == 0) {
             c.no_mcp = true;
+        } else if (strcmp(argv[i], "--no-sandbox") == 0) {
+            /* handled by sandbox_maybe_reexec() before parsing */
+        } else if (strcmp(argv[i], "--allow") == 0 && i + 1 < argc) {
+            i++;                           /* ditto: an extra writable path */
         } else if (strcmp(argv[i], "--local") == 0) {
             api_ignore_saved = true;    /* ignore a saved API default this run */
         } else if ((strcmp(argv[i], "-s") == 0 || strcmp(argv[i], "--system") == 0)
@@ -2288,11 +2293,17 @@ static Cli parse_args(int argc, char **argv) {
                    "                  no flags. `--local` ignores it for one run; `basi-cli api clear`\n"
                    "                  forgets it; `basi-cli api` shows it.\n"
                    "  --local         Ignore the saved API default and use a local GGUF this run\n"
+                   "  --allow <dir>   Let the agent write to <dir> too this run (also: .basi/sandbox,\n"
+                   "                  one '<path> [rw|ro]' per line)\n"
+                   "  --no-sandbox    Let the agent write anywhere you can (BASI_SANDBOX=0 does the same)\n"
                    "  --mcp-config <f>  Extra MCP server config file, applied after the standard\n"
                    "                  ones (~/.config/basi-cli/mcp.json, ./.basi/mcp.json, ./.mcp.json)\n"
                    "  --no-mcp        Do not connect to any MCP server this run\n"
                    "  -d              Debug mode (verbose tool output)\n"
                    "  -h              Show this help\n\n"
+                   "Sandbox: the agent can WRITE only to this project, /tmp, ~/.cache and BASI's\n"
+                   "  own config/data, and cannot READ secrets (~/.ssh, ~/.claude, browser\n"
+                   "  profiles, ...). Needs bubblewrap. --allow / .basi/sandbox add paths.\n\n"
                    "Local telemetry: BASI records per-turn outcomes, rounds, tokens and tool\n"
                    "  call/failure counts (never prompts or output) to ~/.local/share/basi-cli/\n"
                    "  telemetry.jsonl. It never leaves this machine. `basi-cli telemetry off`\n"
@@ -5002,6 +5013,10 @@ int main(int argc, char **argv) {
 
     /* `basi-cli study ...`: the discovery loop runs without loading a model —
      * executing an experiment and applying its decision rule is deterministic. */
+    /* Everything below runs the agent (REPL, -p, deepsearch, study, factory):
+       from here on, writes are confined to the project (sandbox.c). */
+    sandbox_maybe_reexec(argc, argv);
+
     if (argc >= 2 && (strcmp(argv[1], "study") == 0 ||
                       strcmp(argv[1], "factory") == 0)) {
         /* These dispatch ahead of parse_args, so --api/--api-model never reach
