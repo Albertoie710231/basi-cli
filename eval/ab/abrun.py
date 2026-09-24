@@ -83,11 +83,22 @@ def run_trial(t, arm, rep, args, out, cache):
     t0 = time.time()
     for i, step in enumerate(task["steps"]):
         prompt = arm["context"] + fill(step["prompt"], **vars_)
-        env_s = dict(env, BASI_TELEMETRY_TAG=f"{name}:{arm['name']}:{rep}:{i}")
+        session_log = tdir / f"session-step{i}.jsonl"
+        env_s = dict(env, BASI_TELEMETRY_TAG=f"{name}:{arm['name']}:{rep}:{i}",
+                     BASI_SESSION_LOG=str(session_log))
         cmd = " ".join([shlex.quote(args.basi), *args.basi_args,
                         "--no-mcp", "--yolo", "-p", shlex.quote(prompt)])
         sh(cmd, box, env_s, task.get("timeout", 900), tdir / f"step{i}.log")
-        rc = sh(fill(step["check"], **vars_), box, env, 300, tdir / f"check{i}.log")
+        check_cmd = fill(step["check"], **vars_)
+        rc = sh(check_cmd, box, env, 300, tdir / f"check{i}.log")
+        # The check result goes into the session log where a user's reaction would
+        # be, so `basi-cli sleep --from <run>` can learn from failed runs.
+        out_tail = (tdir / f"check{i}.log").read_text(errors="replace")[-800:]
+        verdict = "[AUTOMATIC CHECK PASSED]" if rc == 0 else "[AUTOMATIC CHECK FAILED]"
+        reaction = (f"{verdict} The task's own check ran after you finished.\n"
+                    f"Check command:\n{check_cmd}\nCheck output (tail):\n{out_tail}")
+        with open(session_log, "a") as f:
+            f.write(json.dumps({"role": "user", "content": reaction}) + "\n")
         if rc != 0:
             res["fail_step"] = i
             if task.get("stop_on_fail", True):

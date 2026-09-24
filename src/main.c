@@ -5761,6 +5761,13 @@ int main(int argc, char **argv) {
        skips the picker; otherwise list previous sessions or start new.
        session_path is retained so /model can re-exec with --resume. */
     char *session_path = NULL;
+    /* One-shot runs keep no log by default (scripts would flood the session
+       picker). BASI_SESSION_LOG=<file> opts in, so an eval harness can hand
+       `basi-cli sleep --from` the runs whose checks failed. */
+    if (oneshot) {
+        const char *sl = getenv("BASI_SESSION_LOG");
+        if (sl && *sl && (session_fp = fopen(sl, "a"))) session_path = strdup(sl);
+    }
     if (!oneshot) {
         if (resume_path) {
             session_load_into(resume_path, &messages, &msg_count, &msg_cap,

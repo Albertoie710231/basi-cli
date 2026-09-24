@@ -176,10 +176,11 @@ struct Episode {
     int    index = 0;
     string request, reaction, text;   /* text = condensed episode for the model */
     int    tool_calls = 0, tool_errors = 0, repeats = 0;
-    bool   capped = false, correction = false, review = false;
+    bool   capped = false, correction = false, review = false, check_failed = false;
     string signals() const {
         string s;
         auto add = [&](const string &x) { if (!s.empty()) s += ", "; s += x; };
+        if (check_failed) add("automatic check failed");
         if (capped)      add("hit the round cap");
         if (tool_errors) add(std::to_string(tool_errors) + " tool error(s)");
         if (repeats)     add(std::to_string(repeats) + " repeated call(s)");
@@ -239,8 +240,12 @@ vector<Episode> episodes_of(const string &path, const string &name) {
                 work += "ASSISTANT " + clip(r.content, i + 1 == e ? 1500 : 400) + "\n";
             }
         }
-        ep.correction = !ep.reaction.empty() && looks_like_correction(ep.reaction);
-        ep.review     = ep.reaction.size() > 800;
+        /* an automatic check result is not the user: its command text ("--no-mcp")
+           would otherwise read as a correction */
+        bool automatic = starts_with(ep.reaction, "[AUTOMATIC CHECK");
+        ep.correction = !ep.reaction.empty() && !automatic && looks_like_correction(ep.reaction);
+        ep.check_failed = starts_with(ep.reaction, "[AUTOMATIC CHECK FAILED]");
+        ep.review     = ep.reaction.size() > 800 && !starts_with(ep.reaction, "[AUTOMATIC CHECK");
         ep.text = "REQUEST:\n" + clip(ep.request, 1500) + "\n\nWHAT BASI DID:\n" + clip(work, 9000) +
                   (ep.reaction.empty() ? "" : "\n\nTHE USER'S NEXT MESSAGE:\n" + clip(ep.reaction, 2500));
         eps.push_back(ep);
@@ -249,6 +254,7 @@ vector<Episode> episodes_of(const string &path, const string &name) {
 }
 
 bool has_signal(const Episode &e, bool session_flagged) {
+    if (e.check_failed) return true;       /* even with no tool calls: talked, did nothing, failed */
     if (e.tool_calls == 0) return false;               /* chit-chat: nothing learned */
     return e.capped || e.tool_errors || e.repeats || e.correction || e.review ||
            e.tool_calls >= 5 || session_flagged;
@@ -284,7 +290,9 @@ std::map<string, string> telemetry_flags() {
 const char *EXTRACT_PROMPT =
     "You are reviewing ONE episode from a coding agent's past session in this project: "
     "the user's request, what the agent did (tool calls and results, abbreviated), and "
-    "the user's next message (their reaction).\n\n"
+    "the user's next message (their reaction). The reaction may instead be the result "
+    "of an AUTOMATIC CHECK run after the agent finished: if it failed, work out from "
+    "what the agent did why the task was not done, and what habit would have avoided it.\n\n"
     "Extract lessons that would make the agent do BETTER next time. Two kinds only:\n"
     "- \"habit\": how to work. General, imperative, reusable on OTHER tasks. Only from "
     "something that went wrong or that the user had to correct: a false claim, a missed "
@@ -470,6 +478,7 @@ string now_stamp() {
 
 int cmd_run(int argc, char **argv) {
     bool all = false, dry = false;
+    vector<string> from_dirs;
     int port = 8181, limit = 0;
     if (const char *pe = getenv("BASI_SERVER_PORT")) if (*pe) port = atoi(pe);
     for (int i = 2; i < argc; i++) {
@@ -477,6 +486,7 @@ int cmd_run(int argc, char **argv) {
         else if (!strcmp(argv[i], "--dry-run")) dry = true;
         else if (!strcmp(argv[i], "--limit") && i + 1 < argc) limit = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--port") && i + 1 < argc) port = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--from") && i + 1 < argc) from_dirs.push_back(argv[++i]);
     }
     char *sd = session_dir_path();
     if (!sd) { fprintf(stderr, "No session directory for this project.\n"); return 1; }
@@ -488,32 +498,51 @@ int cmd_run(int argc, char **argv) {
     json seen = json::object();
     try { string s = read_file(seen_p); if (!s.empty()) seen = json::parse(s); } catch (...) {}
 
+    /* files are keyed by their path relative to sdir, or by full path for
+       --from sources (logs from `basi -p` runs with BASI_SESSION_LOG set) */
     vector<string> files;
-    if (DIR *d = opendir(sdir.c_str())) {
-        while (dirent *de = readdir(d)) {
-            string n = de->d_name;
-            if (n.size() > 6 && n.substr(n.size() - 6) == ".jsonl") files.push_back(n);
+    if (from_dirs.empty()) {
+        if (DIR *d = opendir(sdir.c_str())) {
+            while (dirent *de = readdir(d)) {
+                string n = de->d_name;
+                if (n.size() > 6 && n.substr(n.size() - 6) == ".jsonl") files.push_back(n);
+            }
+            closedir(d);
         }
-        closedir(d);
+    } else {
+        sdir = "";
+        for (auto &fd : from_dirs) {
+            string cmd = "find '" + fd + "' -name 'session-*.jsonl' -type f 2>/dev/null";
+            if (FILE *pp = popen(cmd.c_str(), "r")) {
+                char buf[4096];
+                while (fgets(buf, sizeof buf, pp)) {
+                    string f = buf;
+                    while (!f.empty() && (f.back() == '\n' || f.back() == '\r')) f.pop_back();
+                    if (!f.empty()) files.push_back(f);
+                }
+                pclose(pp);
+            }
+        }
     }
     std::sort(files.begin(), files.end());
+    auto full = [&](const string &n) { return sdir.empty() ? n : sdir + "/" + n; };
     auto flags = telemetry_flags();
 
     vector<Episode> todo;
     int n_sessions = 0, n_new = 0;
     for (auto &n : files) {
-        long sz = file_size(sdir + "/" + n);
+        long sz = file_size(full(n));
         n_sessions++;
         if (!all && seen.contains(n) && seen[n].get<long>() == sz) continue;
         n_new++;
         bool flagged = flags.count(n) > 0;
-        for (auto &e : episodes_of(sdir + "/" + n, n))
+        for (auto &e : episodes_of(full(n), n))
             if (has_signal(e, flagged)) todo.push_back(e);
     }
     if (limit > 0 && (int)todo.size() > limit) todo.resize(limit);
 
     printf("sleep: %d session(s) in %s, %d new or changed, %zu episode(s) with signal\n",
-           n_sessions, sdir.c_str(), n_new, todo.size());
+           n_sessions, sdir.empty() ? "the --from dirs" : sdir.c_str(), n_new, todo.size());
     if (dry) {
         for (auto &e : todo)
             printf("  %s #%d  [%s]  %s\n", e.session.c_str(), e.index, e.signals().c_str(),
@@ -567,7 +596,7 @@ int cmd_run(int argc, char **argv) {
         write_jsonl(pend_p, pending);          /* save as we go: a crash keeps the work */
     }
     for (auto &n : files) {
-        long sz = file_size(sdir + "/" + n);
+        long sz = file_size(full(n));
         if (sz >= 0) seen[n] = sz;
     }
     std::ofstream(seen_p, std::ios::trunc) << seen.dump(1);
@@ -686,9 +715,11 @@ extern "C" int dream_cmd(int argc, char **argv) {
     }
     if (sub == "-h" || sub == "--help" || sub == "help") {
         printf("Usage:\n"
-               "  basi-cli sleep [--dry-run] [--all] [--limit N]\n"
+               "  basi-cli sleep [--dry-run] [--all] [--limit N] [--from DIR]\n"
                "                  learn from this project's past sessions (new/changed ones\n"
-               "                  only unless --all); --dry-run lists the episodes, no model\n"
+               "                  only unless --all); --dry-run lists the episodes, no model;\n"
+               "                  --from DIR reads session-*.jsonl logs of `basi -p` runs\n"
+               "                  (BASI_SESSION_LOG) instead, e.g. an eval/ab run\n"
                "  basi-cli sleep review            accept/reject proposals one by one\n"
                "  basi-cli sleep list              print the proposals waiting for review\n"
                "  basi-cli sleep accept|reject <id…>\n"

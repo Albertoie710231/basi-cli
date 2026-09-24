@@ -1,0 +1,15 @@
+{
+ "name": "pwd",
+ "source": "held-out transfer task for lessons learned on `version` (2026-09-24); same 'plan it first' wording, different code",
+ "prepare": "git -C {repo} archive HEAD src Makefile | tar -x -C {cache} && make -C {cache} -j16",
+ "setup": "cp -a {cache}/. .",
+ "stop_on_fail": true,
+ "timeout": 900,
+ "steps": [
+  {
+   "id": "1",
+   "prompt": "Add a /pwd slash command to BASI-CLI that prints the current working directory in dim grey (the same colour /cost uses) and is listed in /help. It takes no arguments. Plan it before implementing.",
+   "check": "make -j16 >/dev/null 2>&1 || { echo BUILD_FAILED; exit 1; }\nout=$(printf '/pwd\\n/help\\n' | HOME=$(mktemp -d) BASI_TELEMETRY=0 timeout 120 ./basi-cli --no-mcp 2>&1)\nprintf '%s\\n' \"$out\" > check-output.txt\nprintf '%s\\n' \"$out\" | grep -aF \"$PWD\" | grep -qa $'\\e\\[90m' || { echo NO_DIM_GREY_LINE_WITH_CWD; exit 1; }\nprintf '%s\\n' \"$out\" | grep -qaE '^\\s+/pwd\\b' || { echo NOT_IN_HELP; exit 1; }\necho PASS"
+  }
+ ]
+}
