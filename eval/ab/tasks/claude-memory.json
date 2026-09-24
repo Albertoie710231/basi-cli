@@ -1,0 +1,52 @@
+{
+ "name": "claude-memory",
+ "source": "facts that exist only in the Claude Code memory notes (~/.claude/projects/.../memory), 2026-09-24",
+ "setup": "true",
+ "env": {
+  "HOME": "{box}/.home"
+ },
+ "stop_on_fail": false,
+ "timeout": 600,
+ "steps": [
+  {
+   "id": "1",
+   "prompt": "Answer this question about this project (BASI-CLI and its measurements). Write ONLY the answer — one or two sentences with the specific numbers — to the file answer.txt, overwriting it. Question: On this project's Intel Arc B580, which llama.cpp backend has faster prompt processing (prefill), SYCL or Vulkan, and by roughly what factor?",
+   "check": "grep -qi sycl answer.txt && grep -Eq '(2\\.[0-9]+|3) ?(x|×|times)' answer.txt; rc=$?; cat answer.txt 2>/dev/null; rm -f answer.txt; exit $rc"
+  },
+  {
+   "id": "2",
+   "prompt": "Answer this question about this project (BASI-CLI and its measurements). Write ONLY the answer — one or two sentences with the specific numbers — to the file answer.txt, overwriting it. Question: What -ub (ubatch) value is the prefill lever for the B580 SYCL build in this project?",
+   "check": "grep -q 2048 answer.txt; rc=$?; cat answer.txt 2>/dev/null; rm -f answer.txt; exit $rc"
+  },
+  {
+   "id": "3",
+   "prompt": "Answer this question about this project (BASI-CLI and its measurements). Write ONLY the answer — one or two sentences with the specific numbers — to the file answer.txt, overwriting it. Question: Why must the redis checkout used for this project's refactor corpus live at a short path like /tmp/rd? Give the limit.",
+   "check": "grep -Eq '108' answer.txt; rc=$?; cat answer.txt 2>/dev/null; rm -f answer.txt; exit $rc"
+  },
+  {
+   "id": "4",
+   "prompt": "Answer this question about this project (BASI-CLI and its measurements). Write ONLY the answer — one or two sentences with the specific numbers — to the file answer.txt, overwriting it. Question: How do you point a single BASI run at a hosted API without changing the saved default backend?",
+   "check": "grep -q 'BASI_API' answer.txt; rc=$?; cat answer.txt 2>/dev/null; rm -f answer.txt; exit $rc"
+  },
+  {
+   "id": "5",
+   "prompt": "Answer this question about this project (BASI-CLI and its measurements). Write ONLY the answer — one or two sentences with the specific numbers — to the file answer.txt, overwriting it. Question: For DeepSeek-V4-Flash 284B streamed from NVMe, was CPU-only or Vulkan GPU prefill faster in this project's measurements, and what were the numbers?",
+   "check": "grep -qi cpu answer.txt && grep -Eq '4\\.7|13\\.1' answer.txt; rc=$?; cat answer.txt 2>/dev/null; rm -f answer.txt; exit $rc"
+  },
+  {
+   "id": "6",
+   "prompt": "Answer this question about this project (BASI-CLI and its measurements). Write ONLY the answer — one or two sentences with the specific numbers — to the file answer.txt, overwriting it. Question: Why was vim disqualified from this project's spaghetti-refactor corpus? Give the number.",
+   "check": "grep -Eq '(^|[^0-9])27([^0-9]|$)' answer.txt; rc=$?; cat answer.txt 2>/dev/null; rm -f answer.txt; exit $rc"
+  },
+  {
+   "id": "7",
+   "prompt": "Answer this question about this project (BASI-CLI and its measurements). Write ONLY the answer — one or two sentences with the specific numbers — to the file answer.txt, overwriting it. Question: How much did the round count vary between identical configs in this project's measured agent-loop noise floor?",
+   "check": "grep -Eq '72|96' answer.txt; rc=$?; cat answer.txt 2>/dev/null; rm -f answer.txt; exit $rc"
+  },
+  {
+   "id": "8",
+   "prompt": "Answer this question about this project (BASI-CLI and its measurements). Write ONLY the answer — one or two sentences with the specific numbers — to the file answer.txt, overwriting it. Question: What -ngl value is the ceiling for Qwen3.8-27B UD-Q6_K_XL on this project's B580?",
+   "check": "grep -Eq '(^|[^0-9])28([^0-9]|$)' answer.txt; rc=$?; cat answer.txt 2>/dev/null; rm -f answer.txt; exit $rc"
+  }
+ ]
+}

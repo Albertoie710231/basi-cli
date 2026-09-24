@@ -84,6 +84,8 @@ def run_trial(t, arm, rep, args, out, cache):
         res["error"] = "setup failed"
         return res
 
+    if arm.get("kb"):
+        shutil.copytree(arm["kb"], box / ".basi" / "knowledge" / "pinned", dirs_exist_ok=True)
     if arm.get("lessons"):
         (box / ".basi").mkdir(exist_ok=True)
         (box / ".basi" / "lessons.md").write_text(arm["lessons"])
@@ -258,7 +260,11 @@ def main():
             arms.append(dict(name="A", context=""))
         else:
             nm, _, path = spec.partition("=")
-            if path.startswith("lessons:"):
+            if path.startswith("kb:"):
+                # A directory of knowledge notes (e.g. `basi-cli import claude` output),
+                # installed on the pinned shelf that docs_search reads.
+                arms.append(dict(name=nm, context="", kb=path[3:]))
+            elif path.startswith("lessons:"):
                 # Installed where BASI itself loads it, so the real loader is tested.
                 arms.append(dict(name=nm, context="", lessons=Path(path[8:]).read_text()))
             else:
