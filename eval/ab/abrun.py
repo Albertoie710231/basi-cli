@@ -97,9 +97,10 @@ def run_trial(t, arm, rep, args, out, cache):
         env_s = dict(env, BASI_TELEMETRY_TAG=f"{name}:{arm['name']}:{rep}:{i}",
                      BASI_SESSION_LOG=str(session_log))
         basi = args.basi
+        session_log.touch()          # must exist to be bind-mounted into the jail
         jail = []
         if args.jail:
-            # Filesystem jail: the agent sees the system, its own trial folder, the
+            # Filesystem jail (the default): the agent sees the system, its own trial folder, the
             # BASI config (read-only, for the saved backend) and the binary under a
             # neutral path — not $HOME, not ~/.claude, not the repo. Without it a
             # "no context" arm with bash found the answers on disk anyway (30 of 48
@@ -111,8 +112,18 @@ def run_trial(t, arm, rep, args, out, cache):
                     "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp",
                     "--ro-bind", args.basi, "/opt/basi/basi-cli",
                     "--ro-bind", str(cfg), str(cfg),
-                    "--bind", str(tdir), str(tdir), "--bind", str(out / "data"), str(out / "data"),
+                    # only the sandbox and this step's session log — not the trial folder,
+                    # whose earlier step logs and check results the agent could otherwise read
+                    "--bind", str(box), str(box), "--bind", str(session_log), str(session_log),
+                    "--bind", str(out / "data"), str(out / "data"),
                     "--chdir", str(box), "--die-with-parent"]
+            # A local model needs its weights, the GPU, the llama.cpp build and oneAPI.
+            extra = list(args.jail_bind)
+            if "--local" in args.basi_args:
+                extra += ["/opt", str(Path.home() / "llama.cpp"), str(Path.home() / ".cache" / "huggingface")]
+                jail[jail.index("--dev") : jail.index("--dev") + 2] = ["--dev", "/dev", "--dev-bind-try", "/dev/dri", "/dev/dri"]
+            for pth in extra:
+                jail[-3:-3] = ["--ro-bind-try", pth, pth]
             basi = "/opt/basi/basi-cli"
         cmd = " ".join([*map(shlex.quote, jail), shlex.quote(basi), *args.basi_args,
                         "--no-mcp", "--yolo", "-p", shlex.quote(prompt)])
@@ -266,8 +277,11 @@ def main():
     ap.add_argument("--out", default=None)
     ap.add_argument("--timeout", type=int, default=0, help="per-step seconds (overrides the task's; local models need hours)")
     ap.add_argument("--yes", action="store_true", help="skip the confirmation")
-    ap.add_argument("--jail", action="store_true",
-                    help="run each agent in a bwrap filesystem jail (only its trial folder visible)")
+    ap.add_argument("--no-jail", dest="jail", action="store_false",
+                    help="let agents see the whole filesystem (default: each runs in a bwrap jail "
+                         "that sees only its trial folder)")
+    ap.add_argument("--jail-bind", action="append", default=[], metavar="PATH",
+                    help="extra read-only path visible inside the jail (repeatable)")
     args = ap.parse_args()
     args.basi_args = shlex.split(args.basi_args)
     if "--api" in args.basi_args:
