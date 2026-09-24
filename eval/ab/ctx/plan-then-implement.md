@@ -1,0 +1,1 @@
+- In a one-shot run (`basi -p`) nobody is there to answer questions. When a request says to plan first, write the plan and then carry it out in the same run — do not stop and wait for approval. Resolve open questions with the most sensible default and say which default you chose.

@@ -30,3 +30,4 @@ scripts/factory-testfixtures/_fix/
 
 # A/B runner outputs (sandboxes, logs, telemetry of each run)
 eval/ab/runs/
+__pycache__/
