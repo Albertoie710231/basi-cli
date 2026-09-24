@@ -31,3 +31,6 @@ scripts/factory-testfixtures/_fix/
 # A/B runner outputs (sandboxes, logs, telemetry of each run)
 eval/ab/runs/
 __pycache__/
+
+# basi-cli sleep state (proposals, seen sessions); .basi/lessons.md is yours to keep or commit
+.basi/dream/

@@ -21,6 +21,8 @@ passes. With 5 reps per arm only a large effect can show; the report says so.
 
   python3 eval/ab/abrun.py --tasks version,noted --arms A --repeat 5 --jobs 4
   python3 eval/ab/abrun.py --tasks noted --arms A,oldchat=ctx/noted-may.md --repeat 5
+  python3 eval/ab/abrun.py --tasks version --arms A,dream=lessons:.basi/lessons.md   (installed as
+                                                  the sandbox's .basi/lessons.md, loaded by BASI)
 """
 import argparse, concurrent.futures as cf, datetime, json, os, shlex, shutil
 import subprocess, sys, time
@@ -73,6 +75,10 @@ def run_trial(t, arm, rep, args, out, cache):
                                 tdir / "setup.log") != 0:
         res["error"] = "setup failed"
         return res
+
+    if arm.get("lessons"):
+        (box / ".basi").mkdir(exist_ok=True)
+        (box / ".basi" / "lessons.md").write_text(arm["lessons"])
 
     t0 = time.time()
     for i, step in enumerate(task["steps"]):
@@ -217,7 +223,11 @@ def main():
             arms.append(dict(name="A", context=""))
         else:
             nm, _, path = spec.partition("=")
-            arms.append(dict(name=nm, context=CONTEXT_HEADER + Path(path).read_text() + "\n\n---\n\n"))
+            if path.startswith("lessons:"):
+                # Installed where BASI itself loads it, so the real loader is tested.
+                arms.append(dict(name=nm, context="", lessons=Path(path[8:]).read_text()))
+            else:
+                arms.append(dict(name=nm, context=CONTEXT_HEADER + Path(path).read_text() + "\n\n---\n\n"))
 
     stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     out = Path(args.out or HERE / "runs" / stamp).resolve()

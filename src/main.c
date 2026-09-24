@@ -46,6 +46,7 @@
 #include "tooldefs.h"
 #include "toolstat.h"
 #include "telemetry.h"
+#include "dream.h"
 #include "mcp.h"
 #include "cookbook.h"
 #include "slashmenu.h"
@@ -2296,6 +2297,9 @@ static Cli parse_args(int argc, char **argv) {
                    "  call/failure counts (never prompts or output) to ~/.local/share/basi-cli/\n"
                    "  telemetry.jsonl. It never leaves this machine. `basi-cli telemetry off`\n"
                    "  stops it, BASI_TELEMETRY=0 skips one run, `basi-cli telemetry` shows status.\n\n"
+                   "Lessons: `basi-cli sleep` proposes lessons from this project's past chats;\n"
+                   "  `basi-cli sleep review` accepts them into .basi/lessons.md, which BASI loads\n"
+                   "  at startup (BASI_LESSONS=0 skips it).\n\n"
                    "Model selection:\n"
                    "  With no -m, BASI uses the saved default (set by the first-run picker or\n"
                    "  the in-chat /model command), then $BASI_MODEL, then the picker. So after\n"
@@ -2430,6 +2434,45 @@ static void build_system_prompt(char *buf, size_t sz, bool native_tools,
             }
             fclose(bf);
         }
+    }
+    /* Reviewed lessons from `basi-cli sleep`: only what the user accepted.
+     * The <!-- source --> tags are for the user, not the model — stripped. */
+    if (!getenv("BASI_LESSONS") || strcmp(getenv("BASI_LESSONS"), "0") != 0) {
+        size_t n = 0;
+        char *raw = read_file_all(".basi/lessons.md", &n);
+        if (raw && n > 0) {
+            StringBuf lb; sb_init(&lb);
+            int lessons = 0;
+            for (char *line = strtok(raw, "\n"); line; line = strtok(NULL, "\n")) {
+                if (line[0] == '#' || strncmp(line, "- ", 2) != 0) {
+                    if (strncmp(line, "## ", 3) == 0) { sb_append_str(&lb, line); sb_append_char(&lb, '\n'); }
+                    continue;
+                }
+                char *c = strstr(line, "<!--");
+                if (c) { while (c > line && c[-1] == ' ') c--; *c = '\0'; }
+                sb_append_str(&lb, line); sb_append_char(&lb, '\n');
+                lessons++;
+            }
+            char *text = sb_to_str(&lb);
+            size_t cur_len = strlen(buf);
+            const char *header =
+                "\n\nLESSONS FROM EARLIER SESSIONS IN THIS PROJECT (reviewed and accepted by the user; "
+                "tools and rules above take precedence):\n";
+            size_t cap = 3000, tl = strlen(text);
+            if (lessons > 0 && sz - cur_len > strlen(header) + 200) {
+                size_t room = sz - cur_len - strlen(header) - 1;
+                if (tl > cap) tl = cap;
+                if (tl > room) tl = room;
+                memcpy(buf + cur_len, header, strlen(header));
+                memcpy(buf + cur_len + strlen(header), text, tl);
+                buf[cur_len + strlen(header) + tl] = '\0';
+                printf("\033[90m[Loaded .basi/lessons.md (%d lesson%s%s) — BASI_LESSONS=0 to skip]\033[0m\n",
+                       lessons, lessons == 1 ? "" : "s", strlen(text) > tl ? ", truncated" : "");
+                fflush(stdout);
+            }
+            free(text);
+        }
+        free(raw);
     }
 }
 
@@ -3549,6 +3592,9 @@ static void handle_slash_command(char *user_input,
                     "                        copy a markdown file into ./.basi/knowledge/\n"
                     "  basi-cli telemetry [off|on|show|purge]\n"
                     "                        LOCAL usage stats: status, stop/resume, view, delete\n"
+                    "  basi-cli sleep [review|show|--dry-run]\n"
+                    "                        learn lessons from this project's past sessions;\n"
+                    "                        you review them before BASI uses them\n"
                     "\n"
                     "Tools the model can call: read, head, tail, grep, wc, bash,\n"
                     "  edit, scaffold, web_search, web_fetch, readfile, code_context,\n"
@@ -4872,6 +4918,20 @@ int main(int argc, char **argv) {
     /* `basi-cli telemetry ...`: local usage stats — status, on/off, show, purge. */
     if (argc >= 2 && strcmp(argv[1], "telemetry") == 0)
         return telemetry_cmd(argc, argv);
+
+    /* `basi-cli sleep ...`: learn reviewed lessons from this project's past
+       sessions. Uses the saved/env API backend like study, else a local
+       llama-server on BASI_SERVER_PORT (8181). */
+    if (argc >= 2 && strcmp(argv[1], "sleep") == 0) {
+        const char *sub = argc >= 3 ? argv[2] : "";
+        bool needs_model = !(strcmp(sub, "review") == 0 || strcmp(sub, "list") == 0 ||
+                             strcmp(sub, "accept") == 0 || strcmp(sub, "reject") == 0 ||
+                             strcmp(sub, "show") == 0 || strcmp(sub, "help") == 0 ||
+                             strcmp(sub, "recheck") == 0 ||
+                             strcmp(sub, "--dry-run") == 0);
+        if (needs_model && api_setup_remote(NULL, NULL) < 0) return 2;
+        return dream_cmd(argc, argv);
+    }
 
     /* `basi-cli docs ...` subcommand: handle and exit before model load. */
     if (argc >= 2 && strcmp(argv[1], "docs") == 0) {
